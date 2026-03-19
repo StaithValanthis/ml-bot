@@ -48,11 +48,22 @@ class BybitHTTPError(BybitRestError):
 
 
 class BybitAPIError(BybitRestError):
-    def __init__(self, message: str, *, ret_code: int, ret_msg: str, payload: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        ret_code: int,
+        ret_msg: str,
+        payload: dict[str, Any],
+        operation: str = "",
+        scope: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.ret_code = ret_code
         self.ret_msg = ret_msg
         self.payload = payload
+        self.operation = operation
+        self.scope = scope or {}
 
 
 class BybitResponseDecodeError(BybitRestError):
@@ -118,7 +129,7 @@ class BybitRestClient:
             endpoint_group="trade",
             auth=True,
         )
-        result = self._validate_envelope(data, "open orders")
+        result = self._validate_envelope(data, "open_orders", scope={"category": category, "symbol": symbol})
         result = BybitListResult[OpenOrderItem].model_validate(result)
         return result.items
 
@@ -133,7 +144,7 @@ class BybitRestClient:
             endpoint_group="position",
             auth=True,
         )
-        result = self._validate_envelope(data, "positions")
+        result = self._validate_envelope(data, "position_list", scope={"category": category, "symbol": symbol})
         result = BybitListResult[PositionItem].model_validate(result)
         return result.items
 
@@ -160,7 +171,9 @@ class BybitRestClient:
             endpoint_group="trade",
             auth=True,
         )
-        result = self._validate_envelope(data, "place order")
+        result = self._validate_envelope(
+            data, "place_order", scope={"category": request.category, "symbol": request.symbol}
+        )
         return OrderAck.model_validate(result)
 
     async def amend_order(self, request: AmendOrderRequest) -> OrderAck:
@@ -331,7 +344,12 @@ class BybitRestClient:
 
         raise BybitRestError("Unreachable retry termination in _request.")
 
-    def _validate_envelope(self, payload: dict[str, Any], operation: str) -> dict[str, Any]:
+    def _validate_envelope(
+        self,
+        payload: dict[str, Any],
+        operation: str,
+        scope: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         try:
             envelope = BybitEnvelope[dict[str, Any]].model_validate(payload)
         except Exception as exc:  # pragma: no cover - pydantic details are tested via integration tests
@@ -342,6 +360,8 @@ class BybitRestClient:
                 ret_code=envelope.ret_code,
                 ret_msg=envelope.ret_msg,
                 payload=payload,
+                operation=operation,
+                scope=scope or {},
             )
         return envelope.result
 

@@ -190,6 +190,48 @@ async def test_reconcile_positions_detects_missing_reduce_only() -> None:
 
 
 @pytest.mark.asyncio
+async def test_reconcile_orders_symbol_scoped_when_symbols_configured() -> None:
+    """Reconciler with symbols uses symbol-scoped get_open_orders per symbol."""
+    mock_rest = AsyncMock(spec=BybitRestClient)
+    mock_rest.get_open_orders = AsyncMock(return_value=[])
+    mgr = OrderManager()
+
+    reconciler = Reconciler(
+        rest_client=mock_rest,
+        order_manager=mgr,
+        category="linear",
+        symbols=["BTCUSDT", "ETHUSDT"],
+    )
+    await reconciler.reconcile_orders()
+
+    assert mock_rest.get_open_orders.await_count == 2
+    calls = mock_rest.get_open_orders.await_args_list
+    symbols_seen = {c[1].get("symbol") for c in calls}
+    assert symbols_seen == {"BTCUSDT", "ETHUSDT"}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_positions_symbol_scoped_when_symbols_configured() -> None:
+    """Reconciler with symbols uses symbol-scoped get_positions per symbol."""
+    mock_rest = AsyncMock(spec=BybitRestClient)
+    mock_rest.get_positions = AsyncMock(return_value=[])
+    mgr = OrderManager()
+
+    reconciler = Reconciler(
+        rest_client=mock_rest,
+        order_manager=mgr,
+        category="linear",
+        symbols=["BTCUSDT", "ETHUSDT"],
+    )
+    await reconciler.reconcile_positions()
+
+    assert mock_rest.get_positions.await_count == 2
+    calls = mock_rest.get_positions.await_args_list
+    symbols_seen = {c[1].get("symbol") for c in calls}
+    assert symbols_seen == {"BTCUSDT", "ETHUSDT"}
+
+
+@pytest.mark.asyncio
 async def test_reconcile_positions_ok_when_reduce_only_has_exit() -> None:
     mock_rest = AsyncMock(spec=BybitRestClient)
     mock_rest.get_positions.return_value = [_position(symbol="BTCUSDT", size=Decimal("0.1"))]

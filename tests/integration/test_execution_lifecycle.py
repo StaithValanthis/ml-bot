@@ -11,6 +11,7 @@ import pytest
 from pydantic import SecretStr
 
 from trading.exchange.schemas import ServerTimeResult
+from trading.settings import load_settings
 from trading.execution.order_intent import IntentPurpose, OrderIntent
 from trading.execution.order_manager import OrderManager
 from trading.journal.ledger import LedgerEvent, LedgerSink
@@ -265,3 +266,27 @@ async def test_startup_mode_warning_for_demo_order_capable() -> None:
     ev = next((kw for msg, kw in log_calls if msg == "execution_mode_warning"), {})
     assert ev.get("dry_run") is False
     assert ev.get("mode") == "demo"
+
+
+@pytest.mark.asyncio
+async def test_portfolio_refresh_uses_symbol_scoped_positions() -> None:
+    """Portfolio refresh calls get_positions with symbol for each trading symbol."""
+    from trading.runtime.orchestrator import RuntimeOrchestrator
+
+    settings = load_settings()
+    settings.exchange.bybit_api_key = SecretStr("test-key")
+    settings.exchange.bybit_api_secret = SecretStr("test-secret")
+    symbols = settings.trading.symbols
+
+    mock_rest = MagicMock()
+    mock_rest.get_wallet = AsyncMock(return_value=[])
+    mock_rest.get_positions = AsyncMock(return_value=[])
+
+    with patch("trading.runtime.orchestrator.BybitRestClient", return_value=mock_rest):
+        orch = RuntimeOrchestrator(settings)
+        await orch._refresh_portfolio_snapshot()
+
+    assert mock_rest.get_positions.await_count == len(symbols)
+    calls = mock_rest.get_positions.await_args_list
+    symbols_called = {c[1].get("symbol") for c in calls}
+    assert symbols_called == set(symbols)

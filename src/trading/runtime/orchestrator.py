@@ -9,7 +9,12 @@ from pathlib import Path
 
 from decimal import Decimal
 
-from trading.exchange.bybit_rest import BybitAuthenticationError, BybitRestClient, BybitRestError
+from trading.exchange.bybit_rest import (
+    BybitAPIError,
+    BybitAuthenticationError,
+    BybitRestClient,
+    BybitRestError,
+)
 from trading.exchange.bybit_ws_private import BybitWsPrivateClient
 from trading.exchange.bybit_ws_public import BybitWsPublicClient
 from trading.exchange.schemas import PlaceOrderRequest
@@ -86,6 +91,7 @@ class RuntimeOrchestrator:
             rest_client=self._rest,
             order_manager=self._order_manager,
             category=settings.trading.category,
+            symbols=settings.trading.symbols,
         )
 
         self._circuit_breaker = CircuitBreaker()
@@ -520,7 +526,13 @@ class RuntimeOrchestrator:
             )
             self._metrics.inc("order_acks_total")
         except BybitRestError as exc:
-            self._logger.exception("order_submit_failed", order_link_id=intent.order_link_id, error=str(exc))
+            log_ctx: dict[str, object] = {"order_link_id": intent.order_link_id, "error": str(exc)}
+            if isinstance(exc, BybitAPIError):
+                log_ctx["ret_code"] = exc.ret_code
+                log_ctx["ret_msg"] = exc.ret_msg
+                log_ctx["operation"] = exc.operation
+                log_ctx["scope"] = exc.scope
+            self._logger.exception("order_submit_failed", **log_ctx)
             was_tripped = self._circuit_breaker.is_tripped()
             self._circuit_breaker.record_order_rejection()
             now_tripped = self._circuit_breaker.is_tripped()
@@ -550,9 +562,24 @@ class RuntimeOrchestrator:
             return
         try:
             wallets = await self._rest.get_wallet(account_type="UNIFIED")
-            positions = await self._rest.get_positions(category=self._settings.trading.category)
+            positions = []
+            for sym in self._settings.trading.symbols:
+                pos_list = await self._rest.get_positions(
+                    category=self._settings.trading.category, symbol=sym
+                )
+                positions.extend(pos_list)
         except BybitRestError as exc:
-            self._logger.warning("portfolio_refresh_failed", error=str(exc))
+            if isinstance(exc, BybitAPIError):
+                self._logger.warning(
+                    "portfolio_refresh_failed",
+                    error=str(exc),
+                    ret_code=exc.ret_code,
+                    ret_msg=exc.ret_msg,
+                    operation=exc.operation,
+                    scope=exc.scope,
+                )
+            else:
+                self._logger.warning("portfolio_refresh_failed", error=str(exc))
             return
 
         equity = Decimal("0")
@@ -619,7 +646,17 @@ class RuntimeOrchestrator:
             self._logger.warning("reconcile_skipped_auth", error=str(exc))
             return
         except BybitRestError as exc:
-            self._logger.warning("reconcile_failed", error=str(exc))
+            if isinstance(exc, BybitAPIError):
+                self._logger.warning(
+                    "reconcile_failed",
+                    error=str(exc),
+                    ret_code=exc.ret_code,
+                    ret_msg=exc.ret_msg,
+                    operation=exc.operation,
+                    scope=exc.scope,
+                )
+            else:
+                self._logger.warning("reconcile_failed", error=str(exc))
             return
 
         if not report_orders.ok or not report_positions.ok:

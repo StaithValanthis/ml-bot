@@ -27,17 +27,36 @@ class Reconciler:
     """
     Compares local in-memory order tracking with authoritative exchange snapshots.
 
-    TODO(phase-6): Extend to wallet/position reconciliation and auto-healing actions.
+    Uses symbol-scoped REST requests for DEMO compatibility (avoids unscoped
+    category-only calls that can fail on demo API).
     """
 
-    def __init__(self, *, rest_client: BybitRestClient, order_manager: OrderManager, category: str) -> None:
+    def __init__(
+        self,
+        *,
+        rest_client: BybitRestClient,
+        order_manager: OrderManager,
+        category: str,
+        symbols: list[str] | None = None,
+    ) -> None:
         self._rest_client = rest_client
         self._order_manager = order_manager
         self._category = category
+        self._symbols = symbols or []
 
     async def reconcile_orders(self, symbol: str | None = None) -> ReconciliationReport:
-        local_open = await self._order_manager.get_open_orders(symbol)
-        exchange_open = await self._rest_client.get_open_orders(category=self._category, symbol=symbol)
+        if symbol is not None:
+            local_open = await self._order_manager.get_open_orders(symbol)
+            exchange_open = await self._rest_client.get_open_orders(category=self._category, symbol=symbol)
+        elif self._symbols:
+            local_open = await self._order_manager.get_open_orders(None)
+            exchange_open: list = []
+            for s in self._symbols:
+                orders = await self._rest_client.get_open_orders(category=self._category, symbol=s)
+                exchange_open.extend(orders)
+        else:
+            local_open = await self._order_manager.get_open_orders(None)
+            exchange_open = await self._rest_client.get_open_orders(category=self._category, symbol=None)
 
         issues: list[ReconciliationIssue] = []
         local_by_link = {order.order_link_id: order for order in local_open}
@@ -105,8 +124,16 @@ class Reconciler:
 
     async def reconcile_positions(self, symbol: str | None = None) -> ReconciliationReport:
         # v1 scaffold: verify protective reduce-only exits exist for non-flat positions.
-        positions = await self._rest_client.get_positions(category=self._category, symbol=symbol)
-        local_open = await self._order_manager.get_open_orders(symbol)
+        if symbol is not None:
+            positions = await self._rest_client.get_positions(category=self._category, symbol=symbol)
+        elif self._symbols:
+            positions = []
+            for s in self._symbols:
+                pos_list = await self._rest_client.get_positions(category=self._category, symbol=s)
+                positions.extend(pos_list)
+        else:
+            positions = await self._rest_client.get_positions(category=self._category, symbol=None)
+        local_open = await self._order_manager.get_open_orders(None)
         reduce_only_open = [order for order in local_open if order.reduce_only]
         issues: list[ReconciliationIssue] = []
 
