@@ -591,6 +591,8 @@ class RuntimeOrchestrator:
 
         position_map: dict[str, PositionRiskView] = {}
         for p in positions:
+            if p.size <= 0:
+                continue
             side = _to_position_side(p.side)
             liq_price = _decimal_or_none(p.liq_price)
             position_map[p.symbol] = PositionRiskView(

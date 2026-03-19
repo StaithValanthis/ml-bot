@@ -3,9 +3,16 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from trading.util.types import OrderSide, OrderStatus, OrderType, TimeInForce
+
+
+def _empty_str_to_decimal(v: object) -> Decimal:
+    """Convert empty string or None to Decimal('0'); otherwise parse to Decimal."""
+    if v is None or v == "":
+        return Decimal("0")
+    return Decimal(str(v))
 
 
 class BybitBaseModel(BaseModel):
@@ -58,6 +65,8 @@ class OpenOrderItem(BybitBaseModel):
 
 
 class PositionItem(BybitBaseModel):
+    """Bybit position; tolerates empty-string payloads for flat/empty positions."""
+
     symbol: str
     side: str
     size: Decimal
@@ -68,6 +77,21 @@ class PositionItem(BybitBaseModel):
     liq_price: str = Field(alias="liqPrice")
     unrealised_pnl: Decimal = Field(alias="unrealisedPnl")
     updated_time: str = Field(alias="updatedTime")
+
+    @field_validator(
+        "size", "avg_price", "mark_price", "position_value", "leverage", "unrealised_pnl",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_empty_to_zero(cls, v: object) -> Decimal:
+        return _empty_str_to_decimal(v)
+
+    @field_validator("liq_price", mode="before")
+    @classmethod
+    def _coerce_liq_price(cls, v: object) -> str:
+        if v is None:
+            return ""
+        return str(v)
 
 
 class WalletCoinItem(BybitBaseModel):

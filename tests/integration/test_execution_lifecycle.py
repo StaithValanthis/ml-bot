@@ -269,6 +269,43 @@ async def test_startup_mode_warning_for_demo_order_capable() -> None:
 
 
 @pytest.mark.asyncio
+async def test_portfolio_refresh_with_empty_position_responses() -> None:
+    """Portfolio refresh does not crash when Bybit returns empty-position payloads."""
+    from trading.exchange.schemas import PositionItem
+    from trading.runtime.orchestrator import RuntimeOrchestrator
+
+    settings = load_settings()
+    settings.exchange.bybit_api_key = SecretStr("test-key")
+    settings.exchange.bybit_api_secret = SecretStr("test-secret")
+
+    empty_position = PositionItem.model_validate(
+        {
+            "symbol": "BTCUSDT",
+            "side": "",
+            "size": "",
+            "avgPrice": "",
+            "markPrice": "",
+            "positionValue": "",
+            "leverage": "",
+            "liqPrice": "",
+            "unrealisedPnl": "",
+            "updatedTime": "1710000000000",
+        }
+    )
+
+    mock_rest = MagicMock()
+    mock_rest.get_wallet = AsyncMock(return_value=[])
+    mock_rest.get_positions = AsyncMock(return_value=[empty_position])
+
+    with patch("trading.runtime.orchestrator.BybitRestClient", return_value=mock_rest):
+        orch = RuntimeOrchestrator(settings)
+        await orch._refresh_portfolio_snapshot()
+
+    assert orch._portfolio.equity_usdt == Decimal("0")
+    assert len(orch._portfolio.positions) == 0
+
+
+@pytest.mark.asyncio
 async def test_portfolio_refresh_uses_symbol_scoped_positions() -> None:
     """Portfolio refresh calls get_positions with symbol for each trading symbol."""
     from trading.runtime.orchestrator import RuntimeOrchestrator
