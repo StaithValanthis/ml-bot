@@ -1,0 +1,8 @@
+risk:
+  per_symbol:
+    BTCUSDT:
+      max_notional_usdt: 30000
+      max_position_abs: 0.5
+    ETHUSDT:
+      max_notional_usdt: 20000
+      max_position_abs: 5.0

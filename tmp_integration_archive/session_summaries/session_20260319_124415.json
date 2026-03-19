@@ -1,0 +1,17 @@
+{
+  "session_start": "2026-03-19T12:44:15.404520+00:00",
+  "session_end": "2026-03-19T12:44:15.513326+00:00",
+  "mode": "paper",
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT"
+  ],
+  "decisions_total": 0,
+  "order_intents_total": 0,
+  "order_submissions_total": 0,
+  "order_acks_total": 0,
+  "reconcile_mismatch_cycles": 0,
+  "reconcile_issues_total": 0,
+  "staleness_incidents_total": 0,
+  "circuit_breaker_trips_total": 0
+}

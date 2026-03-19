@@ -1,0 +1,9 @@
+logging:
+  level: INFO
+  json: true
+  include_timestamp: true
+  logger_name: trading
+  processors:
+    - add_log_level
+    - add_logger_name
+    - stack_info

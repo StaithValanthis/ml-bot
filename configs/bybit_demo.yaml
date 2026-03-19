@@ -1,0 +1,5 @@
+exchange:
+  base_url: "https://api-demo.bybit.com"
+  public_ws_url: "wss://stream-demo.bybit.com/v5/public/linear"
+  private_ws_url: "wss://stream-demo.bybit.com/v5/private"
+  testnet: true

@@ -1,0 +1,5 @@
+model_registry:
+  provider: mlflow
+  tracking_uri: "http://localhost:5000"
+  experiment_name: "bybit-usdt-perp"
+  stage: "Staging"

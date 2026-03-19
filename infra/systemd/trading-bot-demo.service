@@ -1,0 +1,20 @@
+[Unit]
+Description=ML Bot — Demo trading (Bybit demo, exchange-connected)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+Group=__SERVICE_USER__
+WorkingDirectory=__REPO_ROOT__
+EnvironmentFile=__REPO_ROOT__/.env
+ExecStart=__REPO_ROOT__/.venv/bin/python -m trading.main
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-bot-demo
+
+[Install]
+WantedBy=multi-user.target

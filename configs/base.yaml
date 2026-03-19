@@ -1,0 +1,35 @@
+runtime:
+  mode: paper
+  timezone: UTC
+  shutdown_timeout_seconds: 20
+  dry_run: true
+
+exchange:
+  provider: bybit
+  recv_window_ms: 5000
+  request_timeout_seconds: 15
+  max_retries: 5
+  backoff_base_seconds: 0.5
+  backoff_max_seconds: 8.0
+
+trading:
+  category: linear
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+  candle_timeframe: "5"
+  regime_timeframe: "60"
+  trade_only_closed_candles: true
+
+risk:
+  max_total_notional_usdt: 50000
+  max_leverage: 3.0
+  daily_loss_limit_usdt: 1000
+  liquidation_buffer_bps: 200
+  safe_mode: false
+
+logging:
+  level: INFO
+  json: true
+  include_timestamp: true
+  logger_name: trading

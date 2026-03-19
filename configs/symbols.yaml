@@ -1,0 +1,11 @@
+symbols:
+  BTCUSDT:
+    qty_step: 0.001
+    min_qty: 0.001
+    price_tick: 0.10
+    max_leverage: 100
+  ETHUSDT:
+    qty_step: 0.01
+    min_qty: 0.01
+    price_tick: 0.01
+    max_leverage: 100
