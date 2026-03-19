@@ -204,8 +204,6 @@ class RuntimeOrchestrator:
             )
             await self._ws_public.subscribe(public_topics)
             expected_public = {f"public:{s}" for s in self._settings.trading.symbols}
-            if self._can_use_private_stream():
-                expected_public |= {f"private:{s}" for s in self._settings.trading.symbols}
             self._staleness.set_expected_channels(expected_public)
 
             self._tasks.append(asyncio.create_task(self._ws_public.run_forever(), name="runtime-ws-public"))
@@ -298,6 +296,8 @@ class RuntimeOrchestrator:
                     self._session_ended_cleanly = False
                     reason = f"task_failed:{task.get_name()}"
                     self._abort_reasons.append(reason)
+                    if task.get_name() == "runtime-ws-private":
+                        self._health.set_private_stream_error(str(exc))
                     self._logger.exception(
                         "runtime_task_failed",
                         task=task.get_name(),
@@ -318,9 +318,6 @@ class RuntimeOrchestrator:
     async def _on_private_events(self, events: list[NormalizedEvent]) -> None:
         await self._market_state.apply_events(events)
         for event in events:
-            symbol = getattr(event, "symbol", None)
-            if isinstance(symbol, str) and symbol:
-                await self._staleness.mark_seen(f"private:{symbol}")
             if isinstance(event, NormalizedOrderUpdate):
                 link_id = event.order_link_id or ""
                 prev = await self._order_manager.get_by_link_id(link_id) if link_id else None
@@ -727,7 +724,7 @@ class RuntimeOrchestrator:
         self._health.mark_reconcile()
 
     async def _watchdog_cycle(self) -> None:
-        stale = await self._staleness.stale_channels()
+        stale = await self._staleness.stale_channels(trigger_streams={"public"})
         self._health.set_stale_channels(stale)
         self._health.set_circuit_breaker(self._circuit_breaker.is_tripped())
         self._metrics.set_gauge("stale_channel_count", float(len(stale)))
@@ -877,6 +874,7 @@ class RuntimeOrchestrator:
             equity_usdt=equity,
             ws_public=health_snap.ws_public_connected,
             ws_private=health_snap.ws_private_connected,
+            private_stream_error=health_snap.private_stream_error,
             circuit_breaker=health_snap.circuit_breaker_tripped,
             stale_count=len(health_snap.stale_channels),
             decisions_total=decisions,
@@ -911,6 +909,8 @@ class RuntimeOrchestrator:
             "staleness_incidents_total": int(metrics.counters.get("staleness_incidents_total", 0)),
             "circuit_breaker_trips_total": int(metrics.counters.get("circuit_breaker_trips_total", 0)),
         }
+        if self._health.snapshot().private_stream_error is not None:
+            summary["private_stream_error"] = self._health.snapshot().private_stream_error
         if self._abort_reasons:
             summary["abort_reasons"] = self._abort_reasons
         if self._startup_auth_disabled:

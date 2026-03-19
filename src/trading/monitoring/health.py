@@ -16,6 +16,7 @@ class HealthSnapshot:
     last_decision_at: datetime | None
     last_reconcile_at: datetime | None
     updated_at: datetime
+    private_stream_error: str | None
 
 
 class HealthState:
@@ -30,6 +31,7 @@ class HealthState:
         self._last_decision_at: datetime | None = None
         self._last_reconcile_at: datetime | None = None
         self._updated_at = utc_now()
+        self._private_stream_error: str | None = None
 
     def set_ws_public(self, connected: bool) -> None:
         with self._lock:
@@ -39,6 +41,13 @@ class HealthState:
     def set_ws_private(self, connected: bool) -> None:
         with self._lock:
             self._ws_private_connected = connected
+            if connected:
+                self._private_stream_error = None
+            self._updated_at = utc_now()
+
+    def set_private_stream_error(self, error: str | None) -> None:
+        with self._lock:
+            self._private_stream_error = error
             self._updated_at = utc_now()
 
     def set_stale_channels(self, channels: list[str]) -> None:
@@ -71,4 +80,5 @@ class HealthState:
                 last_decision_at=self._last_decision_at,
                 last_reconcile_at=self._last_reconcile_at,
                 updated_at=self._updated_at,
+                private_stream_error=self._private_stream_error,
             )

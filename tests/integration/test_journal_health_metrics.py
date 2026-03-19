@@ -10,6 +10,7 @@ import pytest
 from trading.exchange.schemas import ServerTimeResult
 from trading.journal.ledger import LedgerEvent, LedgerSink
 from trading.monitoring.alerts import AlertEvent, AlertLevel, AlertSink
+from trading.monitoring.health import HealthState
 from trading.runtime.orchestrator import RuntimeOrchestrator
 from trading.settings import load_settings
 
@@ -88,3 +89,112 @@ async def test_watchdog_staleness_journals_and_alerts() -> None:
     snap = orch._health.snapshot()
     assert "public:BTCUSDT" in snap.stale_channels
     assert snap.circuit_breaker_tripped is True
+
+
+@pytest.mark.asyncio
+async def test_idle_private_stream_does_not_trigger_feed_stale() -> None:
+    """Idle private stream (no private topic messages) does not trip feed-stale safe mode."""
+    settings = load_settings()
+    capture_ledger = _CaptureSink()
+    capture_alerts = _CaptureAlerts()
+
+    mock_staleness = MagicMock()
+    mock_staleness.stale_channels = AsyncMock(return_value=[])
+
+    mock_rest = MagicMock()
+    mock_rest.get_server_time = AsyncMock(return_value=ServerTimeResult(time_second="1700000000", time_nano="0"))
+    mock_rest.get_wallet = AsyncMock(return_value=[])
+    mock_rest.get_positions = AsyncMock(return_value=[])
+    mock_rest.get_open_orders = AsyncMock(return_value=[])
+    mock_rest.close = AsyncMock()
+
+    async def mock_ws_run() -> None:
+        await asyncio.sleep(0.2)
+
+    mock_ws_public = MagicMock()
+    mock_ws_public.subscribe = AsyncMock()
+    mock_ws_public.run_forever = AsyncMock(side_effect=mock_ws_run)
+    mock_ws_public.close = AsyncMock()
+
+    mock_ws_private = MagicMock()
+    mock_ws_private.subscribe = AsyncMock()
+    mock_ws_private.run_forever = AsyncMock(return_value=None)
+    mock_ws_private.close = AsyncMock()
+
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient", return_value=mock_rest),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient", return_value=mock_ws_public),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient", return_value=mock_ws_private),
+    ):
+        orch = RuntimeOrchestrator(settings)
+        orch._ledger._sinks.insert(0, capture_ledger)
+        orch._alerts = capture_alerts
+        orch._staleness = mock_staleness
+
+        task = asyncio.create_task(orch.run())
+        await asyncio.sleep(0.35)
+        await orch.stop()
+        await task
+
+    assert not any(e.event_type == "staleness_violation" for e in capture_ledger.events)
+    assert not any(a.code == "feed_stale" for a in capture_alerts.alerts)
+    snap = orch._health.snapshot()
+    assert snap.circuit_breaker_tripped is False
+
+
+def test_disconnected_private_stream_reported_unhealthy() -> None:
+    """Disconnected or auth-failed private stream is reported as unhealthy in health snapshot."""
+    health = HealthState()
+    health.set_ws_private(False)
+    health.set_private_stream_error("Private websocket auth failed: {...}")
+
+    snap = health.snapshot()
+    assert snap.ws_private_connected is False
+    assert snap.private_stream_error is not None
+    assert "auth" in snap.private_stream_error.lower()
+
+
+@pytest.mark.asyncio
+async def test_private_task_failure_sets_private_stream_error() -> None:
+    """When private WS task fails, private_stream_error is set in health."""
+    settings = load_settings()
+    mock_staleness = MagicMock()
+    mock_staleness.stale_channels = AsyncMock(return_value=[])
+
+    mock_rest = MagicMock()
+    mock_rest.get_server_time = AsyncMock(return_value=ServerTimeResult(time_second="1700000000", time_nano="0"))
+    mock_rest.get_wallet = AsyncMock(return_value=[])
+    mock_rest.get_positions = AsyncMock(return_value=[])
+    mock_rest.get_open_orders = AsyncMock(return_value=[])
+    mock_rest.close = AsyncMock()
+
+    async def mock_ws_public_run() -> None:
+        await asyncio.sleep(0.5)
+
+    mock_ws_public = MagicMock()
+    mock_ws_public.subscribe = AsyncMock()
+    mock_ws_public.run_forever = AsyncMock(side_effect=mock_ws_public_run)
+    mock_ws_public.close = AsyncMock()
+
+    mock_ws_private = MagicMock()
+    mock_ws_private.subscribe = AsyncMock()
+    mock_ws_private.run_forever = AsyncMock(side_effect=RuntimeError("Private websocket auth failed"))
+    mock_ws_private.close = AsyncMock()
+
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient", return_value=mock_rest),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient", return_value=mock_ws_public),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient", return_value=mock_ws_private),
+        patch.object(RuntimeOrchestrator, "_can_use_private_stream", return_value=True),
+    ):
+        orch = RuntimeOrchestrator(settings)
+        orch._staleness = mock_staleness
+
+        task = asyncio.create_task(orch.run())
+        await asyncio.sleep(0.6)
+        await orch.stop()
+        await task
+
+    snap = orch._health.snapshot()
+    assert snap.private_stream_error is not None
+    assert "auth" in snap.private_stream_error.lower()

@@ -39,21 +39,30 @@ class FeedStalenessWatchdog:
         async with self._lock:
             self._last_seen[channel] = utc_now()
 
-    async def stale_channels(self) -> list[str]:
+    async def stale_channels(self, trigger_streams: set[str] | None = None) -> list[str]:
+        """
+        Return channels that have exceeded their staleness limit.
+
+        When trigger_streams is provided (e.g. {"public"}), only return channels
+        whose stream prefix is in that set. Private streams are event-driven and
+        should not trigger feed-stale safe mode when idle.
+        """
         now = utc_now()
         async with self._lock:
             stale: list[str] = []
             channels_to_check = set(self._last_seen.keys()) | self._expected_channels
             for channel in channels_to_check:
-                seen_at = self._last_seen.get(channel, now)
                 stream_name = channel.split(":", maxsplit=1)[0]
+                if trigger_streams is not None and stream_name not in trigger_streams:
+                    continue
+                seen_at = self._last_seen.get(channel, now)
                 limit = self._limits.get(stream_name, self._default_limit)
                 if now - seen_at > limit.max_age:
                     stale.append(channel)
             return stale
 
     async def assert_healthy(self) -> None:
-        stale = await self.stale_channels()
+        stale = await self.stale_channels(trigger_streams={"public"})
         if stale:
             raise RuntimeError(f"Feed staleness detected: {stale}")
 
