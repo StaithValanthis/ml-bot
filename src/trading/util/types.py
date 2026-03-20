@@ -13,6 +13,14 @@ class RuntimeMode(str, Enum):
     LIVE = "live"
 
 
+class ModelFilterMode(str, Enum):
+    """DEMO-only model filter operating mode. Never used in LIVE."""
+
+    HARD_BLOCK = "hard_block"
+    SHADOW = "shadow"
+    THRESHOLD_OVERRIDE = "threshold_override"
+
+
 class ExchangeType(str, Enum):
     BYBIT = "bybit"
 

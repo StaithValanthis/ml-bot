@@ -7,11 +7,19 @@ from dataclasses import dataclass, field
 
 @dataclass(slots=True)
 class ModelFilterOutcomes:
-    """DEMO-only model filter counts for operator visibility."""
+    """DEMO-only model filter counts and calibration visibility for operator diagnostics."""
 
     blocked: int = 0
     allowed: int = 0
     prediction_unavailable: int = 0
+    shadow_would_have_blocked: int = 0
+    threshold: float = 0.5
+    mode: str = "hard_block"
+    prob_min: float | None = None
+    prob_max: float | None = None
+    prob_latest: float | None = None
+    prob_count: int = 0
+    latest_features: dict[str, float] | None = None
 
 
 @dataclass(slots=True)

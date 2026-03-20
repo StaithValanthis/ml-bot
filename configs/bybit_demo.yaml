@@ -24,3 +24,7 @@ runtime:
   # DEMO-only: minimum notional floor so valid candidates meet exchange min_qty.
   # When computed qty < min_qty, use this floor (capped at 10% equity). ~75 USDT covers 0.001 BTC.
   demo_sizing_min_notional_usdt: 75
+  # DEMO-only: model filter mode. hard_block (default), shadow (score but never block), threshold_override (use threshold below).
+  # model_filter_mode: shadow
+  # DEMO-only: threshold for threshold_override mode. 0-1. Ignored for hard_block/shadow (shadow uses 0.5 for logging).
+  # model_filter_threshold: 0.01

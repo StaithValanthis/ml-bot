@@ -9,7 +9,7 @@ import yaml
 from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from trading.util.types import ExchangeType, MarketSymbol, RuntimeMode
+from trading.util.types import ExchangeType, MarketSymbol, ModelFilterMode, RuntimeMode
 
 
 class EnvSettings(BaseSettings):
@@ -103,6 +103,8 @@ class RuntimeSettings(BaseModel):
     demo_candidate_overrides: DemoCandidateOverrides | None = None
     demo_sizing_min_notional_usdt: Decimal | None = None
     model_filter_enabled: bool = False
+    model_filter_mode: ModelFilterMode = ModelFilterMode.HARD_BLOCK
+    model_filter_threshold: float | None = None
     model_artifact_path: Path | None = None
 
     @field_validator("timezone")
@@ -124,6 +126,13 @@ class RuntimeSettings(BaseModel):
     def _validate_demo_sizing_min_notional(cls, value: Decimal | None) -> Decimal | None:
         if value is not None and value <= 0:
             raise ValueError("demo_sizing_min_notional_usdt must be positive when set")
+        return value
+
+    @field_validator("model_filter_threshold")
+    @classmethod
+    def _validate_model_filter_threshold(cls, value: float | None) -> float | None:
+        if value is not None and not (0.0 <= value <= 1.0):
+            raise ValueError("model_filter_threshold must be between 0 and 1 when set")
         return value
 
 
@@ -407,6 +416,15 @@ def load_settings() -> AppSettings:
 
     if (model_filter := os.getenv("TRADING_MODEL_FILTER_ENABLED")) is not None:
         runtime_cfg["model_filter_enabled"] = model_filter.lower() in ("true", "1", "yes")
+    if (mf_mode := os.getenv("TRADING_MODEL_FILTER_MODE")) is not None:
+        raw = mf_mode.strip().lower()
+        if raw in ("hard_block", "shadow", "threshold_override"):
+            runtime_cfg["model_filter_mode"] = raw
+    if (mf_threshold := os.getenv("TRADING_MODEL_FILTER_THRESHOLD")) is not None:
+        try:
+            runtime_cfg["model_filter_threshold"] = float(mf_threshold.strip())
+        except ValueError:
+            pass
     if (model_path := os.getenv("TRADING_MODEL_ARTIFACT_PATH")) is not None:
         p = Path(model_path.strip())
         runtime_cfg["model_artifact_path"] = p if p else None

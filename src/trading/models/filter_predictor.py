@@ -38,6 +38,7 @@ class FilterPredictionResult:
     prob_fill: float
     available: bool
     feature_missing_note: str | None = None
+    features_used: dict[str, float] | None = None
 
 
 def _action_to_int(action: str) -> int:
@@ -181,4 +182,10 @@ def score_for_filter(
     if not result.available:
         return (result, True)
     allow = result.prob_fill >= threshold
-    return (result, allow)
+    result_with_features = FilterPredictionResult(
+        prob_fill=result.prob_fill,
+        available=result.available,
+        feature_missing_note=result.feature_missing_note,
+        features_used=features,
+    )
+    return (result_with_features, allow)

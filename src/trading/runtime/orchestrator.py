@@ -44,7 +44,7 @@ from trading.strategy.signal_engine import SignalEngine
 from trading.util.json_util import dumps_json_safe
 from trading.util.logging import get_logger
 from trading.util.time import utc_now
-from trading.util.types import MarketSymbol, OHLCVBar, OrderSide, PositionSide, RuntimeMode
+from trading.util.types import MarketSymbol, ModelFilterMode, OHLCVBar, OrderSide, PositionSide, RuntimeMode
 from trading.storage.parquet_store import ParquetArchiveStore
 from trading.runtime.drill import (
     DrillConfig,
@@ -104,6 +104,8 @@ class RuntimeOrchestrator:
         self._strategy_order_outcomes = StrategyOrderOutcomes()
         self._model_filter_model: object | None = None
         self._model_filter_active: bool = False
+        self._model_filter_mode: ModelFilterMode = ModelFilterMode.HARD_BLOCK
+        self._model_filter_threshold: float | None = None
 
         self._rest = BybitRestClient(settings.exchange)
         self._metrics = MetricsRegistry()
@@ -959,6 +961,11 @@ class RuntimeOrchestrator:
                 if self._model_filter_active:
                     from trading.models.filter_predictor import score_for_filter
 
+                    mf_mode = self._model_filter_mode
+                    if mf_mode == ModelFilterMode.THRESHOLD_OVERRIDE and self._model_filter_threshold is not None:
+                        model_filter_threshold = self._model_filter_threshold
+                    else:
+                        model_filter_threshold = 0.5
                     pred_result, allow = score_for_filter(
                         self._model_filter_model,
                         symbol=signal.symbol,
@@ -969,9 +976,11 @@ class RuntimeOrchestrator:
                         reference_price=signal.reference_price,
                         confidence=signal.confidence,
                         ts_utc=utc_now(),
-                        threshold=0.5,
+                        threshold=model_filter_threshold,
                     )
                     mf = self._strategy_order_outcomes.model_filter
+                    mf.threshold = model_filter_threshold
+                    mf.mode = mf_mode.value
                     self._metrics.inc("strategy_model_filter_reached")
                     if not pred_result.available:
                         mf.prediction_unavailable += 1
@@ -982,13 +991,41 @@ class RuntimeOrchestrator:
                             note=pred_result.feature_missing_note,
                         )
                         continue
-                    elif not allow:
+                    prob = pred_result.prob_fill
+                    mf.prob_count += 1
+                    mf.prob_latest = prob
+                    if mf.prob_min is None or prob < mf.prob_min:
+                        mf.prob_min = prob
+                    if mf.prob_max is None or prob > mf.prob_max:
+                        mf.prob_max = prob
+                    if pred_result.features_used is not None:
+                        mf.latest_features = dict(pred_result.features_used)
+                    would_block = not allow
+                    if mf_mode == ModelFilterMode.SHADOW:
+                        if would_block:
+                            mf.shadow_would_have_blocked += 1
+                            self._logger.info(
+                                "model_filter_shadow_would_have_blocked",
+                                symbol=signal.symbol,
+                                prob_fill=prob,
+                                threshold=model_filter_threshold,
+                            )
+                        else:
+                            mf.allowed += 1
+                            self._logger.info(
+                                "model_filter_allowed",
+                                symbol=signal.symbol,
+                                prob_fill=prob,
+                                threshold=model_filter_threshold,
+                            )
+                    elif would_block:
                         mf.blocked += 1
                         self._metrics.inc("strategy_model_blocked")
                         self._logger.info(
                             "model_filter_blocked",
                             symbol=signal.symbol,
-                            prob_fill=pred_result.prob_fill,
+                            prob_fill=prob,
+                            threshold=model_filter_threshold,
                         )
                         continue
                     else:
@@ -996,7 +1033,8 @@ class RuntimeOrchestrator:
                         self._logger.info(
                             "model_filter_allowed",
                             symbol=signal.symbol,
-                            prob_fill=pred_result.prob_fill,
+                            prob_fill=prob,
+                            threshold=model_filter_threshold,
                         )
 
                 intent = self._execution_engine.build_entry_intent(
@@ -1477,12 +1515,23 @@ class RuntimeOrchestrator:
 
         self._model_filter_model = result.model
         self._model_filter_active = True
+        mf_mode = self._settings.runtime.model_filter_mode
+        mf_threshold = self._settings.runtime.model_filter_threshold
+        self._model_filter_mode = mf_mode
+        self._model_filter_threshold = mf_threshold
+        effective_threshold = (
+            mf_threshold if (mf_mode == ModelFilterMode.THRESHOLD_OVERRIDE and mf_threshold is not None) else 0.5
+        )
+        self._strategy_order_outcomes.model_filter.threshold = effective_threshold
+        self._strategy_order_outcomes.model_filter.mode = mf_mode.value
         self._logger.info(
             "model_filter_status",
             model_filter_enabled=True,
             model_loaded=True,
             model_filter_active=True,
             path=str(result.path),
+            mode=mf_mode.value,
+            threshold=effective_threshold,
         )
 
     def _log_startup_capabilities(self) -> None:
@@ -1608,22 +1657,38 @@ class RuntimeOrchestrator:
             "model_blocked": int(c.get("strategy_model_blocked", 0)),
             "submitted": int(c.get("order_intents_total", 0)),
         }
+        model_filter_calibration: dict[str, object] | None = None
+        if self._model_filter_active:
+            mf = self._strategy_order_outcomes.model_filter
+            model_filter_calibration = {
+                "mode": mf.mode,
+                "threshold": mf.threshold,
+                "blocked": mf.blocked,
+                "allowed": mf.allowed,
+                "shadow_would_have_blocked": mf.shadow_would_have_blocked,
+                "prob_count": mf.prob_count,
+                "prob_min": mf.prob_min,
+                "prob_max": mf.prob_max,
+                "prob_latest": mf.prob_latest,
+            }
         blocking_stage = self._infer_strategy_blocking_stage(c)
         candidate_readiness = dict(self._last_candidate_readiness)
-        self._logger.info(
-            "runtime_summary",
-            mode=self._settings.runtime.mode.value,
-            equity_usdt=equity,
-            ws_public=health_snap.ws_public_connected,
-            ws_private=health_snap.ws_private_connected,
-            private_stream_error=health_snap.private_stream_error,
-            circuit_breaker=health_snap.circuit_breaker_tripped,
-            stale_count=len(health_snap.stale_channels),
-            decisions_total=decisions,
-            strategy_flow=strategy_flow,
-            blocking_stage=blocking_stage,
-            candidate_readiness=candidate_readiness,
-        )
+        log_payload: dict[str, object] = {
+            "mode": self._settings.runtime.mode.value,
+            "equity_usdt": equity,
+            "ws_public": health_snap.ws_public_connected,
+            "ws_private": health_snap.ws_private_connected,
+            "private_stream_error": health_snap.private_stream_error,
+            "circuit_breaker": health_snap.circuit_breaker_tripped,
+            "stale_count": len(health_snap.stale_channels),
+            "decisions_total": decisions,
+            "strategy_flow": strategy_flow,
+            "blocking_stage": blocking_stage,
+            "candidate_readiness": candidate_readiness,
+        }
+        if model_filter_calibration is not None:
+            log_payload["model_filter_calibration"] = model_filter_calibration
+        self._logger.info("runtime_summary", **log_payload)
 
     async def _build_session_summary(self) -> dict[str, object]:
         """Build concise session summary from metrics and session state."""
@@ -1725,9 +1790,17 @@ class RuntimeOrchestrator:
             "enabled": self._settings.runtime.model_filter_enabled,
             "active": self._model_filter_active,
             "model_loaded": self._model_filter_model is not None,
+            "mode": so.model_filter.mode,
+            "threshold": so.model_filter.threshold,
             "blocked": so.model_filter.blocked,
             "allowed": so.model_filter.allowed,
+            "shadow_would_have_blocked": so.model_filter.shadow_would_have_blocked,
             "prediction_unavailable": so.model_filter.prediction_unavailable,
+            "prob_min": so.model_filter.prob_min,
+            "prob_max": so.model_filter.prob_max,
+            "prob_latest": so.model_filter.prob_latest,
+            "prob_count": so.model_filter.prob_count,
+            "latest_features": dict(so.model_filter.latest_features) if so.model_filter.latest_features else None,
         }
         return summary
 
@@ -1834,10 +1907,18 @@ class RuntimeOrchestrator:
             lines.append("## Model Filter (DEMO-only)")
             lines.append(f"- Enabled: {mf.get('enabled', False)}")
             lines.append(f"- Active: {mf.get('active', False)}")
+            lines.append(f"- Mode: {mf.get('mode', 'hard_block')}")
             lines.append(f"- Model loaded: {mf.get('model_loaded', False)}")
+            lines.append(f"- Threshold: {mf.get('threshold', 0.5)}")
             lines.append(f"- Trades allowed by model: {mf.get('allowed', 0)}")
             lines.append(f"- Trades blocked by model: {mf.get('blocked', 0)}")
+            if mf.get("shadow_would_have_blocked", 0) > 0:
+                lines.append(f"- Shadow would have blocked: {mf.get('shadow_would_have_blocked', 0)}")
             lines.append(f"- Prediction unavailable: {mf.get('prediction_unavailable', 0)}")
+            if mf.get("prob_count", 0) > 0:
+                lines.append(f"- Prob stats: min={mf.get('prob_min')} max={mf.get('prob_max')} latest={mf.get('prob_latest')} count={mf.get('prob_count')}")
+            if lf := mf.get("latest_features"):
+                lines.append(f"- Latest features: reference_price={lf.get('reference_price')} confidence={lf.get('confidence')} qty={lf.get('qty')} ts_ordinal={lf.get('ts_ordinal')}")
             lines.append("")
         if summary.get("abort_reasons"):
             lines.append("## Abort Reasons")
