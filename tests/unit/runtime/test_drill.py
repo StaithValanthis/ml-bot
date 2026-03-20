@@ -282,3 +282,46 @@ def test_drill_outcome_abort_details() -> None:
     }
     assert o.abort_details["waited_seconds"] == 25.0
     assert o.abort_details["symbol"] == "BTCUSDT"
+
+
+def test_drill_post_ack_status_classification() -> None:
+    """_drill_post_ack_status classifies outcome for operator visibility."""
+    from trading.runtime.orchestrator import _drill_post_ack_status
+
+    assert _drill_post_ack_status(DrillOutcome(ack_received=False)) == "no_ack"
+    assert (
+        _drill_post_ack_status(
+            DrillOutcome(ack_received=True, final_status=None, completed=False)
+        )
+        == "ack_only_no_transition"
+    )
+    assert (
+        _drill_post_ack_status(
+            DrillOutcome(ack_received=True, final_status="New", completed=False)
+        )
+        == "resting_open"
+    )
+    assert (
+        _drill_post_ack_status(
+            DrillOutcome(ack_received=True, final_status="PartiallyFilled", completed=False)
+        )
+        == "resting_open"
+    )
+    assert (
+        _drill_post_ack_status(
+            DrillOutcome(ack_received=True, final_status="Filled", completed=True)
+        )
+        == "filled"
+    )
+    assert (
+        _drill_post_ack_status(
+            DrillOutcome(ack_received=True, final_status="Cancelled", completed=True)
+        )
+        == "cancelled"
+    )
+    assert (
+        _drill_post_ack_status(
+            DrillOutcome(ack_received=True, final_status="Rejected", completed=True)
+        )
+        == "rejected"
+    )

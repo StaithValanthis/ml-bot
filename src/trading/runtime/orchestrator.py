@@ -56,6 +56,22 @@ from trading.runtime.mode import is_live_execution_mode, is_streaming_mode
 from trading.runtime.scheduler import run_periodic
 
 
+def _drill_post_ack_status(outcome: DrillOutcome) -> str:
+    """Classify post-ack state for operator visibility."""
+    if not outcome.ack_received:
+        return "no_ack"
+    if outcome.completed and outcome.final_status:
+        if outcome.final_status == "Filled":
+            return "filled"
+        if outcome.final_status == "Cancelled":
+            return "cancelled"
+        if outcome.final_status == "Rejected":
+            return "rejected"
+    if outcome.final_status in ("New", "PartiallyFilled"):
+        return "resting_open"
+    return "ack_only_no_transition"
+
+
 class RuntimeOrchestrator:
     """
     Minimal live runtime wiring for market-data-driven decision execution.
@@ -602,6 +618,8 @@ class RuntimeOrchestrator:
                         "qty": str(event.qty) if event.qty is not None else "",
                     },
                 )
+                if link_id and self._drill_outcome.order_link_id == link_id and new_status:
+                    self._drill_outcome.final_status = new_status
                 if prev_status and prev_status != new_status:
                     self._metrics.inc("order_state_transitions_total")
                     await self._ledger.record(
@@ -613,7 +631,6 @@ class RuntimeOrchestrator:
                         },
                     )
                     if link_id and self._drill_outcome.order_link_id == link_id:
-                        self._drill_outcome.final_status = new_status
                         await self._ledger.record(
                             "drill_state_transition",
                             {"order_link_id": link_id, "from_status": prev_status, "to_status": new_status},
@@ -1013,10 +1030,16 @@ class RuntimeOrchestrator:
                 {"order_issues": 0, "position_issues": 0},
             )
             if self._drill_outcome.order_link_id and self._drill_outcome.attempted:
-                await self._ledger.record(
-                    "drill_reconcile_result",
-                    {"order_link_id": self._drill_outcome.order_link_id, "mismatch": False},
-                )
+                post_ack = _drill_post_ack_status(self._drill_outcome)
+                payload: dict[str, object] = {
+                    "order_link_id": self._drill_outcome.order_link_id,
+                    "mismatch": False,
+                }
+                if post_ack == "resting_open":
+                    payload["note"] = "drill_order_resting_open"
+                elif post_ack == "ack_only_no_transition":
+                    payload["note"] = "drill_ack_received_no_further_transition"
+                await self._ledger.record("drill_reconcile_result", payload)
         self._health.mark_reconcile()
 
     async def _watchdog_cycle(self) -> None:
@@ -1218,6 +1241,9 @@ class RuntimeOrchestrator:
                 summary["drill_qty"] = self._drill_outcome.qty
             summary["drill_ack_received"] = self._drill_outcome.ack_received
             summary["drill_reconcile_mismatch"] = self._drill_outcome.reconcile_mismatch
+            if self._drill_outcome.final_status:
+                summary["drill_final_status"] = self._drill_outcome.final_status
+            summary["drill_post_ack_status"] = _drill_post_ack_status(self._drill_outcome)
             if self._drill_outcome.completed:
                 summary["drill_outcome"] = "completed"
             elif self._drill_outcome.aborted:
@@ -1266,6 +1292,9 @@ class RuntimeOrchestrator:
             if summary.get("drill_symbol"):
                 lines.append(f"- Symbol/Side/Qty: {summary.get('drill_symbol')} {summary.get('drill_side', '')} {summary.get('drill_qty', '')}")
             lines.append(f"- Ack received: {summary.get('drill_ack_received', False)}")
+            if summary.get("drill_final_status"):
+                lines.append(f"- Final status: {summary.get('drill_final_status')}")
+            lines.append(f"- Post-ack status: {summary.get('drill_post_ack_status', '')}")
             lines.append(f"- Reconcile mismatch: {summary.get('drill_reconcile_mismatch', False)}")
             lines.append(f"- Outcome: {summary.get('drill_outcome', 'pending')}")
             if summary.get("drill_refused_reason"):

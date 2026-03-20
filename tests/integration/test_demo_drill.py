@@ -689,3 +689,150 @@ def test_drill_summary_fields() -> None:
     assert "Demo Drill" in md
     assert "BTCUSDT" in md
     assert "completed" in md
+
+
+def test_drill_post_ack_status_ack_only_no_transition() -> None:
+    """Session summary reports ack_only_no_transition when ack received but no order update."""
+    settings = load_settings()
+    settings.runtime.demo_drill.enabled = True
+    settings.runtime.mode = RuntimeMode.DEMO
+
+    orch = RuntimeOrchestrator(settings)
+    orch._drill_outcome.enabled = True
+    orch._drill_outcome.attempted = True
+    orch._drill_outcome.order_link_id = "drill-btcu-240101120000"
+    orch._drill_outcome.ack_received = True
+    orch._drill_outcome.final_status = None
+    orch._drill_outcome.completed = False
+
+    summary = orch._build_session_summary()
+    assert summary.get("drill_post_ack_status") == "ack_only_no_transition"
+    assert "drill_final_status" not in summary or summary.get("drill_final_status") is None
+
+    md = orch._build_markdown_summary(summary)
+    assert "ack_only_no_transition" in md
+
+
+def test_drill_post_ack_status_resting_open() -> None:
+    """Session summary reports resting_open when drill order is resting (New/PartiallyFilled)."""
+    settings = load_settings()
+    settings.runtime.demo_drill.enabled = True
+    settings.runtime.mode = RuntimeMode.DEMO
+
+    orch = RuntimeOrchestrator(settings)
+    orch._drill_outcome.enabled = True
+    orch._drill_outcome.attempted = True
+    orch._drill_outcome.order_link_id = "drill-btcu-240101120000"
+    orch._drill_outcome.ack_received = True
+    orch._drill_outcome.final_status = "New"
+    orch._drill_outcome.completed = False
+
+    summary = orch._build_session_summary()
+    assert summary.get("drill_post_ack_status") == "resting_open"
+    assert summary.get("drill_final_status") == "New"
+
+    md = orch._build_markdown_summary(summary)
+    assert "resting_open" in md
+    assert "New" in md
+
+
+def test_drill_post_ack_status_filled() -> None:
+    """Session summary reports filled when drill order completed with Filled."""
+    settings = load_settings()
+    settings.runtime.demo_drill.enabled = True
+    settings.runtime.mode = RuntimeMode.DEMO
+
+    orch = RuntimeOrchestrator(settings)
+    orch._drill_outcome.enabled = True
+    orch._drill_outcome.attempted = True
+    orch._drill_outcome.ack_received = True
+    orch._drill_outcome.final_status = "Filled"
+    orch._drill_outcome.completed = True
+
+    summary = orch._build_session_summary()
+    assert summary.get("drill_post_ack_status") == "filled"
+    assert summary.get("drill_final_status") == "Filled"
+
+
+@pytest.mark.asyncio
+async def test_drill_reconcile_result_note_resting_open() -> None:
+    """Reconcile records drill_reconcile_result with note when drill order is resting open."""
+    from trading.execution.reconciler import ReconciliationReport
+
+    with patch.dict(os.environ, {"TRADING_MODE": "demo", "TRADING_DRY_RUN": "false", "TRADING_DEMO_DRILL_ENABLED": "true"}):
+        settings = load_settings()
+    settings.runtime.demo_drill.enabled = True
+    settings.runtime.mode = RuntimeMode.DEMO
+
+    capture = _CaptureLedger()
+    mock_reconciler = MagicMock()
+    mock_reconciler.reconcile_orders = AsyncMock(
+        return_value=ReconciliationReport(ok=True, issues=[])
+    )
+    mock_reconciler.reconcile_positions = AsyncMock(
+        return_value=ReconciliationReport(ok=True, issues=[])
+    )
+
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient"),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient"),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient"),
+        patch.object(RuntimeOrchestrator, "_has_auth_credentials", return_value=True),
+    ):
+        orch = RuntimeOrchestrator(settings)
+        orch._reconciler = mock_reconciler
+        orch._ledger._sinks.insert(0, capture)
+        orch._drill_outcome.enabled = True
+        orch._drill_outcome.attempted = True
+        orch._drill_outcome.order_link_id = "drill-btcu-240101120000"
+        orch._drill_outcome.ack_received = True
+        orch._drill_outcome.final_status = "New"
+        orch._drill_outcome.completed = False
+
+        await orch._reconcile_cycle()
+
+    ev = next(e for e in capture.events if e.event_type == "drill_reconcile_result")
+    assert ev.payload.get("mismatch") is False
+    assert ev.payload.get("note") == "drill_order_resting_open"
+
+
+@pytest.mark.asyncio
+async def test_drill_reconcile_result_note_ack_only_no_transition() -> None:
+    """Reconcile records drill_reconcile_result with note when ack received but no further transition."""
+    from trading.execution.reconciler import ReconciliationReport
+
+    with patch.dict(os.environ, {"TRADING_MODE": "demo", "TRADING_DRY_RUN": "false", "TRADING_DEMO_DRILL_ENABLED": "true"}):
+        settings = load_settings()
+    settings.runtime.demo_drill.enabled = True
+    settings.runtime.mode = RuntimeMode.DEMO
+
+    capture = _CaptureLedger()
+    mock_reconciler = MagicMock()
+    mock_reconciler.reconcile_orders = AsyncMock(
+        return_value=ReconciliationReport(ok=True, issues=[])
+    )
+    mock_reconciler.reconcile_positions = AsyncMock(
+        return_value=ReconciliationReport(ok=True, issues=[])
+    )
+
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient"),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient"),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient"),
+        patch.object(RuntimeOrchestrator, "_has_auth_credentials", return_value=True),
+    ):
+        orch = RuntimeOrchestrator(settings)
+        orch._reconciler = mock_reconciler
+        orch._ledger._sinks.insert(0, capture)
+        orch._drill_outcome.enabled = True
+        orch._drill_outcome.attempted = True
+        orch._drill_outcome.order_link_id = "drill-btcu-240101120000"
+        orch._drill_outcome.ack_received = True
+        orch._drill_outcome.final_status = None
+        orch._drill_outcome.completed = False
+
+        await orch._reconcile_cycle()
+
+    ev = next(e for e in capture.events if e.event_type == "drill_reconcile_result")
+    assert ev.payload.get("mismatch") is False
+    assert ev.payload.get("note") == "drill_ack_received_no_further_transition"
