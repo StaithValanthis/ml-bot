@@ -108,6 +108,7 @@
   "tests/unit/runtime/test_drill.py::test_build_drill_intent_post_only",
   "tests/unit/runtime/test_drill.py::test_drill_outcome_abort_details",
   "tests/unit/runtime/test_drill.py::test_drill_outcome_defaults",
+  "tests/unit/runtime/test_drill.py::test_drill_post_ack_status_classification",
   "tests/unit/runtime/test_drill.py::test_generate_drill_order_link_id",
   "tests/unit/runtime/test_drill.py::test_validate_drill_allowed",
   "tests/unit/runtime/test_drill.py::test_validate_drill_configurable_max_notional",

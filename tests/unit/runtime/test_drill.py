@@ -325,3 +325,10 @@ def test_drill_post_ack_status_classification() -> None:
         )
         == "rejected"
     )
+    # Terminal status without completed (e.g. first update is Filled, prev_status was None)
+    assert (
+        _drill_post_ack_status(
+            DrillOutcome(ack_received=True, final_status="Filled", completed=False)
+        )
+        == "filled"
+    )
