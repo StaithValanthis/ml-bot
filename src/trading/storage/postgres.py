@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from typing import Any
 
 import asyncpg
 
 from trading.journal.ledger import LedgerEvent
+from trading.util.json_util import _json_default
 
 
 class PostgresJournalStore:
@@ -35,7 +35,9 @@ class PostgresJournalStore:
     async def write_event(self, event: LedgerEvent) -> None:
         if self._pool is None:
             return
-        payload_json = json.dumps(event.payload, separators=(",", ":"), default=_json_default)
+        payload_json = json.dumps(
+            event.payload, separators=(",", ":"), default=_json_default
+        )
         async with self._pool.acquire() as conn:
             await conn.execute(
                 """
@@ -64,7 +66,3 @@ class PostgresJournalStore:
             )
 
 
-def _json_default(value: Any) -> str:
-    if isinstance(value, datetime):
-        return value.isoformat()
-    return str(value)

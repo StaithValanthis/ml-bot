@@ -6,6 +6,8 @@ from typing import Any
 
 import structlog
 
+from trading.util.json_util import _json_default
+
 
 def configure_logging(*, level: str, json_output: bool, logger_name: str) -> None:
     """Configure stdlib + structlog for consistent structured logs."""
@@ -18,7 +20,7 @@ def configure_logging(*, level: str, json_output: bool, logger_name: str) -> Non
         structlog.processors.TimeStamper(fmt="iso", utc=True),
     ]
     if json_output:
-        processors.append(structlog.processors.JSONRenderer())
+        processors.append(structlog.processors.JSONRenderer(default=_json_default))
     else:
         processors.append(structlog.dev.ConsoleRenderer())
 

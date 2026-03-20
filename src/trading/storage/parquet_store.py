@@ -42,4 +42,6 @@ class ParquetArchiveStore:
 def _payload_to_json(payload: dict[str, Any]) -> str:
     import json
 
-    return json.dumps(payload, separators=(",", ":"), default=str)
+    from trading.util.json_util import _json_default
+
+    return json.dumps(payload, separators=(",", ":"), default=_json_default)

@@ -6,6 +6,7 @@
   "tests/integration/test_config_loading.py::test_load_settings_risk_per_symbol_optional",
   "tests/integration/test_config_loading.py::test_load_settings_symbols_validated",
   "tests/integration/test_demo_drill.py::test_drill_abort_summary_includes_improved_details",
+  "tests/integration/test_demo_drill.py::test_drill_ledger_payloads_with_decimal_serialize",
   "tests/integration/test_demo_drill.py::test_drill_refusal_details_in_summary",
   "tests/integration/test_demo_drill.py::test_drill_refused_outside_demo",
   "tests/integration/test_demo_drill.py::test_drill_refused_when_dry_run",
@@ -14,6 +15,7 @@
   "tests/integration/test_demo_drill.py::test_drill_summary_fields",
   "tests/integration/test_demo_drill.py::test_drill_waits_for_market_data_before_aborting",
   "tests/integration/test_demo_drill.py::test_mocked_successful_demo_drill_ack_flow",
+  "tests/integration/test_demo_drill.py::test_session_summary_with_decimal_drill_details_serializes",
   "tests/integration/test_execution_lifecycle.py::test_mocked_place_order_ack_flow",
   "tests/integration/test_execution_lifecycle.py::test_order_manager_state_transition_flow",
   "tests/integration/test_execution_lifecycle.py::test_portfolio_refresh_uses_symbol_scoped_positions",
@@ -106,5 +108,11 @@
   "tests/unit/runtime/test_drill.py::test_validate_drill_refused_when_dry_run",
   "tests/unit/runtime/test_drill.py::test_validate_drill_refused_when_notional_exceeds_cap",
   "tests/unit/runtime/test_drill.py::test_validate_drill_refused_when_qty_below_min",
-  "tests/unit/runtime/test_drill.py::test_validate_drill_refused_when_symbol_not_configured"
+  "tests/unit/runtime/test_drill.py::test_validate_drill_refused_when_symbol_not_configured",
+  "tests/unit/util/test_json_util.py::test_drill_payload_with_decimal_serializes",
+  "tests/unit/util/test_json_util.py::test_dumps_json_safe_with_decimal_payload",
+  "tests/unit/util/test_json_util.py::test_dumps_json_safe_with_nested_decimal",
+  "tests/unit/util/test_json_util.py::test_json_default_datetime",
+  "tests/unit/util/test_json_util.py::test_json_default_decimal",
+  "tests/unit/util/test_json_util.py::test_json_safe_recursive"
 ]

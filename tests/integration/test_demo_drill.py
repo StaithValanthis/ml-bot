@@ -448,6 +448,74 @@ def test_drill_abort_summary_includes_improved_details() -> None:
     assert "25.0" in md
 
 
+@pytest.mark.asyncio
+async def test_drill_ledger_payloads_with_decimal_serialize() -> None:
+    """Ledger events with Decimal in payload (e.g. from drill path) serialize without crash."""
+    import tempfile
+    from decimal import Decimal
+
+    from trading.journal.ledger import LedgerEvent
+    from trading.storage.parquet_store import ParquetArchiveStore
+    from trading.util.time import utc_now
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = ParquetArchiveStore(tmp)
+        event = LedgerEvent(
+            event_type="drill_requested",
+            timestamp=utc_now(),
+            payload={
+                "symbol": "BTCUSDT",
+                "qty": Decimal("0.001"),
+                "side": "Buy",
+                "order_link_id": "drill-btcu-240320100000",
+            },
+        )
+        await store.write_event(event)
+    # No serialization crash = success
+
+
+def test_session_summary_with_decimal_drill_details_serializes() -> None:
+    """Session summary with Decimal in drill_abort_details serializes without crash."""
+    from decimal import Decimal
+
+    from trading.runtime.orchestrator import RuntimeOrchestrator
+    from trading.settings import load_settings
+    from trading.util.json_util import dumps_json_safe
+    from trading.util.types import RuntimeMode
+
+    settings = load_settings()
+    settings.runtime.demo_drill.enabled = True
+    settings.runtime.mode = RuntimeMode.DEMO
+
+    orch = RuntimeOrchestrator(settings)
+    orch._drill_outcome.enabled = True
+    orch._drill_outcome.attempted = True
+    orch._drill_outcome.aborted = True
+    orch._drill_outcome.refused_reason = "drill_refused_notional_exceeds_cap_10"
+    orch._drill_outcome.abort_details = {
+        "symbol": "BTCUSDT",
+        "qty": "0.001",
+        "min_qty": "0.001",
+        "estimated_notional_usdt": "50",
+        "max_notional_usdt": "10",
+    }
+    # Simulate Decimal leaking into summary (e.g. from a different code path)
+    summary = orch._build_session_summary()
+    summary["drill_abort_details"] = {
+        "symbol": "BTCUSDT",
+        "qty": Decimal("0.001"),
+        "estimated_notional_usdt": Decimal("50"),
+        "max_notional_usdt": Decimal("10"),
+    }
+    result = dumps_json_safe(summary, indent=2)
+    assert "Object of type Decimal is not JSON serializable" not in result
+    import json
+
+    parsed = json.loads(result)
+    assert parsed["drill_abort_details"]["qty"] == "0.001"
+    assert parsed["drill_abort_details"]["estimated_notional_usdt"] == "50"
+
+
 def test_drill_refusal_details_in_summary() -> None:
     """Session summary includes structured refusal details (symbol, qty, min_qty, notional, cap)."""
     settings = load_settings()

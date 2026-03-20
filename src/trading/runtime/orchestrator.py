@@ -38,6 +38,7 @@ from trading.settings import AppSettings
 from trading.strategy.candidates import BreakoutTrendCandidateGenerator
 from trading.strategy.regime_filter import RegimeFilter
 from trading.strategy.signal_engine import SignalEngine
+from trading.util.json_util import dumps_json_safe
 from trading.util.logging import get_logger
 from trading.util.time import utc_now
 from trading.util.types import MarketSymbol, OrderSide, PositionSide, RuntimeMode
@@ -1295,7 +1296,7 @@ class RuntimeOrchestrator:
         json_path = report_dir / f"session_{ts}.json"
         md_path = report_dir / f"session_{ts}.md"
         try:
-            json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            json_path.write_text(dumps_json_safe(summary, indent=2), encoding="utf-8")
             md_path.write_text(self._build_markdown_summary(summary), encoding="utf-8")
             self._logger.info(
                 "session_summary_written",
