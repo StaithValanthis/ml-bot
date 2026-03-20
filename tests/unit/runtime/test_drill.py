@@ -144,3 +144,18 @@ def test_drill_outcome_defaults() -> None:
     assert o.ack_received is False
     assert o.completed is False
     assert o.aborted is False
+    assert o.abort_details is None
+
+
+def test_drill_outcome_abort_details() -> None:
+    """DrillOutcome stores abort_details for structured timeout reporting."""
+    o = DrillOutcome()
+    o.abort_details = {
+        "waited_seconds": 25.0,
+        "symbol": "BTCUSDT",
+        "ws_public_connected": False,
+        "ticker_seen": False,
+        "trade_seen": False,
+    }
+    assert o.abort_details["waited_seconds"] == 25.0
+    assert o.abort_details["symbol"] == "BTCUSDT"

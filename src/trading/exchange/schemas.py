@@ -41,6 +41,15 @@ class ServerTimeResult(BybitBaseModel):
     time_nano: str = Field(alias="timeNano")
 
 
+class TickerItem(BybitBaseModel):
+    """Bybit v5 market ticker; bid/ask/last for drill reference price fallback."""
+
+    symbol: str
+    last_price: str = Field(alias="lastPrice")
+    bid1_price: str = Field(alias="bid1Price")
+    ask1_price: str = Field(alias="ask1Price")
+
+
 class FeeRateItem(BybitBaseModel):
     symbol: str
     taker_fee_rate: Decimal = Field(alias="takerFeeRate")

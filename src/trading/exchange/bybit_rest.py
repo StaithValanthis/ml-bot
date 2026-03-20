@@ -25,6 +25,7 @@ from trading.exchange.schemas import (
     PlaceOrderRequest,
     PositionItem,
     ServerTimeResult,
+    TickerItem,
     WalletBalanceItem,
 )
 from trading.settings import ExchangeSettings
@@ -105,6 +106,20 @@ class BybitRestClient:
         data = await self._request("GET", "/v5/market/time", endpoint_group="market", auth=False)
         result = self._validate_envelope(data, "server time")
         return ServerTimeResult.model_validate(result)
+
+    async def get_ticker(self, *, category: str, symbol: str) -> TickerItem | None:
+        """Fetch single-symbol ticker from REST; public, no auth. For drill reference price fallback."""
+        data = await self._request(
+            "GET",
+            "/v5/market/tickers",
+            params={"category": category, "symbol": symbol},
+            endpoint_group="market",
+            auth=False,
+        )
+        result = self._validate_envelope(data, "tickers")
+        list_result = BybitListResult[TickerItem].model_validate(result)
+        items = list_result.items
+        return items[0] if items else None
 
     async def get_fee_rate(self, *, category: str, symbol: str) -> list[FeeRateItem]:
         data = await self._request(

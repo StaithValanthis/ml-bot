@@ -337,6 +337,136 @@ class RuntimeOrchestrator:
                     return
             await asyncio.sleep(0.5)
 
+    async def _wait_for_drill_reference_price(
+        self,
+        *,
+        symbol: str,
+        side: OrderSide,
+        timeout_seconds: float = 25.0,
+        poll_interval_seconds: float = 2.0,
+    ) -> tuple[Decimal | None, dict[str, object]]:
+        """
+        Wait for usable reference price from WS market state, with REST fallback.
+        Returns (ref_price, abort_details). abort_details populated only on timeout.
+        """
+        waited = 0.0
+        logged_waiting = False
+        rest_fallback_attempted = False
+
+        while waited < timeout_seconds:
+            if self._stop_event.is_set():
+                health = self._health.snapshot()
+                return (
+                    None,
+                    {
+                        "waited_seconds": round(waited, 1),
+                        "symbol": symbol,
+                        "ws_public_connected": health.ws_public_connected,
+                        "ticker_seen": False,
+                        "trade_seen": False,
+                        "reason": "stop_requested",
+                    },
+                )
+
+            snap = await self._market_state.snapshot()
+            ticker = snap.tickers.get(symbol)
+            last_trade = snap.last_trade.get(symbol)
+            health = self._health.snapshot()
+
+            if ticker and ticker.bid_price and ticker.ask_price and ticker.bid_price > 0 and ticker.ask_price > 0:
+                ref = ticker.bid_price if side == OrderSide.BUY else ticker.ask_price
+                self._logger.info(
+                    "drill_market_data_ready",
+                    symbol=symbol,
+                    source="ticker",
+                    waited_seconds=round(waited, 1),
+                )
+                await self._ledger.record(
+                    "drill_market_data_ready",
+                    {"symbol": symbol, "source": "ticker", "waited_seconds": round(waited, 1)},
+                )
+                return (ref, {})
+
+            if last_trade and last_trade.price and last_trade.price > 0:
+                self._logger.info(
+                    "drill_market_data_ready",
+                    symbol=symbol,
+                    source="last_trade",
+                    waited_seconds=round(waited, 1),
+                )
+                await self._ledger.record(
+                    "drill_market_data_ready",
+                    {"symbol": symbol, "source": "last_trade", "waited_seconds": round(waited, 1)},
+                )
+                return (last_trade.price, {})
+
+            if not logged_waiting:
+                self._logger.info(
+                    "drill_waiting_for_market_data",
+                    symbol=symbol,
+                    ws_public_connected=health.ws_public_connected,
+                    ticker_seen=ticker is not None,
+                    trade_seen=last_trade is not None,
+                )
+                await self._ledger.record(
+                    "drill_waiting_for_market_data",
+                    {
+                        "symbol": symbol,
+                        "ws_public_connected": health.ws_public_connected,
+                        "ticker_seen": ticker is not None,
+                        "trade_seen": last_trade is not None,
+                    },
+                )
+                logged_waiting = True
+
+            remaining = timeout_seconds - waited
+            if remaining <= 5.0 and not rest_fallback_attempted:
+                rest_fallback_attempted = True
+                try:
+                    ticker_item = await self._rest.get_ticker(
+                        category=self._settings.trading.category,
+                        symbol=symbol,
+                    )
+                    if ticker_item:
+                        bid_val = Decimal(ticker_item.bid1_price) if ticker_item.bid1_price else Decimal("0")
+                        ask_val = Decimal(ticker_item.ask1_price) if ticker_item.ask1_price else Decimal("0")
+                        last_val = Decimal(ticker_item.last_price) if ticker_item.last_price else Decimal("0")
+                        ref = bid_val if side == OrderSide.BUY and bid_val > 0 else ask_val if ask_val > 0 else last_val
+                        if ref > 0:
+                            self._logger.info(
+                                "drill_market_data_ready",
+                                symbol=symbol,
+                                source="rest_fallback",
+                                waited_seconds=round(waited, 1),
+                            )
+                            await self._ledger.record(
+                                "drill_market_data_ready",
+                                {"symbol": symbol, "source": "rest_fallback", "waited_seconds": round(waited, 1)},
+                            )
+                            return (ref, {})
+                except BybitRestError:
+                    pass
+
+            await asyncio.sleep(min(poll_interval_seconds, remaining))
+            waited += poll_interval_seconds
+
+        health = self._health.snapshot()
+        snap = await self._market_state.snapshot()
+        ticker = snap.tickers.get(symbol)
+        last_trade = snap.last_trade.get(symbol)
+        abort_details = {
+            "waited_seconds": round(waited, 1),
+            "symbol": symbol,
+            "ws_public_connected": health.ws_public_connected,
+            "ticker_seen": ticker is not None,
+            "trade_seen": last_trade is not None,
+            "rest_fallback_attempted": rest_fallback_attempted,
+            "reason": "timeout",
+        }
+        self._logger.warning("drill_market_data_timeout", **abort_details)
+        await self._ledger.record("drill_market_data_timeout", abort_details)
+        return (None, abort_details)
+
     async def _demo_drill_cycle(self) -> None:
         """Run one demo drill order; DEMO-only, gated by config."""
         await asyncio.sleep(15.0)
@@ -352,16 +482,19 @@ class RuntimeOrchestrator:
         symbol_spec = self._symbol_specs.get(config.symbol)
         ref_price: Decimal | None = None
         if mode == DrillMode.POST_ONLY_LIMIT:
-            snap = await self._market_state.snapshot()
-            ticker = snap.tickers.get(config.symbol)
-            if ticker and ticker.bid_price and ticker.ask_price:
-                ref_price = ticker.bid_price if config.side == OrderSide.BUY else ticker.ask_price
-            else:
+            ref_price, abort_details = await self._wait_for_drill_reference_price(
+                symbol=config.symbol,
+                side=config.side,
+                timeout_seconds=25.0,
+                poll_interval_seconds=2.0,
+            )
+            if ref_price is None:
                 self._drill_outcome.attempted = True
                 self._drill_outcome.aborted = True
-                self._drill_outcome.refused_reason = "drill_refused_no_ticker"
-                await self._ledger.record("drill_aborted", {"reason": "no_ticker"})
-                self._logger.warning("demo_drill_aborted", reason="no_ticker")
+                self._drill_outcome.refused_reason = "drill_refused_market_data_timeout"
+                self._drill_outcome.abort_details = abort_details
+                await self._ledger.record("drill_aborted", {"reason": "market_data_timeout", "details": abort_details})
+                self._logger.warning("demo_drill_aborted", reason="market_data_timeout", **abort_details)
                 return
 
         refuse = validate_drill(
@@ -1088,6 +1221,8 @@ class RuntimeOrchestrator:
                 summary["drill_outcome"] = "aborted"
                 if self._drill_outcome.refused_reason:
                     summary["drill_refused_reason"] = self._drill_outcome.refused_reason
+                if self._drill_outcome.abort_details:
+                    summary["drill_abort_details"] = self._drill_outcome.abort_details
             else:
                 summary["drill_outcome"] = "pending"
         if self._abort_reasons:
@@ -1132,6 +1267,10 @@ class RuntimeOrchestrator:
             lines.append(f"- Outcome: {summary.get('drill_outcome', 'pending')}")
             if summary.get("drill_refused_reason"):
                 lines.append(f"- Refused reason: {summary.get('drill_refused_reason')}")
+            if details := summary.get("drill_abort_details"):
+                lines.append("- Abort details:")
+                for k, v in details.items():
+                    lines.append(f"  - {k}: {v}")
             lines.append("")
         if summary.get("abort_reasons"):
             lines.append("## Abort Reasons")

@@ -35,6 +35,7 @@ class DrillOutcome:
     enabled: bool = False
     attempted: bool = False
     refused_reason: str | None = None
+    abort_details: dict[str, object] | None = None
     symbol: str | None = None
     side: str | None = None
     qty: str | None = None
