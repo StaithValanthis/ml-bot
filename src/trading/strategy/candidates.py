@@ -2,9 +2,63 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 from trading.strategy.base_alpha import AlphaCandidate, BaseAlpha, CandidateType
 from trading.util.types import OHLCVBar
+
+
+def get_candidate_readiness(
+    symbol: str,
+    bars_5m: list[OHLCVBar],
+    bars_1h: list[OHLCVBar],
+    *,
+    lookback_bars: int = 20,
+) -> dict[str, Any]:
+    """
+    Compute candidate-generation readiness for operator visibility.
+
+    Returns dict with: bars_5m, bars_1h, has_enough_5m, has_enough_1h,
+    unconfirmed_in_5m_window, unconfirmed_in_1h_window, reason.
+    Does not change strategy behavior.
+    """
+    min_5m = lookback_bars + 2
+    min_1h = 24
+    bars_5m_count = len(bars_5m)
+    bars_1h_count = len(bars_1h)
+    has_enough_5m = bars_5m_count >= min_5m
+    has_enough_1h = bars_1h_count >= min_1h
+
+    unconfirmed_in_5m_window = False
+    if has_enough_5m:
+        window_5m = bars_5m[-(lookback_bars + 2) :]
+        unconfirmed_in_5m_window = any(not bar.confirmed for bar in window_5m)
+
+    unconfirmed_in_1h_window = False
+    if has_enough_1h:
+        window_1h = bars_1h[-24:]
+        unconfirmed_in_1h_window = any(not bar.confirmed for bar in window_1h)
+
+    reason: str
+    if not has_enough_5m:
+        reason = "insufficient_5m_history"
+    elif unconfirmed_in_5m_window:
+        reason = "unconfirmed_5m_in_window"
+    else:
+        reason = "ready"
+
+    return {
+        "symbol": symbol,
+        "bars_5m": bars_5m_count,
+        "bars_1h": bars_1h_count,
+        "min_5m_required": min_5m,
+        "min_1h_required": min_1h,
+        "has_enough_5m": has_enough_5m,
+        "has_enough_1h": has_enough_1h,
+        "unconfirmed_in_5m_window": unconfirmed_in_5m_window,
+        "unconfirmed_in_1h_window": unconfirmed_in_1h_window,
+        "reason": reason,
+    }
 
 
 @dataclass(slots=True, frozen=True)
@@ -27,6 +81,14 @@ class BreakoutTrendCandidateGenerator(BaseAlpha):
 
     def __init__(self, config: CandidateGeneratorConfig | None = None) -> None:
         self._cfg = config or CandidateGeneratorConfig()
+
+    def get_readiness(
+        self, symbol: str, bars_5m: list[OHLCVBar], bars_1h: list[OHLCVBar]
+    ) -> dict[str, Any]:
+        """Return candidate-generation readiness for operator visibility."""
+        return get_candidate_readiness(
+            symbol, bars_5m, bars_1h, lookback_bars=self._cfg.lookback_bars
+        )
 
     def on_closed_candle(self, symbol: str, bars_5m: list[OHLCVBar]) -> list[AlphaCandidate]:
         # Strategy rule: absolutely no decisions on partially formed candles.

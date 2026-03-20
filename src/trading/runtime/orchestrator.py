@@ -147,6 +147,7 @@ class RuntimeOrchestrator:
         self._execution_engine = ExecutionEngine(strategy_id="v1alpha")
 
         self._bar_history: dict[str, dict[str, deque]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=800)))
+        self._last_candidate_readiness: dict[str, dict[str, object]] = {}
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
             available_balance_usdt=Decimal("0"),
@@ -716,7 +717,25 @@ class RuntimeOrchestrator:
 
             bars_5m = list(self._bar_history[bar.symbol][self._settings.trading.candle_timeframe])
             bars_1h = list(self._bar_history[bar.symbol][self._settings.trading.regime_timeframe])
+            readiness = self._candidate_generator.get_readiness(bar.symbol, bars_5m, bars_1h)
             candidates = self._candidate_generator.on_closed_candle(bar.symbol, bars_5m)
+            readiness = dict(readiness)
+            readiness["candidate_count"] = len(candidates)
+            if readiness["reason"] == "ready" and len(candidates) == 0:
+                readiness["reason"] = "no_pattern_match"
+            self._last_candidate_readiness[bar.symbol] = readiness
+            if len(candidates) == 0:
+                self._logger.info(
+                    "candidate_readiness",
+                    symbol=bar.symbol,
+                    bars_5m=readiness["bars_5m"],
+                    bars_1h=readiness["bars_1h"],
+                    has_enough_5m=readiness["has_enough_5m"],
+                    has_enough_1h=readiness["has_enough_1h"],
+                    unconfirmed_in_5m_window=readiness["unconfirmed_in_5m_window"],
+                    reason=readiness["reason"],
+                    candidate_count=len(candidates),
+                )
 
             self._metrics.inc("strategy_bars_confirmed")
             for candidate in candidates:
@@ -1428,6 +1447,7 @@ class RuntimeOrchestrator:
             "submitted": int(c.get("order_intents_total", 0)),
         }
         blocking_stage = self._infer_strategy_blocking_stage(c)
+        candidate_readiness = dict(self._last_candidate_readiness)
         self._logger.info(
             "runtime_summary",
             mode=self._settings.runtime.mode.value,
@@ -1440,6 +1460,7 @@ class RuntimeOrchestrator:
             decisions_total=decisions,
             strategy_flow=strategy_flow,
             blocking_stage=blocking_stage,
+            candidate_readiness=candidate_readiness,
         )
 
     async def _build_session_summary(self) -> dict[str, object]:
@@ -1488,6 +1509,7 @@ class RuntimeOrchestrator:
                 "submitted": int(metrics.counters.get("order_intents_total", 0)),
             },
             "blocking_stage": self._infer_strategy_blocking_stage(metrics.counters),
+            "candidate_readiness": dict(self._last_candidate_readiness),
         }
         if self._health.snapshot().private_stream_error is not None:
             summary["private_stream_error"] = self._health.snapshot().private_stream_error
@@ -1565,6 +1587,13 @@ class RuntimeOrchestrator:
             f"- Blocking stage: {summary.get('blocking_stage', 'unknown')}",
             "",
         ]
+        if readiness := summary.get("candidate_readiness"):
+            lines.append("## Candidate Readiness")
+            for sym, r in sorted(readiness.items()):
+                lines.append(f"- {sym}: bars_5m={r.get('bars_5m', 0)} bars_1h={r.get('bars_1h', 0)} "
+                    f"enough_5m={r.get('has_enough_5m', False)} enough_1h={r.get('has_enough_1h', False)} "
+                    f"reason={r.get('reason', '')} candidates={r.get('candidate_count', 0)}")
+            lines.append("")
         if flow := summary.get("strategy_flow"):
             lines.append("## Strategy Flow")
             f = flow

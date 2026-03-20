@@ -195,6 +195,7 @@ async def test_session_summary_written_for_paper_run() -> None:
     assert "bars_confirmed" in flow
     assert "candidates" in flow
     assert "regime_rejected" in flow
+    assert "candidate_readiness" in data
 
 
 @pytest.mark.asyncio
