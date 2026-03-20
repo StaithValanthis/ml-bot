@@ -52,6 +52,7 @@ from trading.runtime.drill import (
     validate_drill,
 )
 from trading.runtime.strategy_orders import ModelFilterOutcomes, StrategyOrderOutcomes
+from trading.runtime.warmup import preload_warmup_klines, WarmupResult
 from trading.storage.postgres import PostgresJournalStore
 from trading.runtime.mode import is_live_execution_mode, is_streaming_mode
 from trading.runtime.scheduler import run_periodic
@@ -148,6 +149,7 @@ class RuntimeOrchestrator:
 
         self._bar_history: dict[str, dict[str, deque]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=800)))
         self._last_candidate_readiness: dict[str, dict[str, object]] = {}
+        self._warmup_results: list[WarmupResult] = []
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
             available_balance_usdt=Decimal("0"),
@@ -227,6 +229,18 @@ class RuntimeOrchestrator:
             else:
                 self._startup_auth_disabled = True
                 self._logger.info("runtime_auth_features_disabled", reason="missing_api_credentials")
+
+            warmup_results = await preload_warmup_klines(
+                self._rest,
+                self._bar_history,
+                symbols=self._settings.trading.symbols,
+                category=self._settings.trading.category,
+                candle_timeframe=self._settings.trading.candle_timeframe,
+                regime_timeframe=self._settings.trading.regime_timeframe,
+                min_5m_bars=22,
+                min_1h_bars=24,
+            )
+            self._warmup_results = warmup_results
 
             public_topics = _public_topics(
                 symbols=self._settings.trading.symbols,
@@ -1510,6 +1524,10 @@ class RuntimeOrchestrator:
             },
             "blocking_stage": self._infer_strategy_blocking_stage(metrics.counters),
             "candidate_readiness": dict(self._last_candidate_readiness),
+            "warmup_results": [
+                {"symbol": r.symbol, "timeframe": r.timeframe, "bars_loaded": r.bars_loaded, "min_required": r.min_required, "satisfied": r.satisfied}
+                for r in self._warmup_results
+            ],
         }
         if self._health.snapshot().private_stream_error is not None:
             summary["private_stream_error"] = self._health.snapshot().private_stream_error
@@ -1587,6 +1605,11 @@ class RuntimeOrchestrator:
             f"- Blocking stage: {summary.get('blocking_stage', 'unknown')}",
             "",
         ]
+        if warmup := summary.get("warmup_results"):
+            lines.append("## Warmup Preload")
+            for r in warmup:
+                lines.append(f"- {r.get('symbol', '')} {r.get('timeframe', '')}: loaded={r.get('bars_loaded', 0)} required={r.get('min_required', 0)} satisfied={r.get('satisfied', False)}")
+            lines.append("")
         if readiness := summary.get("candidate_readiness"):
             lines.append("## Candidate Readiness")
             for sym, r in sorted(readiness.items()):

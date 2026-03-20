@@ -139,6 +139,28 @@ async def test_paper_startup_logs_capabilities_and_durable_sinks() -> None:
     assert order_state.get("recovery_implemented") is False
 
 
+def _make_mock_kline_items(interval_min: int, count: int) -> list:
+    """Create mock KlineItems for warmup tests."""
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from trading.exchange.schemas import KlineItem
+
+    base_ms = int(datetime(2024, 1, 1, 10, 0, 0, tzinfo=UTC).timestamp() * 1000)
+    return [
+        KlineItem(
+            start_time_ms=base_ms + i * interval_min * 60 * 1000,
+            open_price=Decimal("40000"),
+            high_price=Decimal("40010"),
+            low_price=Decimal("39990"),
+            close_price=Decimal("40005"),
+            volume=Decimal("100"),
+            turnover=Decimal("4000500"),
+        )
+        for i in range(count)
+    ]
+
+
 @pytest.mark.asyncio
 async def test_session_summary_written_for_paper_run() -> None:
     """Paper run writes session summary to archive/session_summaries/."""
@@ -152,6 +174,13 @@ async def test_session_summary_written_for_paper_run() -> None:
     mock_rest.get_positions = AsyncMock(return_value=[])
     mock_rest.get_open_orders = AsyncMock(return_value=[])
     mock_rest.close = AsyncMock()
+
+    async def mock_get_kline(*, category: str, symbol: str, interval: str, **kwargs: object) -> list:
+        if interval == "5":
+            return _make_mock_kline_items(5, 30)
+        return _make_mock_kline_items(60, 30)
+
+    mock_rest.get_kline = AsyncMock(side_effect=mock_get_kline)
 
     mock_ws_public = MagicMock()
     mock_ws_public.subscribe = AsyncMock()
@@ -196,6 +225,9 @@ async def test_session_summary_written_for_paper_run() -> None:
     assert "candidates" in flow
     assert "regime_rejected" in flow
     assert "candidate_readiness" in data
+    assert "warmup_results" in data
+    warmup = data.get("warmup_results", [])
+    assert len(warmup) >= 2
 
 
 @pytest.mark.asyncio
