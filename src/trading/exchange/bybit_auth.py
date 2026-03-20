@@ -7,6 +7,7 @@ from time import time
 from urllib.parse import urlencode
 
 from trading.settings import ExchangeSettings
+from trading.util.json_util import _json_default
 
 
 def bybit_timestamp_ms() -> str:
@@ -21,9 +22,10 @@ def canonical_query_string(params: dict[str, object] | None) -> str:
 
 
 def canonical_json_body(body: dict[str, object] | None) -> str:
+    """Serialize request body to JSON for signing and outbound POST. Handles Decimal/datetime."""
     if not body:
         return ""
-    return json.dumps(body, separators=(",", ":"), sort_keys=True)
+    return json.dumps(body, separators=(",", ":"), sort_keys=True, default=_json_default)
 
 
 def sign_v5(

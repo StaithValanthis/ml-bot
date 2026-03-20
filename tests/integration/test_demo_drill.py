@@ -449,6 +449,115 @@ def test_drill_abort_summary_includes_improved_details() -> None:
 
 
 @pytest.mark.asyncio
+async def test_drill_reaches_post_body_construction_with_decimal() -> None:
+    """DEMO drill path reaches place_order POST body construction without Decimal serialization failure."""
+    from unittest.mock import MagicMock
+
+    from pydantic import SecretStr
+
+    from trading.exchange.bybit_rest import BybitRestClient
+
+    with patch.dict(os.environ, {"TRADING_MODE": "demo", "TRADING_DRY_RUN": "false", "TRADING_DEMO_DRILL_ENABLED": "true"}):
+        settings = load_settings()
+    settings.runtime.demo_drill.enabled = True
+    settings.runtime.mode = RuntimeMode.DEMO
+    settings.runtime.dry_run = False
+    settings.exchange.bybit_api_key = SecretStr("test-key")
+    settings.exchange.bybit_api_secret = SecretStr("test-secret")
+
+    captured_post_content: bytes | None = None
+
+    def make_response(result: dict[str, object]) -> object:
+        m = MagicMock()
+        m.status_code = 200
+        m.json.return_value = {"retCode": 0, "retMsg": "OK", "result": result, "time": 1710000000123}
+        m.raise_for_status = MagicMock()
+        m.text = "{}"
+        return m
+
+    async def capture_http_request(*args: object, **kwargs: object) -> object:
+        nonlocal captured_post_content
+        method = kwargs.get("method", "GET")
+        url = kwargs.get("url", "")
+        content = kwargs.get("content")
+        if method == "POST" and content:
+            captured_post_content = content
+            return make_response({"orderId": "ex-123", "orderLinkId": "drill-btcu-240320100000"})
+        if "market/time" in str(url):
+            return make_response({"timeSecond": "1700000000", "timeNano": "0"})
+        if "wallet-balance" in str(url):
+            return make_response({"totalEquity": "0", "totalWalletBalance": "0", "totalAvailableBalance": "0", "coin": []})
+        if "position/list" in str(url):
+            return make_response({"list": []})
+        if "order/realtime" in str(url):
+            return make_response({"list": []})
+        return make_response({})
+
+    def create_rest_client(exchange_settings: object) -> BybitRestClient:
+        client = BybitRestClient(exchange_settings)
+        client._client.request = capture_http_request
+        return client
+
+    capture = _CaptureLedger()
+    mock_staleness = MagicMock()
+    mock_staleness.stale_channels = AsyncMock(return_value=[])
+    mock_staleness.set_expected_channels = MagicMock()
+    mock_staleness.mark_seen = AsyncMock()
+
+    async def inject_ticker() -> None:
+        await asyncio.sleep(2.0)
+        ticker = NormalizedTicker(
+            symbol="BTCUSDT",
+            bid_price=Decimal("5000"),
+            ask_price=Decimal("5001"),
+            ts_exchange_ms=1700000000000,
+            ts_event_utc=datetime.now(UTC),
+        )
+        await orch._market_state.apply_event(ticker)
+
+    mock_ws_public = MagicMock()
+    mock_ws_public.subscribe = AsyncMock()
+    mock_ws_public.run_forever = AsyncMock(side_effect=lambda: asyncio.sleep(0.6))
+    mock_ws_public.close = AsyncMock()
+
+    mock_ws_private = MagicMock()
+    mock_ws_private.subscribe = AsyncMock()
+    mock_ws_private.run_forever = AsyncMock(return_value=None)
+    mock_ws_private.close = AsyncMock()
+
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient", side_effect=create_rest_client),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient", return_value=mock_ws_public),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient", return_value=mock_ws_private),
+        patch.object(RuntimeOrchestrator, "_can_place_exchange_orders", return_value=True),
+    ):
+        orch = RuntimeOrchestrator(settings)
+        orch._staleness = mock_staleness
+        orch._ledger._sinks.insert(0, capture)
+        orch._drill_outcome.enabled = True
+        orch._settings.runtime.demo_drill.enabled = True
+        orch._settings.runtime.mode = RuntimeMode.DEMO
+        orch._settings.runtime.dry_run = False
+
+        asyncio.create_task(inject_ticker())
+        task = asyncio.create_task(orch.run())
+        await asyncio.sleep(20.0)
+        await orch.stop()
+        await task
+
+    assert "drill_requested" in [e.event_type for e in capture.events]
+    assert "drill_submitted" in [e.event_type for e in capture.events]
+    assert "order_submission_attempt" in [e.event_type for e in capture.events]
+    assert captured_post_content is not None
+    import json
+
+    body_str = captured_post_content.decode("utf-8") if isinstance(captured_post_content, bytes) else captured_post_content
+    body = json.loads(body_str)
+    assert body.get("qty") == "0.001"
+    assert "price" in body
+
+
+@pytest.mark.asyncio
 async def test_drill_ledger_payloads_with_decimal_serialize() -> None:
     """Ledger events with Decimal in payload (e.g. from drill path) serialize without crash."""
     import tempfile
