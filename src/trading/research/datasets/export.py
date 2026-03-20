@@ -140,7 +140,7 @@ def export_records_to_json(
     records: list[DecisionExportRecord],
     path: Path,
     *,
-    dataset_diagnostics: dict[str, int | float] | None = None,
+    dataset_diagnostics: dict[str, int | float | bool] | None = None,
 ) -> None:
     """Write decision export records to JSON for research consumption."""
     from trading.util.json_util import dumps_json_safe

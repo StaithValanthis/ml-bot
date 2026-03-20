@@ -3,6 +3,9 @@ runtime:
   timezone: UTC
   shutdown_timeout_seconds: 20
   dry_run: true
+  backtest_bars: 1200
+  backtest_fill_probability: 0.55
+  backtest_fill_seed: 42
 
 exchange:
   provider: bybit

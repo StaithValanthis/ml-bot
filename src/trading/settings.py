@@ -78,7 +78,9 @@ class RuntimeSettings(BaseModel):
     timezone: str = "UTC"
     shutdown_timeout_seconds: int = 20
     dry_run: bool = True
-    backtest_bars: int = 350
+    backtest_bars: int = 1200
+    backtest_fill_probability: float = 0.55
+    backtest_fill_seed: int | None = 42
     demo_drill: DemoDrillSettings = Field(default_factory=DemoDrillSettings)
     model_filter_enabled: bool = False
     model_artifact_path: Path | None = None
@@ -88,6 +90,13 @@ class RuntimeSettings(BaseModel):
     def _validate_timezone(cls, value: str) -> str:
         if value != "UTC":
             raise ValueError("Only UTC timezone is allowed.")
+        return value
+
+    @field_validator("backtest_fill_probability")
+    @classmethod
+    def _validate_fill_probability(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("backtest_fill_probability must be between 0 and 1")
         return value
 
 
@@ -236,6 +245,8 @@ def backtest_config_from_settings(settings: AppSettings) -> "BacktestConfig":
         liquidation_buffer_bps=settings.risk.liquidation_buffer_bps,
         symbol_specs=settings.get_symbol_specs(),
         per_symbol_limits=per_symbol,
+        fill_probability=float(settings.runtime.backtest_fill_probability),
+        fill_seed=settings.runtime.backtest_fill_seed,
     )
 
 
@@ -304,9 +315,25 @@ def load_settings() -> AppSettings:
         ]
     if "backtest_bars" not in runtime_cfg:
         try:
-            runtime_cfg["backtest_bars"] = int(os.getenv("TRADING_BACKTEST_BARS", "350"))
+            runtime_cfg["backtest_bars"] = int(os.getenv("TRADING_BACKTEST_BARS", "1200"))
         except ValueError:
-            runtime_cfg["backtest_bars"] = 350
+            runtime_cfg["backtest_bars"] = 1200
+    if "backtest_fill_probability" not in runtime_cfg:
+        try:
+            runtime_cfg["backtest_fill_probability"] = float(
+                os.getenv("TRADING_BACKTEST_FILL_PROBABILITY", "0.55")
+            )
+        except ValueError:
+            runtime_cfg["backtest_fill_probability"] = 0.55
+    if "backtest_fill_seed" not in runtime_cfg:
+        seed_env = os.getenv("TRADING_BACKTEST_FILL_SEED")
+        if seed_env is not None:
+            try:
+                runtime_cfg["backtest_fill_seed"] = int(seed_env)
+            except ValueError:
+                runtime_cfg["backtest_fill_seed"] = 42
+        elif "backtest_fill_seed" not in runtime_cfg:
+            runtime_cfg["backtest_fill_seed"] = 42
 
     demo_drill_cfg = runtime_cfg.setdefault("demo_drill", {})
     if (drill_enabled := os.getenv("TRADING_DEMO_DRILL_ENABLED")) is not None:

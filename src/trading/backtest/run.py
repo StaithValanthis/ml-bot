@@ -18,7 +18,7 @@ async def run_backtest(settings: AppSettings) -> None:
     """
     Run backtest with config-backed settings and synthetic event source.
 
-    Uses TRADING_BACKTEST_BARS (default 350) for synthetic bar count.
+    Uses TRADING_BACKTEST_BARS (default 1200) for synthetic bar count.
     Writes JSON and markdown reports to archive for parity with DEMO summaries.
     """
     logger = get_logger("trading.backtest.run")
@@ -61,11 +61,15 @@ async def run_backtest(settings: AppSettings) -> None:
         filled_count = sum(1 for r in records if r.filled)
         not_filled_count = len(records) - filled_count
         fill_rate = filled_count / len(records) if records else 0.0
+        has_both_classes = filled_count >= 1 and not_filled_count >= 1
+        train_split_single_class_risk = min(filled_count, not_filled_count) < 2
         diagnostics = {
             "total_decisions": len(records),
             "filled_count": filled_count,
             "not_filled_count": not_filled_count,
             "fill_rate": round(fill_rate, 4),
+            "has_both_classes": has_both_classes,
+            "train_split_single_class_risk": train_split_single_class_risk,
         }
         if records:
             export_records_to_json(records, export_path, dataset_diagnostics=diagnostics)
@@ -76,6 +80,8 @@ async def run_backtest(settings: AppSettings) -> None:
                 filled_count=filled_count,
                 not_filled_count=not_filled_count,
                 fill_rate=round(fill_rate, 4),
+                has_both_classes=has_both_classes,
+                train_split_single_class_risk=train_split_single_class_risk,
                 export_dir=str(export_dir.resolve()),
             )
         else:

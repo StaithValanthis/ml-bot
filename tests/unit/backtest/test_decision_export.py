@@ -90,7 +90,7 @@ async def test_backtest_produces_mixed_filled_and_not_filled(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 async def test_backtest_export_includes_dataset_diagnostics(tmp_path: Path) -> None:
-    """Exported JSON includes dataset_diagnostics (filled_count, not_filled_count, fill_rate)."""
+    """Exported JSON includes dataset_diagnostics (filled_count, not_filled_count, fill_rate, has_both_classes)."""
     settings = load_settings()
     with patch.dict("os.environ", {"TRADING_ARCHIVE_DIR": str(tmp_path.resolve()), "TRADING_MODE": "backtest"}):
         await run_backtest(settings)
@@ -106,3 +106,33 @@ async def test_backtest_export_includes_dataset_diagnostics(tmp_path: Path) -> N
     assert "filled_count" in diag
     assert "not_filled_count" in diag
     assert "fill_rate" in diag
+    assert "has_both_classes" in diag
+    assert "train_split_single_class_risk" in diag
+
+
+@pytest.mark.asyncio
+async def test_scaled_backtest_produces_enough_for_training(tmp_path: Path) -> None:
+    """Default scaled backtest (1200 bars, 0.55 fill_prob) produces enough rows and mixed labels for training."""
+    from trading.research.training.runner import run_offline_training
+
+    settings = load_settings()
+    with patch.dict("os.environ", {"TRADING_ARCHIVE_DIR": str(tmp_path.resolve()), "TRADING_MODE": "backtest"}):
+        await run_backtest(settings)
+
+    export_dir = tmp_path / "decision_exports"
+    json_files = list(export_dir.glob("decisions_*.json"))
+    assert len(json_files) >= 1, "backtest should produce an export"
+    data = json.loads(json_files[0].read_text(encoding="utf-8"))
+    records_data = data.get("records", [])
+    assert len(records_data) >= 20, "scaled backtest should produce at least 20 decisions"
+    filled = sum(1 for r in records_data if r.get("filled"))
+    not_filled = len(records_data) - filled
+    assert filled >= 2, "need at least 2 filled for train split diversity"
+    assert not_filled >= 2, "need at least 2 not-filled for train split diversity"
+
+    result = run_offline_training(records_path=json_files[0], output_dir=tmp_path)
+    assert result.success
+    assert result.total_rows >= 20
+    assert not result.model_training_skipped, (
+        f"training should proceed with mixed labels; reason={result.model_training_skipped_reason}"
+    )
