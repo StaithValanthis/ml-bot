@@ -230,6 +230,12 @@ class RuntimeOrchestrator:
                 self._startup_auth_disabled = True
                 self._logger.info("runtime_auth_features_disabled", reason="missing_api_credentials")
 
+            self._logger.info(
+                "warmup_starting",
+                symbols=self._settings.trading.symbols,
+                candle_tf=self._settings.trading.candle_timeframe,
+                regime_tf=self._settings.trading.regime_timeframe,
+            )
             warmup_results = await preload_warmup_klines(
                 self._rest,
                 self._bar_history,
@@ -241,6 +247,19 @@ class RuntimeOrchestrator:
                 min_1h_bars=24,
             )
             self._warmup_results = warmup_results
+
+            self._logger.info(
+                "warmup_executed",
+                symbols=self._settings.trading.symbols,
+                candle_timeframe=self._settings.trading.candle_timeframe,
+                regime_timeframe=self._settings.trading.regime_timeframe,
+                results=[{"symbol": r.symbol, "tf": r.timeframe, "bars": r.bars_loaded, "satisfied": r.satisfied} for r in warmup_results],
+            )
+            for sym in self._settings.trading.symbols:
+                counts: dict[str, int] = {}
+                for tf in [self._settings.trading.candle_timeframe, self._settings.trading.regime_timeframe]:
+                    counts[tf] = len(self._bar_history[sym][tf])
+                self._logger.info("warmup_post_snapshot", symbol=sym, bar_counts=counts)
 
             public_topics = _public_topics(
                 symbols=self._settings.trading.symbols,

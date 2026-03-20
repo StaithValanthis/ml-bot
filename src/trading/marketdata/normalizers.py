@@ -128,8 +128,10 @@ def normalize_public_message(payload: dict[str, Any]) -> list[NormalizedEvent]:
     if topic.startswith("publicTrade."):
         return [_normalize_trade(item) for item in data if isinstance(item, dict)]
     if topic.startswith("kline."):
-        interval = topic.split(".")[1] if len(topic.split(".")) > 1 else ""
-        return [_normalize_kline(item, interval) for item in data if isinstance(item, dict)]
+        parts = topic.split(".")
+        interval = parts[1] if len(parts) > 1 else ""
+        symbol = parts[2] if len(parts) > 2 else ""
+        return [_normalize_kline(item, interval, symbol) for item in data if isinstance(item, dict)]
     return []
 
 
@@ -180,11 +182,12 @@ def _normalize_trade(raw: dict[str, Any]) -> NormalizedTrade:
     )
 
 
-def _normalize_kline(raw: dict[str, Any], interval_hint: str) -> NormalizedKline:
+def _normalize_kline(raw: dict[str, Any], interval_hint: str, symbol_hint: str = "") -> NormalizedKline:
     start_ms = _coerce_int(raw.get("start"), fallback=0)
     end_ms = _coerce_int(raw.get("end"), fallback=0)
+    symbol = str(raw.get("symbol", symbol_hint)) if raw.get("symbol") else symbol_hint
     return NormalizedKline(
-        symbol=str(raw.get("symbol", "")),
+        symbol=symbol,
         interval=str(raw.get("interval", interval_hint)),
         start_ms=start_ms,
         end_ms=end_ms,

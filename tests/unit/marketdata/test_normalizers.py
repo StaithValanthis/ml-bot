@@ -84,6 +84,32 @@ def test_normalize_public_kline() -> None:
     assert kline.confirmed is True
 
 
+def test_normalize_public_kline_symbol_from_topic_when_missing_in_data() -> None:
+    """Bybit kline WS payload: symbol is in topic kline.{interval}.{symbol}, not in data items."""
+    payload = {
+        "topic": "kline.60.BTCUSDT",
+        "data": [
+            {
+                "start": 1710000000000,
+                "end": 1710003600000,
+                "interval": "60",
+                "open": "60000",
+                "high": "60200",
+                "low": "59900",
+                "close": "60100",
+                "volume": "123.4",
+                "turnover": "7412340",
+                "confirm": True,
+            }
+        ],
+    }
+    events = normalize_public_message(payload)
+    assert len(events) == 1
+    kline = events[0]
+    assert kline.symbol == "BTCUSDT"
+    assert kline.interval == "60"
+
+
 def test_normalize_public_empty_topic_returns_empty() -> None:
     payload = {"topic": "unknown.xyz", "data": [{}]}
     events = normalize_public_message(payload)
