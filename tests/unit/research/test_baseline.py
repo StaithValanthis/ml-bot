@@ -74,11 +74,38 @@ def test_baseline_comparison_model_vs_trivial() -> None:
 
 
 def test_verdict_generation() -> None:
-    """Verdict is one of baseline_only, model_not_better, model_shows_promise."""
+    """Verdict is one of baseline_only, model_not_better, model_shows_promise, model_training_skipped."""
     train = _make_rows(50, 0.5)
     test = _make_rows(15, 0.5)
     result = run_baseline_experiment(train, test)
-    assert result.verdict.value in ("baseline_only", "model_trained_but_not_better", "model_shows_promise")
+    assert result.verdict.value in (
+        "baseline_only",
+        "model_trained_but_not_better",
+        "model_shows_promise",
+        "model_training_skipped",
+    )
+
+
+def test_run_baseline_single_class_train_fallback() -> None:
+    """Single-class train split skips model training and uses scaffold fallback."""
+    train = _make_rows(20, 1.0)
+    test = _make_rows(10, 0.5)
+    result = run_baseline_experiment(train, test)
+    assert result.model_training_skipped
+    assert result.model_training_skipped_reason == "train_split_single_class"
+    assert result.verdict == Verdict.MODEL_TRAINING_SKIPPED
+    assert result.model is None
+    assert "single_class" in result.model_type
+
+
+def test_run_baseline_tiny_dataset_fallback() -> None:
+    """Tiny train split skips model training."""
+    train = _make_rows(1, 0.5)
+    test = _make_rows(5, 0.5)
+    result = run_baseline_experiment(train, test)
+    assert result.model_training_skipped
+    assert result.model_training_skipped_reason == "dataset_too_small"
+    assert result.model is None
 
 
 def test_write_test_predictions(tmp_path: Path) -> None:

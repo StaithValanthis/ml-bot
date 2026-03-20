@@ -84,6 +84,39 @@ def test_run_offline_training_respects_split_config() -> None:
     assert result.train_rows > result.test_rows
 
 
+def test_run_offline_training_single_class_no_model_artifact(tmp_path: Path) -> None:
+    """When train is single-class, no model artifact is written."""
+    base = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    records: list[DecisionExportRecord] = []
+    for i in range(15):
+        t = base + timedelta(minutes=i)
+        records.append(
+            DecisionExportRecord(
+                ts_utc=t,
+                symbol="BTCUSDT",
+                action="entry_long",
+                side="Buy",
+                qty="0.001",
+                reference_price="40000",
+                order_link_id=None,
+                filled=True,
+                fill_ts_utc=t,
+                fill_qty="0.001",
+                fill_price="40000",
+                risk_approved=True,
+                risk_reason=None,
+            )
+        )
+    json_path = tmp_path / "decisions.json"
+    export_records_to_json(records, json_path)
+    result = run_offline_training(records_path=json_path, output_dir=tmp_path)
+    assert result.success
+    assert result.model_training_skipped
+    assert result.model_training_skipped_reason == "train_split_single_class"
+    model_files = list(tmp_path.glob("model_*.pkl"))
+    assert len(model_files) == 0
+
+
 def test_run_offline_main_no_export_exits_cleanly(tmp_path: Path) -> None:
     """run_offline main() exits without error when no decision export exists."""
     from unittest.mock import patch

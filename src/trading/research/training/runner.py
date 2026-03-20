@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from trading.research.datasets.export import DecisionExportRecord
+from trading.util.logging import get_logger
 from trading.research.datasets.prepare import (
     ModelReadyRow,
     compute_feature_coverage,
@@ -45,6 +46,9 @@ class OfflineTrainResult:
     label_trust: dict[str, str] | None = None
     class_imbalance_note: str | None = None
     error: str | None = None
+    total_rows: int = 0
+    model_training_skipped: bool = False
+    model_training_skipped_reason: str | None = None
 
 
 def _load_records_from_json(path: Path) -> list[DecisionExportRecord]:
@@ -177,7 +181,25 @@ def run_offline_training(
         test_end=split_result.test_end.isoformat(),
     )
 
+    logger = get_logger("trading.research.training.runner")
+    logger.info(
+        "offline_train_dataset_diagnostics",
+        total_rows=len(rows),
+        train_rows=len(train_rows),
+        test_rows=len(test_rows),
+        label_counts=label_counts,
+    )
+
     baseline_exp = run_baseline_experiment(train_rows, test_rows)
+
+    if baseline_exp.model_training_skipped:
+        logger.info(
+            "offline_train_model_training_skipped",
+            reason=baseline_exp.model_training_skipped_reason,
+            train_rows=len(train_rows),
+            label_balance=baseline_exp.label_balance,
+        )
+
     metrics = EvalMetrics(
         accuracy=baseline_exp.model_metrics.accuracy,
         precision=baseline_exp.model_metrics.precision,
@@ -200,7 +222,13 @@ def run_offline_training(
     if output_dir and baseline_exp.model is not None:
         model_path = Path(output_dir) / f"model_{run_id}.pkl"
         if save_baseline_model(baseline_exp.model, model_path):
-            pass  # Operator promotes by copying to TRADING_MODEL_ARTIFACT_PATH
+            logger.info("offline_train_model_artifact_written", path=str(model_path))
+    elif baseline_exp.model_training_skipped:
+        logger.info(
+            "offline_train_no_model_artifact",
+            reason="model_training_skipped",
+            skipped_reason=baseline_exp.model_training_skipped_reason,
+        )
 
     feature_coverage = compute_feature_coverage(rows)
     label_trust = compute_label_trust(rows)
@@ -219,4 +247,7 @@ def run_offline_training(
         feature_coverage=feature_coverage,
         label_trust=label_trust,
         class_imbalance_note=class_imbalance_note,
+        total_rows=len(rows),
+        model_training_skipped=baseline_exp.model_training_skipped,
+        model_training_skipped_reason=baseline_exp.model_training_skipped_reason,
     )

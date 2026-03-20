@@ -34,6 +34,9 @@ class OfflineTrainReport:
     label_trust: dict[str, str] | None = None
     class_imbalance_note: str | None = None
     error: str | None = None
+    total_rows: int = 0
+    model_training_skipped: bool = False
+    model_training_skipped_reason: str | None = None
 
 
 def _eval_to_report(
@@ -110,6 +113,9 @@ def build_offline_train_report(result: OfflineTrainResult) -> OfflineTrainReport
                 label_trust=extra["label_trust"],
                 class_imbalance_note=extra["class_imbalance_note"],
                 error=result.error,
+                total_rows=getattr(result, "total_rows", 0),
+                model_training_skipped=getattr(result, "model_training_skipped", False),
+                model_training_skipped_reason=getattr(result, "model_training_skipped_reason", None),
             )
     return OfflineTrainReport(
         run_id=result.run_id,
@@ -124,6 +130,9 @@ def build_offline_train_report(result: OfflineTrainResult) -> OfflineTrainReport
         label_trust=extra["label_trust"],
         class_imbalance_note=extra["class_imbalance_note"],
         error=result.error,
+        total_rows=getattr(result, "total_rows", 0),
+        model_training_skipped=getattr(result, "model_training_skipped", False),
+        model_training_skipped_reason=getattr(result, "model_training_skipped_reason", None),
     )
 
 
@@ -134,6 +143,7 @@ def report_to_dict(report: OfflineTrainReport) -> dict[str, object]:
         "success": report.success,
         "train_rows": report.train_rows,
         "test_rows": report.test_rows,
+        "total_rows": report.total_rows,
         "sample_counts": report.sample_counts,
         "label_counts": report.label_counts,
         "split_metadata": report.split_metadata,
@@ -142,6 +152,8 @@ def report_to_dict(report: OfflineTrainReport) -> dict[str, object]:
         "verdict": report.verdict,
         "model_beats_always_zero": report.model_beats_always_zero,
         "model_beats_majority": report.model_beats_majority,
+        "model_training_skipped": report.model_training_skipped,
+        "model_training_skipped_reason": report.model_training_skipped_reason,
         "error": report.error,
     }
     if report.baseline_always_zero_metrics:
@@ -170,11 +182,21 @@ def build_offline_train_markdown(report: OfflineTrainReport) -> str:
         f"**Verdict:** {report.verdict}",
         "",
         "## Sample Counts",
+        f"- Total rows: {report.total_rows}",
         f"- Train: {report.train_rows}",
         f"- Test: {report.test_rows}",
         "",
-        "## Label Balance",
     ]
+    if report.model_training_skipped:
+        lines.extend([
+            "## Model Training",
+            f"- **Model training skipped:** yes",
+            f"- **Reason:** {report.model_training_skipped_reason or 'unknown'}",
+            "",
+        ])
+    lines.extend([
+        "## Label Balance",
+    ])
     for k, v in sorted(report.label_counts.items()):
         lines.append(f"- {k}: {v}")
     lines.extend([

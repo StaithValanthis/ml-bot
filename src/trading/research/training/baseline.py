@@ -9,12 +9,17 @@ from pathlib import Path
 from trading.research.datasets.prepare import FEATURE_NAMES, ModelReadyRow
 
 
+MIN_TRAIN_ROWS_FOR_MODEL = 2
+MIN_CLASSES_FOR_MODEL = 2
+
+
 class Verdict(str, Enum):
     """Simple verdict on whether model adds value over trivial baseline."""
 
     BASELINE_ONLY = "baseline_only"
     MODEL_NOT_BETTER = "model_trained_but_not_better"
     MODEL_SHOWS_PROMISE = "model_shows_promise"
+    MODEL_TRAINING_SKIPPED = "model_training_skipped"
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +52,8 @@ class BaselineExperimentResult:
     model_beats_majority: bool
     model_predictions: list[int] = ()
     model: object | None = None
+    model_training_skipped: bool = False
+    model_training_skipped_reason: str | None = None
 
 
 def _rows_to_arrays(
@@ -104,6 +111,19 @@ def _predict_majority(y_train: list[int], n_test: int) -> list[int]:
     return [pred] * n_test
 
 
+def _should_skip_model_training(
+    train_rows: list[ModelReadyRow],
+    y_train: list[int],
+) -> tuple[bool, str | None]:
+    """Return (skip, reason) when model training should be skipped."""
+    if len(train_rows) < MIN_TRAIN_ROWS_FOR_MODEL:
+        return (True, "dataset_too_small")
+    n_classes = len(set(y_train))
+    if n_classes < MIN_CLASSES_FOR_MODEL:
+        return (True, "train_split_single_class")
+    return (False, None)
+
+
 def run_baseline_experiment(
     train_rows: list[ModelReadyRow],
     test_rows: list[ModelReadyRow],
@@ -113,6 +133,8 @@ def run_baseline_experiment(
     Train model, run trivial baselines, compute metrics, compare.
 
     Uses logistic regression when sklearn available; otherwise scaffold path.
+    Skips model training when train is single-class or too small; falls back to
+    majority-class predictor. Does not crash on unsuitable datasets.
     """
     X_train, y_train = _rows_to_arrays(train_rows)
     X_test, y_test = _rows_to_arrays(test_rows)
@@ -132,23 +154,40 @@ def run_baseline_experiment(
     model_pred: list[int]
     resolved_model_type = model_type
     trained_model: object | None = None
-    try:
-        from sklearn.linear_model import LogisticRegression
+    model_training_skipped = False
+    model_training_skipped_reason: str | None = None
 
-        clf = LogisticRegression(max_iter=500, random_state=42)
-        clf.fit(X_train, y_train)
-        model_pred = [int(p) for p in clf.predict(X_test)]
-        trained_model = clf
-    except ImportError:
+    skip, skip_reason = _should_skip_model_training(train_rows, y_train)
+    if skip:
         model_pred = _predict_majority(y_train, n_test)
-        resolved_model_type = "scaffold_majority_fallback"
+        resolved_model_type = f"scaffold_{skip_reason}"
+        model_training_skipped = True
+        model_training_skipped_reason = skip_reason
+    else:
+        try:
+            from sklearn.linear_model import LogisticRegression
+
+            clf = LogisticRegression(max_iter=500, random_state=42)
+            clf.fit(X_train, y_train)
+            model_pred = [int(p) for p in clf.predict(X_test)]
+            trained_model = clf
+        except ImportError:
+            model_pred = _predict_majority(y_train, n_test)
+            resolved_model_type = "scaffold_majority_fallback"
+        except ValueError as exc:
+            model_pred = _predict_majority(y_train, n_test)
+            resolved_model_type = "scaffold_fit_failed"
+            model_training_skipped = True
+            model_training_skipped_reason = str(exc)[:200]
 
     model_metrics = _compute_metrics(y_test, model_pred)
 
     model_beats_always_zero = model_metrics.f1 > baseline_always_zero.f1
     model_beats_majority = model_metrics.f1 > baseline_majority.f1
 
-    if resolved_model_type == "scaffold_majority_fallback":
+    if model_training_skipped:
+        verdict = Verdict.MODEL_TRAINING_SKIPPED
+    elif resolved_model_type == "scaffold_majority_fallback":
         verdict = Verdict.BASELINE_ONLY
     elif not model_beats_always_zero and not model_beats_majority:
         verdict = Verdict.MODEL_NOT_BETTER
@@ -168,6 +207,8 @@ def run_baseline_experiment(
         model_beats_majority=model_beats_majority,
         model_predictions=model_pred,
         model=trained_model,
+        model_training_skipped=model_training_skipped,
+        model_training_skipped_reason=model_training_skipped_reason,
     )
 
 

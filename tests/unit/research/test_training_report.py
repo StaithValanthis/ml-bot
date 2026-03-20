@@ -112,6 +112,52 @@ def test_write_offline_train_report_creates_files(tmp_path: Path) -> None:
     assert "model_type" in content
 
 
+def test_report_includes_model_training_skipped_when_skipped(tmp_path: Path) -> None:
+    """Report includes model_training_skipped and reason when training was skipped."""
+    from datetime import UTC, datetime, timedelta
+
+    from trading.research.datasets.export import DecisionExportRecord, export_records_to_json
+    from trading.research.training.runner import run_offline_training
+    from trading.research.training.report import build_offline_train_report, write_offline_train_report
+
+    base = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    records: list[DecisionExportRecord] = []
+    for i in range(12):
+        t = base + timedelta(minutes=i)
+        records.append(
+            DecisionExportRecord(
+                ts_utc=t,
+                symbol="BTCUSDT",
+                action="entry_long",
+                side="Buy",
+                qty="0.001",
+                reference_price="40000",
+                order_link_id=None,
+                filled=True,
+                fill_ts_utc=t,
+                fill_qty="0.001",
+                fill_price="40000",
+                risk_approved=True,
+                risk_reason=None,
+            )
+        )
+    json_path = tmp_path / "decisions.json"
+    export_records_to_json(records, json_path)
+    result = run_offline_training(records_path=json_path, output_dir=tmp_path)
+    assert result.success
+    assert result.model_training_skipped
+
+    report = build_offline_train_report(result)
+    assert report.model_training_skipped
+    assert report.model_training_skipped_reason == "train_split_single_class"
+    assert report.verdict == "model_training_skipped"
+
+    json_path_out, md_path = write_offline_train_report(result, tmp_path)
+    md_content = md_path.read_text(encoding="utf-8")
+    assert "Model training skipped" in md_content
+    assert "train_split_single_class" in md_content
+
+
 def test_report_includes_feature_coverage_and_label_trust(tmp_path: Path) -> None:
     """Report includes feature_coverage, label_trust, class_imbalance_note when present."""
     from trading.research.training.report import build_offline_train_report, report_to_dict
