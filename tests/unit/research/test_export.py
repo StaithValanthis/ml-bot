@@ -142,3 +142,62 @@ def test_export_records_to_json(tmp_path: Path) -> None:
     row = data["records"][0]
     assert row["symbol"] == "BTCUSDT"
     assert row["filled"] is True
+
+
+def test_export_records_to_json_includes_dataset_diagnostics(tmp_path: Path) -> None:
+    """export_records_to_json includes dataset_diagnostics when provided."""
+    import json
+
+    from datetime import UTC, datetime
+
+    base = datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC)
+    records = [
+        DecisionExportRecord(
+            ts_utc=base,
+            symbol="BTCUSDT",
+            action="entry_long",
+            side="Buy",
+            qty="0.001",
+            reference_price=None,
+            order_link_id=None,
+            filled=True,
+            fill_ts_utc=base,
+            fill_qty="0.001",
+            fill_price="40000",
+            risk_approved=True,
+            risk_reason=None,
+        ),
+        DecisionExportRecord(
+            ts_utc=base,
+            symbol="ETHUSDT",
+            action="entry_long",
+            side="Buy",
+            qty="0.01",
+            reference_price=None,
+            order_link_id=None,
+            filled=False,
+            fill_ts_utc=None,
+            fill_qty=None,
+            fill_price=None,
+            risk_approved=True,
+            risk_reason=None,
+        ),
+    ]
+    path = tmp_path / "export.json"
+    export_records_to_json(
+        records,
+        path,
+        dataset_diagnostics={
+            "total_decisions": 2,
+            "filled_count": 1,
+            "not_filled_count": 1,
+            "fill_rate": 0.5,
+        },
+    )
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert "dataset_diagnostics" in data
+    diag = data["dataset_diagnostics"]
+    assert diag["total_decisions"] == 2
+    assert diag["filled_count"] == 1
+    assert diag["not_filled_count"] == 1
+    assert diag["fill_rate"] == 0.5

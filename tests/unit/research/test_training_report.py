@@ -156,6 +156,10 @@ def test_report_includes_model_training_skipped_when_skipped(tmp_path: Path) -> 
     md_content = md_path.read_text(encoding="utf-8")
     assert "Model training skipped" in md_content
     assert "train_split_single_class" in md_content
+    assert "## Recommendations" in md_content
+    assert "Generate more decision exports" in md_content
+    assert "Increase scenario variety" in md_content
+    assert "Improve outcome diversity" in md_content
 
 
 def test_report_includes_feature_coverage_and_label_trust(tmp_path: Path) -> None:

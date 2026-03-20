@@ -194,6 +194,14 @@ def build_offline_train_markdown(report: OfflineTrainReport) -> str:
             f"- **Reason:** {report.model_training_skipped_reason or 'unknown'}",
             "",
         ])
+        if report.model_training_skipped_reason == "train_split_single_class":
+            lines.extend([
+                "## Recommendations",
+                "- Generate more decision exports (run backtest with more bars or varied scenarios)",
+                "- Increase scenario variety (e.g., different symbols, regimes)",
+                "- Improve outcome diversity (ensure both filled and not-filled outcomes in exports)",
+                "",
+            ])
     lines.extend([
         "## Label Balance",
     ])

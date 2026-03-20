@@ -58,12 +58,24 @@ async def run_backtest(settings: AppSettings) -> None:
         )
         records = extract_decision_records(result.events)
         export_dir.mkdir(parents=True, exist_ok=True)
+        filled_count = sum(1 for r in records if r.filled)
+        not_filled_count = len(records) - filled_count
+        fill_rate = filled_count / len(records) if records else 0.0
+        diagnostics = {
+            "total_decisions": len(records),
+            "filled_count": filled_count,
+            "not_filled_count": not_filled_count,
+            "fill_rate": round(fill_rate, 4),
+        }
         if records:
-            export_records_to_json(records, export_path)
+            export_records_to_json(records, export_path, dataset_diagnostics=diagnostics)
             logger.info(
                 "backtest_decision_export_written",
                 path=str(export_path.resolve()),
                 count=len(records),
+                filled_count=filled_count,
+                not_filled_count=not_filled_count,
+                fill_rate=round(fill_rate, 4),
                 export_dir=str(export_dir.resolve()),
             )
         else:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -71,6 +72,8 @@ class BacktestConfig:
     liquidation_buffer_bps: int = 200
     symbol_specs: dict[str, MarketSymbol] = field(default_factory=dict)
     per_symbol_limits: dict[str, PerSymbolLimit] = field(default_factory=dict)
+    fill_probability: float = 0.85
+    fill_seed: int | None = 42
 
 
 def _default_symbol_specs() -> dict[str, MarketSymbol]:
@@ -147,6 +150,8 @@ class BacktestEngine:
         *,
         ledger_sinks: list[LedgerSink] | None = None,
     ) -> BacktestResult:
+        if self._cfg.fill_seed is not None:
+            random.seed(self._cfg.fill_seed)
         sinks = list(ledger_sinks or []) + [self._ledger_sink]
         start_time: datetime | None = None
         end_time: datetime | None = None
@@ -234,22 +239,26 @@ class BacktestEngine:
                     event.bar.close_time,
                 )
 
-                fill_pnl, costs = await self._simulate_fill(intent, event.bar.close_time)
-                self._portfolio = self._apply_fill(intent, fill_pnl, costs, event.bar.close_time)
-                self._fills += 1
-                self._total_costs_usdt += costs
-                fill_price = intent.price or signal.reference_price
-                await self._record(
-                    "fill",
-                    {
-                        "symbol": intent.symbol,
-                        "qty": str(intent.qty),
-                        "exec_price": str(fill_price),
-                    },
-                    event.bar.close_time,
-                )
+                should_fill = random.random() < float(self._cfg.fill_probability)
+                if should_fill:
+                    fill_pnl, costs = await self._simulate_fill(intent, event.bar.close_time)
+                    self._portfolio = self._apply_fill(intent, fill_pnl, costs, event.bar.close_time)
+                    self._fills += 1
+                    self._total_costs_usdt += costs
+                    fill_price = intent.price or signal.reference_price
+                    await self._record(
+                        "fill",
+                        {
+                            "symbol": intent.symbol,
+                            "qty": str(intent.qty),
+                            "exec_price": str(fill_price),
+                        },
+                        event.bar.close_time,
+                    )
+                else:
+                    pass
 
-                if event.funding_rate_bps is not None:
+                if should_fill and event.funding_rate_bps is not None:
                     funding = self._funding_model.compute(
                         symbol=intent.symbol,
                         side=PositionSide.LONG if intent.side == OrderSide.BUY else PositionSide.SHORT,
