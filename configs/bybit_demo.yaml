@@ -4,3 +4,11 @@ exchange:
   public_ws_url: "wss://stream.bybit.com/v5/public/linear"
   private_ws_url: "wss://stream-demo.bybit.com/v5/private"
   testnet: true
+
+# DEMO-only: relaxed breakout thresholds to increase candidate frequency.
+# Applied only when runtime.mode is DEMO. PAPER/LIVE/BACKTEST use defaults.
+runtime:
+  demo_candidate_overrides:
+    min_breakout_bps: 3
+    min_trend_bps: 5
+    min_volume_multiplier: 1.05

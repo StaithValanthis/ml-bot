@@ -35,7 +35,10 @@ from trading.risk.portfolio_state import PortfolioState, PositionRiskView
 from trading.risk.risk_engine import PerSymbolLimit, RiskEngine
 from trading.risk.sizing import SizingInputs, VolatilityAwareSizer
 from trading.settings import AppSettings
-from trading.strategy.candidates import BreakoutTrendCandidateGenerator
+from trading.strategy.candidates import (
+    BreakoutTrendCandidateGenerator,
+    CandidateGeneratorConfig,
+)
 from trading.strategy.regime_filter import RegimeFilter
 from trading.strategy.signal_engine import SignalEngine
 from trading.util.json_util import dumps_json_safe
@@ -142,7 +145,7 @@ class RuntimeOrchestrator:
             per_symbol_limits=per_symbol,
         )
         self._sizer = VolatilityAwareSizer()
-        self._candidate_generator = BreakoutTrendCandidateGenerator()
+        self._candidate_generator = self._build_candidate_generator()
         self._regime_filter = RegimeFilter()
         self._signal_engine = SignalEngine()
         self._execution_engine = ExecutionEngine(strategy_id="v1alpha")
@@ -168,6 +171,36 @@ class RuntimeOrchestrator:
             message_handler=self._on_private_events,
             connection_state_handler=self._health.set_ws_private,
         )
+
+    def _build_candidate_generator(self) -> BreakoutTrendCandidateGenerator:
+        """Build candidate generator; apply DEMO-only overrides when mode is DEMO."""
+        cfg = CandidateGeneratorConfig()
+        overrides = self._settings.runtime.demo_candidate_overrides
+        if (
+            self._settings.runtime.mode == RuntimeMode.DEMO
+            and overrides is not None
+            and any(
+                getattr(overrides, k) is not None
+                for k in ("min_breakout_bps", "min_trend_bps", "min_volume_multiplier")
+            )
+        ):
+            updates: dict[str, Decimal] = {}
+            if overrides.min_breakout_bps is not None:
+                updates["min_breakout_bps"] = Decimal(str(overrides.min_breakout_bps))
+            if overrides.min_trend_bps is not None:
+                updates["min_trend_bps"] = Decimal(str(overrides.min_trend_bps))
+            if overrides.min_volume_multiplier is not None:
+                updates["min_volume_multiplier"] = Decimal(str(overrides.min_volume_multiplier))
+            from dataclasses import replace
+
+            cfg = replace(cfg, **updates)
+            self._logger.info(
+                "demo_candidate_overrides_applied",
+                min_breakout_bps=float(cfg.min_breakout_bps),
+                min_trend_bps=float(cfg.min_trend_bps),
+                min_volume_multiplier=float(cfg.min_volume_multiplier),
+            )
+        return BreakoutTrendCandidateGenerator(config=cfg)
 
     async def run(self) -> None:
         if not is_streaming_mode(self._settings.runtime.mode):

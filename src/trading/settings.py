@@ -41,6 +41,24 @@ class SecretsSettings(BaseSettings):
     bybit_api_secret: SecretStr | None = Field(default=None, alias="BYBIT_API_SECRET")
 
 
+class DemoCandidateOverrides(BaseModel):
+    """
+    DEMO-only breakout threshold overrides to increase candidate frequency.
+    Applied only when runtime.mode is DEMO. Does not affect PAPER/LIVE/BACKTEST.
+    """
+
+    min_breakout_bps: float | None = None
+    min_trend_bps: float | None = None
+    min_volume_multiplier: float | None = None
+
+    @field_validator("min_breakout_bps", "min_trend_bps", "min_volume_multiplier")
+    @classmethod
+    def _validate_non_negative(cls, value: float | None) -> float | None:
+        if value is not None and value < 0:
+            raise ValueError("Override values must be non-negative")
+        return value
+
+
 class DemoDrillSettings(BaseModel):
     """Demo execution drill config; DEMO-only, disabled by default."""
 
@@ -82,6 +100,7 @@ class RuntimeSettings(BaseModel):
     backtest_fill_probability: float = 0.55
     backtest_fill_seed: int | None = 42
     demo_drill: DemoDrillSettings = Field(default_factory=DemoDrillSettings)
+    demo_candidate_overrides: DemoCandidateOverrides | None = None
     model_filter_enabled: bool = False
     model_artifact_path: Path | None = None
 
@@ -353,6 +372,23 @@ def load_settings() -> AppSettings:
         try:
             demo_drill_cfg["max_notional_usdt"] = Decimal(drill_max_notional.strip())
         except Exception:
+            pass
+
+    demo_overrides_cfg = runtime_cfg.setdefault("demo_candidate_overrides", {})
+    if (ob := os.getenv("TRADING_DEMO_MIN_BREAKOUT_BPS")) is not None:
+        try:
+            demo_overrides_cfg["min_breakout_bps"] = float(ob.strip())
+        except ValueError:
+            pass
+    if (ot := os.getenv("TRADING_DEMO_MIN_TREND_BPS")) is not None:
+        try:
+            demo_overrides_cfg["min_trend_bps"] = float(ot.strip())
+        except ValueError:
+            pass
+    if (ov := os.getenv("TRADING_DEMO_MIN_VOLUME_MULTIPLIER")) is not None:
+        try:
+            demo_overrides_cfg["min_volume_multiplier"] = float(ov.strip())
+        except ValueError:
             pass
 
     if (model_filter := os.getenv("TRADING_MODEL_FILTER_ENABLED")) is not None:
