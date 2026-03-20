@@ -9,3 +9,13 @@ symbols:
     min_qty: 0.01
     price_tick: 0.01
     max_leverage: 100
+  SOLUSDT:
+    qty_step: 0.1
+    min_qty: 0.1
+    price_tick: 0.001
+    max_leverage: 50
+  LINKUSDT:
+    qty_step: 0.1
+    min_qty: 0.1
+    price_tick: 0.001
+    max_leverage: 50

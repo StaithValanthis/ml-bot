@@ -5,6 +5,15 @@ exchange:
   private_ws_url: "wss://stream-demo.bybit.com/v5/private"
   testnet: true
 
+# DEMO-only: multi-symbol basket for candidate observation.
+# Expands opportunity set beyond single symbol when env=bybit_demo.
+trading:
+  symbols:
+    - BTCUSDT
+    - ETHUSDT
+    - SOLUSDT
+    - LINKUSDT
+
 # DEMO-only: relaxed breakout thresholds to increase candidate frequency.
 # Applied only when runtime.mode is DEMO. PAPER/LIVE/BACKTEST use defaults.
 runtime:

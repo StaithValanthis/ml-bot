@@ -6,3 +6,9 @@ risk:
     ETHUSDT:
       max_notional_usdt: 20000
       max_position_abs: 5.0
+    SOLUSDT:
+      max_notional_usdt: 15000
+      max_position_abs: 100
+    LINKUSDT:
+      max_notional_usdt: 10000
+      max_position_abs: 500
