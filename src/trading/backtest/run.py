@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
 
 from trading.backtest.engine import BacktestEngine
 from trading.backtest.event_source import synthetic_candle_events
+from trading.backtest.report import build_backtest_report, write_backtest_report
+from trading.research.datasets.export import extract_decision_records, export_records_to_json
 from trading.settings import AppSettings, backtest_config_from_settings
 from trading.util.logging import get_logger
 
@@ -15,7 +19,7 @@ async def run_backtest(settings: AppSettings) -> None:
     Run backtest with config-backed settings and synthetic event source.
 
     Uses TRADING_BACKTEST_BARS (default 350) for synthetic bar count.
-    File-based loading is scaffolded; use synthetic_candle_events for now.
+    Writes JSON and markdown reports to archive for parity with DEMO summaries.
     """
     logger = get_logger("trading.backtest.run")
     cfg = backtest_config_from_settings(settings)
@@ -38,6 +42,30 @@ async def run_backtest(settings: AppSettings) -> None:
     )
     engine = BacktestEngine(config=cfg)
     result = await engine.run(event_source)
+
+    report = build_backtest_report(result, symbols)
+    archive_dir = Path(os.getenv("TRADING_ARCHIVE_DIR", "data/archive"))
+    try:
+        json_path, md_path = write_backtest_report(report, archive_dir)
+        logger.info(
+            "backtest_report_written",
+            json_path=str(json_path),
+            md_path=str(md_path),
+        )
+        records = extract_decision_records(result.events)
+        if records:
+            export_dir = archive_dir / "decision_exports"
+            export_dir.mkdir(parents=True, exist_ok=True)
+            ts = report.session_start[:19].replace("-", "").replace(":", "").replace("T", "_") if report.session_start else "unknown"
+            export_path = export_dir / f"decisions_{ts}.json"
+            export_records_to_json(records, export_path)
+            logger.info("backtest_decision_export_written", path=str(export_path), count=len(records))
+    except OSError as exc:
+        logger.warning(
+            "backtest_report_write_failed",
+            path=str(archive_dir),
+            error=str(exc),
+        )
 
     logger.info(
         "backtest_complete",
