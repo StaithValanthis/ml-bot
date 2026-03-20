@@ -46,6 +46,7 @@ class BaselineExperimentResult:
     model_beats_always_zero: bool
     model_beats_majority: bool
     model_predictions: list[int] = ()
+    model: object | None = None
 
 
 def _rows_to_arrays(
@@ -130,12 +131,14 @@ def run_baseline_experiment(
 
     model_pred: list[int]
     resolved_model_type = model_type
+    trained_model: object | None = None
     try:
         from sklearn.linear_model import LogisticRegression
 
         clf = LogisticRegression(max_iter=500, random_state=42)
         clf.fit(X_train, y_train)
         model_pred = [int(p) for p in clf.predict(X_test)]
+        trained_model = clf
     except ImportError:
         model_pred = _predict_majority(y_train, n_test)
         resolved_model_type = "scaffold_majority_fallback"
@@ -164,6 +167,7 @@ def run_baseline_experiment(
         model_beats_always_zero=model_beats_always_zero,
         model_beats_majority=model_beats_majority,
         model_predictions=model_pred,
+        model=trained_model,
     )
 
 
@@ -179,6 +183,27 @@ def metrics_to_dict(m: ComputedMetrics) -> dict[str, float | int]:
         "confusion_fn": m.confusion_fn,
         "confusion_tp": m.confusion_tp,
     }
+
+
+def save_baseline_model(model: object | None, path: Path) -> bool:
+    """
+    Save promoted baseline model artifact for runtime use.
+
+    Returns True if saved, False if model is None or save fails.
+    Expects sklearn-like classifier with predict/predict_proba.
+    """
+    if model is None:
+        return False
+    try:
+        import joblib
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(model, path)
+        return True
+    except ImportError:
+        return False
+    except Exception:
+        return False
 
 
 def write_test_predictions(

@@ -17,6 +17,7 @@ from trading.research.datasets.prepare import (
 )
 from trading.research.training.baseline import (
     run_baseline_experiment,
+    save_baseline_model,
     write_test_predictions,
 )
 from trading.research.training.evaluate import (
@@ -195,6 +196,11 @@ def run_offline_training(
     if output_dir and test_rows and baseline_exp.model_predictions:
         predictions_path = Path(output_dir) / f"predictions_{run_id}.json"
         write_test_predictions(test_rows, baseline_exp.model_predictions, predictions_path)
+
+    if output_dir and baseline_exp.model is not None:
+        model_path = Path(output_dir) / f"model_{run_id}.pkl"
+        if save_baseline_model(baseline_exp.model, model_path):
+            pass  # Operator promotes by copying to TRADING_MODEL_ARTIFACT_PATH
 
     feature_coverage = compute_feature_coverage(rows)
     label_trust = compute_label_trust(rows)

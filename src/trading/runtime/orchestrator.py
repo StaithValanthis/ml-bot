@@ -51,7 +51,7 @@ from trading.runtime.drill import (
     generate_drill_order_link_id,
     validate_drill,
 )
-from trading.runtime.strategy_orders import StrategyOrderOutcomes
+from trading.runtime.strategy_orders import ModelFilterOutcomes, StrategyOrderOutcomes
 from trading.storage.postgres import PostgresJournalStore
 from trading.runtime.mode import is_live_execution_mode, is_streaming_mode
 from trading.runtime.scheduler import run_periodic
@@ -98,6 +98,8 @@ class RuntimeOrchestrator:
         self._startup_auth_disabled = False
         self._drill_outcome = DrillOutcome()
         self._strategy_order_outcomes = StrategyOrderOutcomes()
+        self._model_filter_model: object | None = None
+        self._model_filter_active: bool = False
 
         self._rest = BybitRestClient(settings.exchange)
         self._metrics = MetricsRegistry()
@@ -276,14 +278,16 @@ class RuntimeOrchestrator:
                     mode=drill_cfg.mode,
                     message="Demo execution drill is enabled; will submit one test order.",
                 )
-                if (
-                    self._settings.runtime.mode == RuntimeMode.DEMO
-                    and not self._settings.runtime.dry_run
-                    and self._can_place_exchange_orders()
-                ):
-                    self._tasks.append(
-                        asyncio.create_task(self._demo_drill_cycle(), name="runtime-demo-drill"),
-                    )
+            if (
+                self._settings.runtime.mode == RuntimeMode.DEMO
+                and not self._settings.runtime.dry_run
+                and self._can_place_exchange_orders()
+            ):
+                self._tasks.append(
+                    asyncio.create_task(self._demo_drill_cycle(), name="runtime-demo-drill"),
+                )
+
+            self._init_model_filter()
 
             self._tasks.append(asyncio.create_task(self._task_supervisor(), name="runtime-supervisor"))
             self._logger.info("runtime_started")
@@ -763,6 +767,45 @@ class RuntimeOrchestrator:
                     )
                     continue
 
+                if self._model_filter_active:
+                    from trading.models.filter_predictor import score_for_filter
+
+                    pred_result, allow = score_for_filter(
+                        self._model_filter_model,
+                        symbol=signal.symbol,
+                        action=signal.action.value,
+                        side=signal.side.value if signal.side else None,
+                        qty=float(qty),
+                        risk_approved=True,
+                        reference_price=signal.reference_price,
+                        confidence=signal.confidence,
+                        ts_utc=utc_now(),
+                        threshold=0.5,
+                    )
+                    mf = self._strategy_order_outcomes.model_filter
+                    if not pred_result.available:
+                        mf.prediction_unavailable += 1
+                        self._logger.info(
+                            "model_filter_prediction_unavailable",
+                            symbol=signal.symbol,
+                            note=pred_result.feature_missing_note,
+                        )
+                    elif not allow:
+                        mf.blocked += 1
+                        self._logger.info(
+                            "model_filter_blocked",
+                            symbol=signal.symbol,
+                            prob_fill=pred_result.prob_fill,
+                        )
+                        continue
+                    else:
+                        mf.allowed += 1
+                        self._logger.info(
+                            "model_filter_allowed",
+                            symbol=signal.symbol,
+                            prob_fill=pred_result.prob_fill,
+                        )
+
                 intent = self._execution_engine.build_entry_intent(
                     signal=signal,
                     qty=qty,
@@ -1176,6 +1219,79 @@ class RuntimeOrchestrator:
             and not self._settings.runtime.dry_run
         )
 
+    def _init_model_filter(self) -> None:
+        """Load model artifact and enable DEMO-only filter. Never active in LIVE."""
+        from trading.models.filter_artifact import load_model_artifact
+        from trading.models.filter_predictor import RUNTIME_FEATURE_NAMES
+        from trading.research.datasets.prepare import FEATURE_NAMES
+
+        enabled = self._settings.runtime.model_filter_enabled
+        path = self._settings.runtime.model_artifact_path
+
+        if self._settings.runtime.mode != RuntimeMode.DEMO:
+            if enabled:
+                self._logger.warning(
+                    "model_filter_disabled_not_demo",
+                    mode=self._settings.runtime.mode.value,
+                    message="Model filter is DEMO-only; disabled in non-DEMO mode.",
+                )
+            self._logger.info(
+                "model_filter_status",
+                model_filter_enabled=False,
+                model_loaded=False,
+                model_filter_active=False,
+            )
+            return
+
+        if not enabled:
+            self._logger.info(
+                "model_filter_status",
+                model_filter_enabled=False,
+                model_loaded=False,
+                model_filter_active=False,
+            )
+            return
+
+        if path is None or not path:
+            self._logger.info(
+                "model_filter_status",
+                model_filter_enabled=True,
+                model_loaded=False,
+                model_filter_active=False,
+                note="model_artifact_path not set",
+            )
+            return
+
+        result = load_model_artifact(path)
+        if not result.loaded:
+            self._logger.info(
+                "model_filter_status",
+                model_filter_enabled=True,
+                model_loaded=False,
+                model_filter_active=False,
+                path=str(result.path),
+                error=result.error,
+            )
+            return
+
+        if tuple(FEATURE_NAMES) != tuple(RUNTIME_FEATURE_NAMES):
+            self._logger.warning(
+                "model_filter_feature_mismatch",
+                offline_features=list(FEATURE_NAMES),
+                runtime_features=list(RUNTIME_FEATURE_NAMES),
+                message="Runtime features differ from offline expectations; predictions may be unreliable.",
+            )
+
+        self._model_filter_model = result.model
+        self._model_filter_active = True
+        self._logger.info(
+            "model_filter_status",
+            model_filter_enabled=True,
+            model_loaded=True,
+            model_filter_active=True,
+            path=str(result.path),
+        )
+
     def _log_startup_capabilities(self) -> None:
         """Log a concise startup capability summary (enabled/disabled)."""
         private_stream = self._can_use_private_stream()
@@ -1344,6 +1460,14 @@ class RuntimeOrchestrator:
             "cancelled": so.cancelled,
             "rejected": so.rejected,
         }
+        summary["model_filter"] = {
+            "enabled": self._settings.runtime.model_filter_enabled,
+            "active": self._model_filter_active,
+            "model_loaded": self._model_filter_model is not None,
+            "blocked": so.model_filter.blocked,
+            "allowed": so.model_filter.allowed,
+            "prediction_unavailable": so.model_filter.prediction_unavailable,
+        }
         return summary
 
     def _build_markdown_summary(self, summary: dict[str, object]) -> str:
@@ -1401,6 +1525,15 @@ class RuntimeOrchestrator:
             lines.append(f"- Filled: {o.get('filled', 0)}")
             lines.append(f"- Cancelled: {o.get('cancelled', 0)}")
             lines.append(f"- Rejected: {o.get('rejected', 0)}")
+            lines.append("")
+        if mf := summary.get("model_filter"):
+            lines.append("## Model Filter (DEMO-only)")
+            lines.append(f"- Enabled: {mf.get('enabled', False)}")
+            lines.append(f"- Active: {mf.get('active', False)}")
+            lines.append(f"- Model loaded: {mf.get('model_loaded', False)}")
+            lines.append(f"- Trades allowed by model: {mf.get('allowed', 0)}")
+            lines.append(f"- Trades blocked by model: {mf.get('blocked', 0)}")
+            lines.append(f"- Prediction unavailable: {mf.get('prediction_unavailable', 0)}")
             lines.append("")
         if summary.get("abort_reasons"):
             lines.append("## Abort Reasons")

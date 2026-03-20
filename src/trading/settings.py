@@ -80,6 +80,8 @@ class RuntimeSettings(BaseModel):
     dry_run: bool = True
     backtest_bars: int = 350
     demo_drill: DemoDrillSettings = Field(default_factory=DemoDrillSettings)
+    model_filter_enabled: bool = False
+    model_artifact_path: Path | None = None
 
     @field_validator("timezone")
     @classmethod
@@ -325,6 +327,12 @@ def load_settings() -> AppSettings:
             demo_drill_cfg["max_notional_usdt"] = Decimal(drill_max_notional.strip())
         except Exception:
             pass
+
+    if (model_filter := os.getenv("TRADING_MODEL_FILTER_ENABLED")) is not None:
+        runtime_cfg["model_filter_enabled"] = model_filter.lower() in ("true", "1", "yes")
+    if (model_path := os.getenv("TRADING_MODEL_ARTIFACT_PATH")) is not None:
+        p = Path(model_path.strip())
+        runtime_cfg["model_artifact_path"] = p if p else None
 
     if env.log_level is not None:
         data.setdefault("logging", {})["level"] = env.log_level
