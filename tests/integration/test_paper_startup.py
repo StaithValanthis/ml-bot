@@ -189,6 +189,12 @@ async def test_session_summary_written_for_paper_run() -> None:
     assert "reconcile_mismatch_cycles" in data
     assert "staleness_incidents_total" in data
     assert "circuit_breaker_trips_total" in data
+    assert "strategy_flow" in data
+    assert "blocking_stage" in data
+    flow = data.get("strategy_flow", {})
+    assert "bars_confirmed" in flow
+    assert "candidates" in flow
+    assert "regime_rejected" in flow
 
 
 @pytest.mark.asyncio

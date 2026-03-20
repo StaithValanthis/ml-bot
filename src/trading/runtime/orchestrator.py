@@ -718,10 +718,16 @@ class RuntimeOrchestrator:
             bars_1h = list(self._bar_history[bar.symbol][self._settings.trading.regime_timeframe])
             candidates = self._candidate_generator.on_closed_candle(bar.symbol, bars_5m)
 
+            self._metrics.inc("strategy_bars_confirmed")
             for candidate in candidates:
+                self._metrics.inc("strategy_candidates_total")
                 regime = self._regime_filter.evaluate(candidate=candidate, bars_1h=bars_1h)
+                if not regime.allow:
+                    self._metrics.inc("strategy_regime_rejected")
+                    continue
                 signal = self._signal_engine.evaluate(candidate, regime)
                 if signal.side is None or signal.reference_price is None:
+                    self._metrics.inc("strategy_signal_rejected")
                     continue
                 await self._ledger.record(
                     "decision",
@@ -751,6 +757,7 @@ class RuntimeOrchestrator:
                     symbol_spec,
                 )
                 if qty <= 0:
+                    self._metrics.inc("strategy_sizing_rejected")
                     continue
 
                 risk = self._risk_engine.evaluate(
@@ -759,6 +766,7 @@ class RuntimeOrchestrator:
                     expected_order_notional=qty * signal.reference_price,
                 )
                 if not risk.approved:
+                    self._metrics.inc("strategy_risk_rejected")
                     self._logger.info(
                         "signal_blocked_by_risk",
                         symbol=signal.symbol,
@@ -783,15 +791,19 @@ class RuntimeOrchestrator:
                         threshold=0.5,
                     )
                     mf = self._strategy_order_outcomes.model_filter
+                    self._metrics.inc("strategy_model_filter_reached")
                     if not pred_result.available:
                         mf.prediction_unavailable += 1
+                        self._metrics.inc("strategy_model_blocked")
                         self._logger.info(
                             "model_filter_prediction_unavailable",
                             symbol=signal.symbol,
                             note=pred_result.feature_missing_note,
                         )
+                        continue
                     elif not allow:
                         mf.blocked += 1
+                        self._metrics.inc("strategy_model_blocked")
                         self._logger.info(
                             "model_filter_blocked",
                             symbol=signal.symbol,
@@ -1367,12 +1379,55 @@ class RuntimeOrchestrator:
             dry_run=dry_run,
         )
 
+    def _infer_strategy_blocking_stage(self, m: dict[str, float]) -> str:
+        """Infer which stage is blocking decisions for operator visibility."""
+        decisions = int(m.get("decisions_total", 0))
+        intents = int(m.get("order_intents_total", 0))
+        if decisions > 0 or intents > 0:
+            return "submitted"
+        bars = int(m.get("strategy_bars_confirmed", 0))
+        if bars == 0:
+            return "no_bars"
+        candidates = int(m.get("strategy_candidates_total", 0))
+        if candidates == 0:
+            return "no_candidates"
+        regime_rej = int(m.get("strategy_regime_rejected", 0))
+        signal_rej = int(m.get("strategy_signal_rejected", 0))
+        sizing_rej = int(m.get("strategy_sizing_rejected", 0))
+        risk_rej = int(m.get("strategy_risk_rejected", 0))
+        model_reached = int(m.get("strategy_model_filter_reached", 0))
+        model_blocked = int(m.get("strategy_model_blocked", 0))
+        if regime_rej > 0 and regime_rej >= candidates:
+            return "regime_rejected"
+        if signal_rej > 0 or sizing_rej > 0:
+            passed_regime = candidates - regime_rej
+            if signal_rej + sizing_rej >= passed_regime:
+                return "signal_rejected"
+        if risk_rej > 0:
+            return "risk_rejected"
+        if self._model_filter_active and model_reached > 0 and model_blocked >= model_reached:
+            return "model_blocked"
+        return "submitted"
+
     async def _runtime_summary_cycle(self) -> None:
         """Concise periodic runtime summary for paper/demo modes."""
         health_snap = self._health.snapshot()
         metrics_snap = self._metrics.snapshot()
         equity = float(self._portfolio.equity_usdt)
         decisions = metrics_snap.counters.get("decisions_total", 0)
+        c = metrics_snap.counters
+        strategy_flow = {
+            "bars_confirmed": int(c.get("strategy_bars_confirmed", 0)),
+            "candidates": int(c.get("strategy_candidates_total", 0)),
+            "regime_rejected": int(c.get("strategy_regime_rejected", 0)),
+            "signal_rejected": int(c.get("strategy_signal_rejected", 0)),
+            "sizing_rejected": int(c.get("strategy_sizing_rejected", 0)),
+            "risk_rejected": int(c.get("strategy_risk_rejected", 0)),
+            "model_filter_reached": int(c.get("strategy_model_filter_reached", 0)),
+            "model_blocked": int(c.get("strategy_model_blocked", 0)),
+            "submitted": int(c.get("order_intents_total", 0)),
+        }
+        blocking_stage = self._infer_strategy_blocking_stage(c)
         self._logger.info(
             "runtime_summary",
             mode=self._settings.runtime.mode.value,
@@ -1383,6 +1438,8 @@ class RuntimeOrchestrator:
             circuit_breaker=health_snap.circuit_breaker_tripped,
             stale_count=len(health_snap.stale_channels),
             decisions_total=decisions,
+            strategy_flow=strategy_flow,
+            blocking_stage=blocking_stage,
         )
 
     async def _build_session_summary(self) -> dict[str, object]:
@@ -1419,6 +1476,18 @@ class RuntimeOrchestrator:
             "reconcile_issues_total": int(metrics.counters.get("reconcile_issues_total", 0)),
             "staleness_incidents_total": int(metrics.counters.get("staleness_incidents_total", 0)),
             "circuit_breaker_trips_total": int(metrics.counters.get("circuit_breaker_trips_total", 0)),
+            "strategy_flow": {
+                "bars_confirmed": int(metrics.counters.get("strategy_bars_confirmed", 0)),
+                "candidates": int(metrics.counters.get("strategy_candidates_total", 0)),
+                "regime_rejected": int(metrics.counters.get("strategy_regime_rejected", 0)),
+                "signal_rejected": int(metrics.counters.get("strategy_signal_rejected", 0)),
+                "sizing_rejected": int(metrics.counters.get("strategy_sizing_rejected", 0)),
+                "risk_rejected": int(metrics.counters.get("strategy_risk_rejected", 0)),
+                "model_filter_reached": int(metrics.counters.get("strategy_model_filter_reached", 0)),
+                "model_blocked": int(metrics.counters.get("strategy_model_blocked", 0)),
+                "submitted": int(metrics.counters.get("order_intents_total", 0)),
+            },
+            "blocking_stage": self._infer_strategy_blocking_stage(metrics.counters),
         }
         if self._health.snapshot().private_stream_error is not None:
             summary["private_stream_error"] = self._health.snapshot().private_stream_error
@@ -1493,8 +1562,22 @@ class RuntimeOrchestrator:
             f"- State transitions: {summary.get('order_state_transitions_total', 0)}",
             f"- Reconcile mismatch cycles: {summary.get('reconcile_mismatch_cycles', 0)}",
             f"- Reconcile issues: {summary.get('reconcile_issues_total', 0)}",
+            f"- Blocking stage: {summary.get('blocking_stage', 'unknown')}",
             "",
         ]
+        if flow := summary.get("strategy_flow"):
+            lines.append("## Strategy Flow")
+            f = flow
+            lines.append(f"- Bars confirmed: {f.get('bars_confirmed', 0)}")
+            lines.append(f"- Candidates: {f.get('candidates', 0)}")
+            lines.append(f"- Regime rejected: {f.get('regime_rejected', 0)}")
+            lines.append(f"- Signal rejected: {f.get('signal_rejected', 0)}")
+            lines.append(f"- Sizing rejected: {f.get('sizing_rejected', 0)}")
+            lines.append(f"- Risk rejected: {f.get('risk_rejected', 0)}")
+            lines.append(f"- Model filter reached: {f.get('model_filter_reached', 0)}")
+            lines.append(f"- Model blocked: {f.get('model_blocked', 0)}")
+            lines.append(f"- Submitted: {f.get('submitted', 0)}")
+            lines.append("")
         if summary.get("drill_enabled"):
             lines.append("## Demo Drill")
             lines.append(f"- Enabled: {summary.get('drill_enabled', False)}")
