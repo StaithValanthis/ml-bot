@@ -1,5 +1,1 @@
-{
-  "tests/unit/runtime/test_drill.py::test_validate_drill_conflicting_min_qty_vs_cap": true,
-  "tests/unit/runtime/test_drill.py::test_validate_drill_refusal_details_qty_below_min": true,
-  "tests/unit/runtime/test_drill.py::test_validate_drill_refusal_details_notional_exceeds_cap": true
-}
+{}
