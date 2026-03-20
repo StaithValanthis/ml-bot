@@ -40,8 +40,16 @@ from trading.strategy.regime_filter import RegimeFilter
 from trading.strategy.signal_engine import SignalEngine
 from trading.util.logging import get_logger
 from trading.util.time import utc_now
-from trading.util.types import MarketSymbol, PositionSide, RuntimeMode
+from trading.util.types import MarketSymbol, OrderSide, PositionSide, RuntimeMode
 from trading.storage.parquet_store import ParquetArchiveStore
+from trading.runtime.drill import (
+    DrillConfig,
+    DrillMode,
+    DrillOutcome,
+    build_drill_intent,
+    generate_drill_order_link_id,
+    validate_drill,
+)
 from trading.storage.postgres import PostgresJournalStore
 from trading.runtime.mode import is_live_execution_mode, is_streaming_mode
 from trading.runtime.scheduler import run_periodic
@@ -70,6 +78,7 @@ class RuntimeOrchestrator:
         self._abort_reasons: list[str] = []
         self._consecutive_reconcile_mismatches = 0
         self._startup_auth_disabled = False
+        self._drill_outcome = DrillOutcome()
 
         self._rest = BybitRestClient(settings.exchange)
         self._metrics = MetricsRegistry()
@@ -237,6 +246,26 @@ class RuntimeOrchestrator:
                 await self._ws_private.subscribe(["order", "execution", "position", "wallet"])
                 self._tasks.append(asyncio.create_task(self._ws_private.run_forever(), name="runtime-ws-private"))
 
+            drill_cfg = self._settings.runtime.demo_drill
+            if drill_cfg.enabled:
+                self._drill_outcome.enabled = True
+                self._logger.warning(
+                    "demo_drill_enabled",
+                    symbol=drill_cfg.symbol,
+                    side=drill_cfg.side,
+                    qty=str(drill_cfg.qty),
+                    mode=drill_cfg.mode,
+                    message="Demo execution drill is enabled; will submit one test order.",
+                )
+                if (
+                    self._settings.runtime.mode == RuntimeMode.DEMO
+                    and not self._settings.runtime.dry_run
+                    and self._can_place_exchange_orders()
+                ):
+                    self._tasks.append(
+                        asyncio.create_task(self._demo_drill_cycle(), name="runtime-demo-drill"),
+                    )
+
             self._tasks.append(asyncio.create_task(self._task_supervisor(), name="runtime-supervisor"))
             self._logger.info("runtime_started")
         except Exception as exc:
@@ -308,6 +337,102 @@ class RuntimeOrchestrator:
                     return
             await asyncio.sleep(0.5)
 
+    async def _demo_drill_cycle(self) -> None:
+        """Run one demo drill order; DEMO-only, gated by config."""
+        await asyncio.sleep(15.0)
+        if self._stop_event.is_set():
+            return
+        drill_cfg = self._settings.runtime.demo_drill
+        if not drill_cfg.enabled or self._settings.runtime.mode != RuntimeMode.DEMO:
+            return
+        side = OrderSide.BUY if drill_cfg.side == "Buy" else OrderSide.SELL
+        mode = DrillMode.POST_ONLY_LIMIT if drill_cfg.mode == "post_only" else DrillMode.REDUCE_ONLY
+        config = DrillConfig(symbol=drill_cfg.symbol, side=side, qty=drill_cfg.qty, mode=mode)
+
+        symbol_spec = self._symbol_specs.get(config.symbol)
+        ref_price: Decimal | None = None
+        if mode == DrillMode.POST_ONLY_LIMIT:
+            snap = await self._market_state.snapshot()
+            ticker = snap.tickers.get(config.symbol)
+            if ticker and ticker.bid_price and ticker.ask_price:
+                ref_price = ticker.bid_price if config.side == OrderSide.BUY else ticker.ask_price
+            else:
+                self._drill_outcome.attempted = True
+                self._drill_outcome.aborted = True
+                self._drill_outcome.refused_reason = "drill_refused_no_ticker"
+                await self._ledger.record("drill_aborted", {"reason": "no_ticker"})
+                self._logger.warning("demo_drill_aborted", reason="no_ticker")
+                return
+
+        refuse = validate_drill(
+            mode=self._settings.runtime.mode,
+            dry_run=self._settings.runtime.dry_run,
+            symbol=config.symbol,
+            qty=config.qty,
+            configured_symbols=self._settings.trading.symbols,
+            symbol_spec=symbol_spec,
+            reference_price=ref_price,
+        )
+        if refuse:
+            self._drill_outcome.attempted = True
+            self._drill_outcome.aborted = True
+            self._drill_outcome.refused_reason = refuse
+            await self._ledger.record("drill_aborted", {"reason": refuse})
+            self._logger.warning("demo_drill_aborted", reason=refuse)
+            return
+
+        self._drill_outcome.attempted = True
+        self._drill_outcome.symbol = config.symbol
+        self._drill_outcome.side = config.side.value
+        self._drill_outcome.qty = str(config.qty)
+        order_link_id = generate_drill_order_link_id(config.symbol)
+        self._drill_outcome.order_link_id = order_link_id
+
+        await self._ledger.record(
+            "drill_requested",
+            {"symbol": config.symbol, "side": config.side.value, "qty": str(config.qty), "order_link_id": order_link_id},
+        )
+        self._logger.info(
+            "drill_requested",
+            symbol=config.symbol,
+            side=config.side.value,
+            qty=str(config.qty),
+            order_link_id=order_link_id,
+        )
+
+        position_side: PositionSide | None = None
+        if mode == DrillMode.REDUCE_ONLY:
+            pos = self._portfolio.positions.get(config.symbol)
+            if pos is None or pos.qty <= 0:
+                self._drill_outcome.aborted = True
+                self._drill_outcome.refused_reason = "drill_refused_no_position"
+                await self._ledger.record("drill_aborted", {"reason": "no_position"})
+                return
+            position_side = pos.side
+
+        try:
+            intent = build_drill_intent(
+                config=config,
+                reference_price=ref_price,
+                order_link_id=order_link_id,
+                now=utc_now(),
+                position_side=position_side,
+            )
+        except ValueError as exc:
+            self._drill_outcome.aborted = True
+            self._drill_outcome.refused_reason = str(exc)
+            await self._ledger.record("drill_aborted", {"reason": str(exc)})
+            return
+
+        await self._order_manager.register_intent(intent)
+        await self._ledger.record(
+            "drill_submitted",
+            {"order_link_id": order_link_id, "symbol": config.symbol, "side": config.side.value, "qty": str(config.qty)},
+        )
+        self._logger.info("drill_submitted", order_link_id=order_link_id, symbol=config.symbol)
+
+        await self._submit_intent(intent, is_drill=True)
+
     async def _on_public_events(self, events: list[NormalizedEvent]) -> None:
         await self._market_state.apply_events(events)
         for event in events:
@@ -351,6 +476,18 @@ class RuntimeOrchestrator:
                             "to_status": new_status,
                         },
                     )
+                    if link_id and self._drill_outcome.order_link_id == link_id:
+                        self._drill_outcome.final_status = new_status
+                        await self._ledger.record(
+                            "drill_state_transition",
+                            {"order_link_id": link_id, "from_status": prev_status, "to_status": new_status},
+                        )
+                        if new_status in ("Filled", "Cancelled", "Rejected"):
+                            self._drill_outcome.completed = True
+                            await self._ledger.record(
+                                "drill_completed",
+                                {"order_link_id": link_id, "final_status": new_status},
+                            )
                     self._logger.info(
                         "order_state_transition",
                         order_link_id=event.order_link_id or "",
@@ -468,9 +605,9 @@ class RuntimeOrchestrator:
                 )
 
                 if self._can_place_exchange_orders():
-                    await self._submit_intent(intent)
+                    await self._submit_intent(intent, is_drill=False)
 
-    async def _submit_intent(self, intent: object) -> None:
+    async def _submit_intent(self, intent: object, *, is_drill: bool = False) -> None:
         from trading.execution.order_intent import OrderIntent
 
         if not isinstance(intent, OrderIntent):
@@ -516,6 +653,14 @@ class RuntimeOrchestrator:
                 "order_ack",
                 {"order_link_id": ack.order_link_id, "order_id": ack.order_id},
             )
+            if is_drill and self._drill_outcome.order_link_id == ack.order_link_id:
+                self._drill_outcome.ack_received = True
+                self._drill_outcome.order_id = ack.order_id
+                await self._ledger.record(
+                    "drill_ack_received",
+                    {"order_link_id": ack.order_link_id, "order_id": ack.order_id},
+                )
+                self._logger.info("drill_ack_received", order_link_id=ack.order_link_id, order_id=ack.order_id)
             self._logger.info(
                 "order_ack_received",
                 order_link_id=ack.order_link_id,
@@ -523,6 +668,10 @@ class RuntimeOrchestrator:
             )
             self._metrics.inc("order_acks_total")
         except BybitRestError as exc:
+            if is_drill and isinstance(intent, OrderIntent) and self._drill_outcome.order_link_id == intent.order_link_id:
+                self._drill_outcome.aborted = True
+                self._drill_outcome.refused_reason = str(exc)
+                await self._ledger.record("drill_aborted", {"reason": str(exc)})
             log_ctx: dict[str, object] = {"order_link_id": intent.order_link_id, "error": str(exc)}
             if isinstance(exc, BybitAPIError):
                 log_ctx["ret_code"] = exc.ret_code
@@ -678,6 +827,12 @@ class RuntimeOrchestrator:
                     affected_link_ids.append(i.order_link_id)
                 if i.order_id:
                     affected_order_ids.append(i.order_id)
+            if self._drill_outcome.order_link_id and self._drill_outcome.order_link_id in affected_link_ids:
+                self._drill_outcome.reconcile_mismatch = True
+                await self._ledger.record(
+                    "drill_reconcile_result",
+                    {"order_link_id": self._drill_outcome.order_link_id, "mismatch": True},
+                )
             payload: dict[str, object] = {
                 "order_issues": [i.details for i in order_issues],
                 "position_issues": [i.details for i in position_issues],
@@ -721,6 +876,11 @@ class RuntimeOrchestrator:
                 "reconcile_ok",
                 {"order_issues": 0, "position_issues": 0},
             )
+            if self._drill_outcome.order_link_id and self._drill_outcome.attempted:
+                await self._ledger.record(
+                    "drill_reconcile_result",
+                    {"order_link_id": self._drill_outcome.order_link_id, "mismatch": False},
+                )
         self._health.mark_reconcile()
 
     async def _watchdog_cycle(self) -> None:
@@ -911,6 +1071,25 @@ class RuntimeOrchestrator:
         }
         if self._health.snapshot().private_stream_error is not None:
             summary["private_stream_error"] = self._health.snapshot().private_stream_error
+        if self._drill_outcome.enabled:
+            summary["drill_enabled"] = True
+            summary["drill_attempted"] = self._drill_outcome.attempted
+            if self._drill_outcome.symbol:
+                summary["drill_symbol"] = self._drill_outcome.symbol
+            if self._drill_outcome.side:
+                summary["drill_side"] = self._drill_outcome.side
+            if self._drill_outcome.qty:
+                summary["drill_qty"] = self._drill_outcome.qty
+            summary["drill_ack_received"] = self._drill_outcome.ack_received
+            summary["drill_reconcile_mismatch"] = self._drill_outcome.reconcile_mismatch
+            if self._drill_outcome.completed:
+                summary["drill_outcome"] = "completed"
+            elif self._drill_outcome.aborted:
+                summary["drill_outcome"] = "aborted"
+                if self._drill_outcome.refused_reason:
+                    summary["drill_refused_reason"] = self._drill_outcome.refused_reason
+            else:
+                summary["drill_outcome"] = "pending"
         if self._abort_reasons:
             summary["abort_reasons"] = self._abort_reasons
         if self._startup_auth_disabled:
@@ -942,6 +1121,18 @@ class RuntimeOrchestrator:
             f"- Reconcile issues: {summary.get('reconcile_issues_total', 0)}",
             "",
         ]
+        if summary.get("drill_enabled"):
+            lines.append("## Demo Drill")
+            lines.append(f"- Enabled: {summary.get('drill_enabled', False)}")
+            lines.append(f"- Attempted: {summary.get('drill_attempted', False)}")
+            if summary.get("drill_symbol"):
+                lines.append(f"- Symbol/Side/Qty: {summary.get('drill_symbol')} {summary.get('drill_side', '')} {summary.get('drill_qty', '')}")
+            lines.append(f"- Ack received: {summary.get('drill_ack_received', False)}")
+            lines.append(f"- Reconcile mismatch: {summary.get('drill_reconcile_mismatch', False)}")
+            lines.append(f"- Outcome: {summary.get('drill_outcome', 'pending')}")
+            if summary.get("drill_refused_reason"):
+                lines.append(f"- Refused reason: {summary.get('drill_refused_reason')}")
+            lines.append("")
         if summary.get("abort_reasons"):
             lines.append("## Abort Reasons")
             for r in summary["abort_reasons"]:

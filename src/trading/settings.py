@@ -41,12 +41,37 @@ class SecretsSettings(BaseSettings):
     bybit_api_secret: SecretStr | None = Field(default=None, alias="BYBIT_API_SECRET")
 
 
+class DemoDrillSettings(BaseModel):
+    """Demo execution drill config; DEMO-only, disabled by default."""
+
+    enabled: bool = False
+    symbol: str = "BTCUSDT"
+    side: str = "Buy"
+    qty: Decimal = Decimal("0.001")
+    mode: str = "post_only"
+
+    @field_validator("side")
+    @classmethod
+    def _validate_side(cls, value: str) -> str:
+        if value not in ("Buy", "Sell"):
+            raise ValueError("side must be Buy or Sell")
+        return value
+
+    @field_validator("mode")
+    @classmethod
+    def _validate_mode(cls, value: str) -> str:
+        if value not in ("post_only", "reduce_only"):
+            raise ValueError("mode must be post_only or reduce_only")
+        return value
+
+
 class RuntimeSettings(BaseModel):
     mode: RuntimeMode
     timezone: str = "UTC"
     shutdown_timeout_seconds: int = 20
     dry_run: bool = True
     backtest_bars: int = 350
+    demo_drill: DemoDrillSettings = Field(default_factory=DemoDrillSettings)
 
     @field_validator("timezone")
     @classmethod
@@ -272,6 +297,21 @@ def load_settings() -> AppSettings:
             runtime_cfg["backtest_bars"] = int(os.getenv("TRADING_BACKTEST_BARS", "350"))
         except ValueError:
             runtime_cfg["backtest_bars"] = 350
+
+    demo_drill_cfg = runtime_cfg.setdefault("demo_drill", {})
+    if (drill_enabled := os.getenv("TRADING_DEMO_DRILL_ENABLED")) is not None:
+        demo_drill_cfg["enabled"] = drill_enabled.lower() in ("true", "1", "yes")
+    if (drill_symbol := os.getenv("TRADING_DEMO_DRILL_SYMBOL")) is not None:
+        demo_drill_cfg["symbol"] = drill_symbol.strip().upper()
+    if (drill_side := os.getenv("TRADING_DEMO_DRILL_SIDE")) is not None:
+        demo_drill_cfg["side"] = drill_side.strip()
+    if (drill_qty := os.getenv("TRADING_DEMO_DRILL_QTY")) is not None:
+        try:
+            demo_drill_cfg["qty"] = Decimal(drill_qty.strip())
+        except Exception:
+            pass
+    if (drill_mode := os.getenv("TRADING_DEMO_DRILL_MODE")) is not None:
+        demo_drill_cfg["mode"] = drill_mode.strip().lower()
 
     if env.log_level is not None:
         data.setdefault("logging", {})["level"] = env.log_level
