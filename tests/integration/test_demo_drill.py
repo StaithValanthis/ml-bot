@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import UTC, datetime
+from pathlib import Path
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -260,6 +262,91 @@ async def test_mocked_successful_demo_drill_ack_flow() -> None:
     assert "drill_submitted" in event_types
     assert "drill_ack_received" in event_types
     assert orch._drill_outcome.ack_received is True
+
+
+@pytest.mark.asyncio
+async def test_demo_drill_shutdown_writes_session_summary() -> None:
+    """Demo drill run followed by controlled shutdown writes session summary artifacts."""
+    with patch.dict(os.environ, {"TRADING_MODE": "demo", "TRADING_DRY_RUN": "false", "TRADING_DEMO_DRILL_ENABLED": "true"}):
+        settings = load_settings()
+    settings.runtime.demo_drill.enabled = True
+    settings.runtime.mode = RuntimeMode.DEMO
+    settings.runtime.dry_run = False
+
+    archive_dir = Path.cwd() / "tmp_integration_archive"
+    summaries_dir = archive_dir / "session_summaries"
+
+    capture = _CaptureLedger()
+    mock_rest = MagicMock()
+    mock_rest.get_server_time = AsyncMock(return_value=ServerTimeResult(time_second="1700000000", time_nano="0"))
+    mock_rest.get_wallet = AsyncMock(return_value=[])
+    mock_rest.get_positions = AsyncMock(return_value=[])
+    mock_rest.get_open_orders = AsyncMock(return_value=[])
+
+    def place_order_side_effect(request: object) -> object:
+        order_link_id = getattr(request, "order_link_id", "drill-btcu-240101120000")
+        return OrderAck(order_id="ex-order-123", order_link_id=order_link_id)
+
+    mock_rest.place_order = AsyncMock(side_effect=place_order_side_effect)
+    mock_rest.close = AsyncMock()
+
+    mock_ws_public = MagicMock()
+    mock_ws_public.subscribe = AsyncMock()
+    mock_ws_public.run_forever = AsyncMock(side_effect=lambda: asyncio.sleep(0.6))
+    mock_ws_public.close = AsyncMock()
+
+    mock_ws_private = MagicMock()
+    mock_ws_private.subscribe = AsyncMock()
+    mock_ws_private.run_forever = AsyncMock(return_value=None)
+    mock_ws_private.close = AsyncMock()
+
+    async def inject_ticker() -> None:
+        await asyncio.sleep(2.0)
+        ticker = NormalizedTicker(
+            symbol="BTCUSDT",
+            bid_price=Decimal("5000"),
+            ask_price=Decimal("5001"),
+            ts_exchange_ms=1700000000000,
+            ts_event_utc=datetime.now(UTC),
+        )
+        await orch._market_state.apply_event(ticker)
+
+    mock_staleness = MagicMock()
+    mock_staleness.stale_channels = AsyncMock(return_value=[])
+    mock_staleness.set_expected_channels = MagicMock()
+    mock_staleness.mark_seen = AsyncMock()
+
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient", return_value=mock_rest),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient", return_value=mock_ws_public),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient", return_value=mock_ws_private),
+        patch.object(RuntimeOrchestrator, "_can_place_exchange_orders", return_value=True),
+    ):
+        orch = RuntimeOrchestrator(settings)
+        orch._staleness = mock_staleness
+        orch._ledger._sinks.insert(0, capture)
+        orch._drill_outcome.enabled = True
+        orch._settings.runtime.demo_drill.enabled = True
+        orch._settings.runtime.mode = RuntimeMode.DEMO
+        orch._settings.runtime.dry_run = False
+
+        asyncio.create_task(inject_ticker())
+        task = asyncio.create_task(orch.run())
+        await asyncio.sleep(20.0)
+        await orch.stop()
+        await task
+
+    event_types = [e.event_type for e in capture.events]
+    assert "drill_ack_received" in event_types
+    assert "runtime_stop" in event_types
+
+    json_files = list(summaries_dir.glob("session_*.json"))
+    md_files = list(summaries_dir.glob("session_*.md"))
+    assert len(json_files) >= 1
+    assert len(md_files) >= 1
+    data = json.loads(json_files[-1].read_text(encoding="utf-8"))
+    assert data.get("drill_enabled") is True
+    assert data.get("drill_ack_received") is True
 
 
 @pytest.mark.asyncio

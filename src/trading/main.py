@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import signal
 import sys
 
 from trading.runtime.mode import is_backtest_mode, is_streaming_mode
@@ -8,10 +9,26 @@ from trading.settings import load_settings
 from trading.util.logging import configure_logging, get_logger
 
 
+def _install_shutdown_handlers(orchestrator: object) -> None:
+    """Install SIGTERM/SIGINT handlers to trigger graceful shutdown."""
+    loop = asyncio.get_running_loop()
+
+    def request_stop() -> None:
+        asyncio.create_task(orchestrator.stop())
+
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if sig is not None:
+            try:
+                loop.add_signal_handler(sig, request_stop)
+            except NotImplementedError:
+                pass
+
+
 async def _run_streaming(settings: object) -> None:
     from trading.runtime.orchestrator import RuntimeOrchestrator
 
     orchestrator = RuntimeOrchestrator(settings)
+    _install_shutdown_handlers(orchestrator)
     try:
         await orchestrator.run()
     except asyncio.CancelledError:

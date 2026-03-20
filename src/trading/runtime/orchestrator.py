@@ -1324,17 +1324,42 @@ class RuntimeOrchestrator:
         report_dir.mkdir(parents=True, exist_ok=True)
         json_path = report_dir / f"session_{ts}.json"
         md_path = report_dir / f"session_{ts}.md"
+        json_ok = False
+        md_ok = False
         try:
             json_path.write_text(dumps_json_safe(summary, indent=2), encoding="utf-8")
+            json_ok = True
+        except OSError as exc:
+            self._logger.warning(
+                "session_summary_write_failed",
+                path=str(json_path),
+                file_type="json",
+                error=str(exc),
+            )
+        try:
             md_path.write_text(self._build_markdown_summary(summary), encoding="utf-8")
+            md_ok = True
+        except OSError as exc:
+            self._logger.warning(
+                "session_summary_write_failed",
+                path=str(md_path),
+                file_type="markdown",
+                error=str(exc),
+            )
+        if json_ok and md_ok:
             self._logger.info(
                 "session_summary_written",
                 path=str(json_path),
                 session_ended_cleanly=summary.get("session_ended_cleanly"),
                 abort_reasons=summary.get("abort_reasons"),
             )
-        except OSError as exc:
-            self._logger.warning("session_summary_write_failed", path=str(json_path), error=str(exc))
+            await self._ledger.record(
+                "session_summary_written",
+                {
+                    "json_path": str(json_path),
+                    "md_path": str(md_path),
+                },
+            )
 
 
 def _public_topics(*, symbols: list[str], candle_timeframe: str, regime_timeframe: str) -> list[str]:
