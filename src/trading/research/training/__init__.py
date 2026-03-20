@@ -1,5 +1,11 @@
 """Training: splits, train, evaluate, promote, offline runner workflow boundaries."""
 
+from trading.research.training.compare import (
+    ExperimentComparison,
+    compare_reports,
+    load_report_dict,
+    write_comparison_report,
+)
 from trading.research.training.baseline import (
     BaselineExperimentResult,
     ComputedMetrics,
@@ -31,6 +37,7 @@ from trading.research.training.splits import (
 from trading.research.training.train import TrainRequest, TrainResult, TrainingJob
 
 __all__ = [
+    "ExperimentComparison",
     "BaselineExperimentResult",
     "ComputedMetrics",
     "DefaultTimeSeriesSplitter",
@@ -51,10 +58,13 @@ __all__ = [
     "TrainingJob",
     "Verdict",
     "build_offline_train_report",
+    "compare_reports",
     "decide_promotion",
+    "load_report_dict",
     "metrics_to_dict",
     "run_baseline_experiment",
     "run_offline_training",
+    "write_comparison_report",
     "write_offline_train_report",
     "write_test_predictions",
 ]

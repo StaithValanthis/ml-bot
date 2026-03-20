@@ -10,6 +10,8 @@ from pathlib import Path
 from trading.research.datasets.export import DecisionExportRecord
 from trading.research.datasets.prepare import (
     ModelReadyRow,
+    compute_feature_coverage,
+    compute_label_trust,
     prepare_training_rows,
     write_training_rows_csv,
 )
@@ -38,6 +40,9 @@ class OfflineTrainResult:
     prepared_csv_path: Path | None
     baseline_experiment: object | None = None
     predictions_path: Path | None = None
+    feature_coverage: dict[str, float] | None = None
+    label_trust: dict[str, str] | None = None
+    class_imbalance_note: str | None = None
     error: str | None = None
 
 
@@ -64,6 +69,7 @@ def _load_records_from_json(path: Path) -> list[DecisionExportRecord]:
                 fill_price=r.get("fill_price"),
                 risk_approved=r.get("risk_approved", False),
                 risk_reason=r.get("risk_reason"),
+                confidence=r.get("confidence"),
             )
         )
     return records
@@ -190,6 +196,11 @@ def run_offline_training(
         predictions_path = Path(output_dir) / f"predictions_{run_id}.json"
         write_test_predictions(test_rows, baseline_exp.model_predictions, predictions_path)
 
+    feature_coverage = compute_feature_coverage(rows)
+    label_trust = compute_label_trust(rows)
+    filled_pct = sum(1 for r in rows if r.label == 1) / len(rows) if rows else 0.0
+    class_imbalance_note = f"filled={filled_pct:.1%}" if rows else "no_data"
+
     return OfflineTrainResult(
         success=True,
         run_id=run_id,
@@ -199,4 +210,7 @@ def run_offline_training(
         prepared_csv_path=prepared_csv_path,
         baseline_experiment=baseline_exp,
         predictions_path=predictions_path,
+        feature_coverage=feature_coverage,
+        label_trust=label_trust,
+        class_imbalance_note=class_imbalance_note,
     )

@@ -181,7 +181,11 @@ class BacktestEngine:
                 self._decisions += 1
                 await self._record(
                     "decision",
-                    {"symbol": signal.symbol, "action": signal.action.value},
+                    {
+                        "symbol": signal.symbol,
+                        "action": signal.action.value,
+                        "confidence": str(signal.confidence),
+                    },
                     event.bar.close_time,
                 )
 
@@ -221,7 +225,12 @@ class BacktestEngine:
 
                 await self._record(
                     "order_intent",
-                    {"symbol": intent.symbol, "side": intent.side.value, "qty": str(intent.qty)},
+                    {
+                        "symbol": intent.symbol,
+                        "side": intent.side.value,
+                        "qty": str(intent.qty),
+                        "reference_price": str(signal.reference_price),
+                    },
                     event.bar.close_time,
                 )
 
@@ -229,9 +238,14 @@ class BacktestEngine:
                 self._portfolio = self._apply_fill(intent, fill_pnl, costs, event.bar.close_time)
                 self._fills += 1
                 self._total_costs_usdt += costs
+                fill_price = intent.price or signal.reference_price
                 await self._record(
                     "fill",
-                    {"symbol": intent.symbol, "qty": str(intent.qty)},
+                    {
+                        "symbol": intent.symbol,
+                        "qty": str(intent.qty),
+                        "exec_price": str(fill_price),
+                    },
                     event.bar.close_time,
                 )
 

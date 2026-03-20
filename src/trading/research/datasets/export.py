@@ -30,6 +30,7 @@ class DecisionExportRecord:
     fill_price: str | None
     risk_approved: bool
     risk_reason: str | None
+    confidence: str | None = None
 
 
 def extract_decision_records(events: list[LedgerEvent]) -> list[DecisionExportRecord]:
@@ -111,6 +112,8 @@ def extract_decision_records(events: list[LedgerEvent]) -> list[DecisionExportRe
         fill_qty = str(fill_p.get("exec_qty", fill_p.get("qty", ""))) if fill_p else None
         fill_price = str(fill_p.get("exec_price", "")) if fill_p else None
 
+        ref_price = intent_p.get("reference_price") if intent_p else None
+        conf = dp.get("confidence") if dp else None
         records.append(
             DecisionExportRecord(
                 ts_utc=devt.timestamp,
@@ -118,7 +121,7 @@ def extract_decision_records(events: list[LedgerEvent]) -> list[DecisionExportRe
                 action=action,
                 side=intent_p.get("side") if intent_p else None,
                 qty=intent_p.get("qty", "") if intent_p else "",
-                reference_price=None,
+                reference_price=ref_price,
                 order_link_id=intent_p.get("order_link_id") if intent_p else None,
                 filled=fill_p is not None,
                 fill_ts_utc=fill_ts,
@@ -126,6 +129,7 @@ def extract_decision_records(events: list[LedgerEvent]) -> list[DecisionExportRe
                 fill_price=fill_price,
                 risk_approved=risk_approved,
                 risk_reason=risk_reason,
+                confidence=conf,
             )
         )
 
@@ -153,6 +157,7 @@ def export_records_to_json(records: list[DecisionExportRecord], path: Path) -> N
             "fill_price": r.fill_price,
             "risk_approved": r.risk_approved,
             "risk_reason": r.risk_reason,
+            "confidence": r.confidence,
         }
         for r in records
     ]

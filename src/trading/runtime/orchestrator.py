@@ -783,6 +783,7 @@ class RuntimeOrchestrator:
                         "qty": str(intent.qty),
                         "order_link_id": intent.order_link_id,
                         "reduce_only": str(intent.reduce_only),
+                        "reference_price": str(signal.reference_price),
                     },
                 )
                 self._logger.info(

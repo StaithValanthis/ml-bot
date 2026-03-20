@@ -30,6 +30,9 @@ class OfflineTrainReport:
     verdict: str = "baseline_only"
     model_beats_always_zero: bool = False
     model_beats_majority: bool = False
+    feature_coverage: dict[str, float] | None = None
+    label_trust: dict[str, str] | None = None
+    class_imbalance_note: str | None = None
     error: str | None = None
 
 
@@ -79,6 +82,11 @@ def build_offline_train_report(result: OfflineTrainResult) -> OfflineTrainReport
     baseline_exp: BaselineExperimentResult | None = None
     if hasattr(result, "baseline_experiment") and isinstance(result.baseline_experiment, BaselineExperimentResult):
         baseline_exp = result.baseline_experiment
+    extra = {
+        "feature_coverage": getattr(result, "feature_coverage", None),
+        "label_trust": getattr(result, "label_trust", None),
+        "class_imbalance_note": getattr(result, "class_imbalance_note", None),
+    }
     if result.eval_result is not None:
         r = _eval_to_report(result.eval_result, baseline_exp)
         if r is not None:
@@ -98,6 +106,9 @@ def build_offline_train_report(result: OfflineTrainResult) -> OfflineTrainReport
                 verdict=r.verdict,
                 model_beats_always_zero=r.model_beats_always_zero,
                 model_beats_majority=r.model_beats_majority,
+                feature_coverage=extra["feature_coverage"],
+                label_trust=extra["label_trust"],
+                class_imbalance_note=extra["class_imbalance_note"],
                 error=result.error,
             )
     return OfflineTrainReport(
@@ -109,6 +120,9 @@ def build_offline_train_report(result: OfflineTrainResult) -> OfflineTrainReport
         label_counts={},
         split_metadata={},
         metrics={},
+        feature_coverage=extra["feature_coverage"],
+        label_trust=extra["label_trust"],
+        class_imbalance_note=extra["class_imbalance_note"],
         error=result.error,
     )
 
@@ -136,6 +150,12 @@ def report_to_dict(report: OfflineTrainReport) -> dict[str, object]:
         d["baseline_majority_metrics"] = report.baseline_majority_metrics
     if report.model_metrics:
         d["model_metrics"] = report.model_metrics
+    if report.feature_coverage:
+        d["feature_coverage"] = report.feature_coverage
+    if report.label_trust:
+        d["label_trust"] = report.label_trust
+    if report.class_imbalance_note:
+        d["class_imbalance_note"] = report.class_imbalance_note
     return d
 
 
@@ -190,6 +210,18 @@ def build_offline_train_markdown(report: OfflineTrainReport) -> str:
         f"- Model beats majority: {report.model_beats_majority}",
         "",
     ])
+    if report.class_imbalance_note:
+        lines.extend(["## Class Imbalance", f"- {report.class_imbalance_note}", ""])
+    if report.feature_coverage:
+        lines.append("## Feature Coverage (non-missing fraction)")
+        for k, v in sorted(report.feature_coverage.items()):
+            lines.append(f"- {k}: {v:.2f}")
+        lines.append("")
+    if report.label_trust:
+        lines.append("## Label Trust")
+        for k, v in sorted(report.label_trust.items()):
+            lines.append(f"- {k}: {v}")
+        lines.append("")
     if report.error:
         lines.append(f"**Error:** {report.error}\n")
     return "\n".join(lines)

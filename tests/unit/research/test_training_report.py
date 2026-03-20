@@ -110,3 +110,27 @@ def test_write_offline_train_report_creates_files(tmp_path: Path) -> None:
     assert "sample_counts" in content
     assert "verdict" in content
     assert "model_type" in content
+
+
+def test_report_includes_feature_coverage_and_label_trust(tmp_path: Path) -> None:
+    """Report includes feature_coverage, label_trust, class_imbalance_note when present."""
+    from trading.research.training.report import build_offline_train_report, report_to_dict
+
+    from trading.research.training.runner import OfflineTrainResult
+
+    result = OfflineTrainResult(
+        success=True,
+        run_id="r1",
+        train_rows=10,
+        test_rows=5,
+        eval_result=None,
+        prepared_csv_path=None,
+        feature_coverage={"reference_price": 0.8, "confidence": 1.0},
+        label_trust={"filled": "trustworthy", "profitable_fill": "scaffold_2_missing"},
+        class_imbalance_note="filled=45%",
+    )
+    report = build_offline_train_report(result)
+    d = report_to_dict(report)
+    assert d.get("feature_coverage") == {"reference_price": 0.8, "confidence": 1.0}
+    assert d.get("label_trust") == {"filled": "trustworthy", "profitable_fill": "scaffold_2_missing"}
+    assert d.get("class_imbalance_note") == "filled=45%"
