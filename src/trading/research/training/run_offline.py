@@ -26,14 +26,29 @@ def main() -> None:
 
     archive_dir = Path(os.getenv("TRADING_ARCHIVE_DIR", "data/archive"))
     export_dir = archive_dir / "decision_exports"
+    export_dir_resolved = export_dir.resolve()
     records_path: Path | None = None
     if export_dir.exists():
         json_files = sorted(export_dir.glob("decisions_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
         if json_files:
             records_path = json_files[0]
-            logger.info("offline_train_using_export", path=str(records_path))
+            logger.info(
+                "offline_train_using_export",
+                path=str(records_path.resolve()),
+                export_dir=str(export_dir_resolved),
+                count=len(json_files),
+            )
     if records_path is None:
-        logger.warning("offline_train_no_export_found", export_dir=str(export_dir))
+        export_exists = export_dir.exists()
+        json_count = len(list(export_dir.glob("decisions_*.json"))) if export_exists else 0
+        logger.warning(
+            "offline_train_no_export_found",
+            export_dir=str(export_dir_resolved),
+            export_dir_exists=export_exists,
+            decisions_json_count=json_count,
+            expected_pattern="decisions_*.json",
+            hint="Run backtest first: trading-backtest or TRADING_MODE=backtest python -m trading.main",
+        )
         return
 
     output_dir = archive_dir / "offline_train"

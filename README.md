@@ -57,6 +57,18 @@ Production-grade modular monolith for Bybit USDT perpetual futures with strict e
 3. Run:
    - **Runtime (paper/demo/live):** `python -m trading.main` or `trading-bot`
    - **Backtest:** `TRADING_MODE=backtest python -m trading.main` or `trading-backtest`
+   - **Offline ML training:** `trading-offline-train` (requires decision exports from backtest first)
+
+**Offline ML / Decision Exports**
+
+To run offline training, generate decision exports first:
+
+1. **Generate exports:** `trading-backtest` or `TRADING_MODE=backtest python -m trading.main`
+   - Writes `data/archive/decision_exports/decisions_<timestamp>.json`
+   - Logs `backtest_decision_export_written` (path, count) or `backtest_decision_export_skipped` (count=0)
+2. **Run training:** `trading-offline-train` or `python -m trading.research.training.run_offline`
+   - Uses most recent `decisions_*.json` in `data/archive/decision_exports/`
+   - Output: `data/archive/offline_train/`
 
 ## Production Installation (Ubuntu 22.04/24.04)
 

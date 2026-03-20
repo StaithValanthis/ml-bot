@@ -27,7 +27,8 @@ async def synthetic_candle_events(
         t = base + timedelta(minutes=int(timeframe) * (i + 1))
         for symbol in symbols:
             base_price = Decimal("40000") if "BTC" in symbol else Decimal("2500")
-            close = base_price + Decimal(i) * Decimal("5")
+            bump = Decimal((i % 7) * 15)
+            close = base_price + Decimal(i) * Decimal("5") + bump
             yield CandleEvent(
                 symbol=symbol,
                 bar=OHLCVBar(

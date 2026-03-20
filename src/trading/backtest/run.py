@@ -45,6 +45,10 @@ async def run_backtest(settings: AppSettings) -> None:
 
     report = build_backtest_report(result, symbols)
     archive_dir = Path(os.getenv("TRADING_ARCHIVE_DIR", "data/archive"))
+    export_dir = archive_dir / "decision_exports"
+    ts = report.session_start[:19].replace("-", "").replace(":", "").replace("T", "_") if report.session_start else "unknown"
+    export_path = export_dir / f"decisions_{ts}.json"
+
     try:
         json_path, md_path = write_backtest_report(report, archive_dir)
         logger.info(
@@ -53,13 +57,23 @@ async def run_backtest(settings: AppSettings) -> None:
             md_path=str(md_path),
         )
         records = extract_decision_records(result.events)
+        export_dir.mkdir(parents=True, exist_ok=True)
         if records:
-            export_dir = archive_dir / "decision_exports"
-            export_dir.mkdir(parents=True, exist_ok=True)
-            ts = report.session_start[:19].replace("-", "").replace(":", "").replace("T", "_") if report.session_start else "unknown"
-            export_path = export_dir / f"decisions_{ts}.json"
             export_records_to_json(records, export_path)
-            logger.info("backtest_decision_export_written", path=str(export_path), count=len(records))
+            logger.info(
+                "backtest_decision_export_written",
+                path=str(export_path.resolve()),
+                count=len(records),
+                export_dir=str(export_dir.resolve()),
+            )
+        else:
+            logger.info(
+                "backtest_decision_export_skipped",
+                path=str(export_path.resolve()),
+                count=0,
+                reason="no_decisions_to_export",
+                export_dir=str(export_dir.resolve()),
+            )
     except OSError as exc:
         logger.warning(
             "backtest_report_write_failed",

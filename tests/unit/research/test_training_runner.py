@@ -82,3 +82,13 @@ def test_run_offline_training_respects_split_config() -> None:
     total = result.train_rows + result.test_rows
     assert total <= 100
     assert result.train_rows > result.test_rows
+
+
+def test_run_offline_main_no_export_exits_cleanly(tmp_path: Path) -> None:
+    """run_offline main() exits without error when no decision export exists."""
+    from unittest.mock import patch
+
+    from trading.research.training.run_offline import main
+
+    with patch.dict("os.environ", {"TRADING_ARCHIVE_DIR": str(tmp_path.resolve())}):
+        main()
