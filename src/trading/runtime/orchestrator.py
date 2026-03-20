@@ -51,6 +51,7 @@ from trading.runtime.drill import (
     generate_drill_order_link_id,
     validate_drill,
 )
+from trading.runtime.strategy_orders import StrategyOrderOutcomes
 from trading.storage.postgres import PostgresJournalStore
 from trading.runtime.mode import is_live_execution_mode, is_streaming_mode
 from trading.runtime.scheduler import run_periodic
@@ -60,15 +61,15 @@ def _drill_post_ack_status(outcome: DrillOutcome) -> str:
     """Classify post-ack state for operator visibility."""
     if not outcome.ack_received:
         return "no_ack"
-    if outcome.completed and outcome.final_status:
+    if outcome.final_status:
         if outcome.final_status == "Filled":
             return "filled"
         if outcome.final_status == "Cancelled":
             return "cancelled"
         if outcome.final_status == "Rejected":
             return "rejected"
-    if outcome.final_status in ("New", "PartiallyFilled"):
-        return "resting_open"
+        if outcome.final_status in ("New", "PartiallyFilled"):
+            return "resting_open"
     return "ack_only_no_transition"
 
 
@@ -96,6 +97,7 @@ class RuntimeOrchestrator:
         self._consecutive_reconcile_mismatches = 0
         self._startup_auth_disabled = False
         self._drill_outcome = DrillOutcome()
+        self._strategy_order_outcomes = StrategyOrderOutcomes()
 
         self._rest = BybitRestClient(settings.exchange)
         self._metrics = MetricsRegistry()
@@ -641,6 +643,40 @@ class RuntimeOrchestrator:
                                 "drill_completed",
                                 {"order_link_id": link_id, "final_status": new_status},
                             )
+                    elif prev and not prev.metadata.get("drill"):
+                        so = self._strategy_order_outcomes
+                        if new_status == "PartiallyFilled" and link_id not in so._seen_partially_filled:
+                            so._seen_partially_filled.add(link_id)
+                            so.partially_filled += 1
+                            self._logger.info(
+                                "strategy_order_partially_filled",
+                                order_link_id=link_id,
+                                symbol=event.symbol or "",
+                            )
+                        elif new_status == "Filled" and link_id not in so._seen_filled:
+                            so._seen_filled.add(link_id)
+                            so.filled += 1
+                            self._logger.info(
+                                "strategy_order_filled",
+                                order_link_id=link_id,
+                                symbol=event.symbol or "",
+                            )
+                        elif new_status == "Cancelled" and link_id not in so._seen_cancelled:
+                            so._seen_cancelled.add(link_id)
+                            so.cancelled += 1
+                            self._logger.info(
+                                "strategy_order_cancelled",
+                                order_link_id=link_id,
+                                symbol=event.symbol or "",
+                            )
+                        elif new_status == "Rejected" and link_id not in so._seen_rejected:
+                            so._seen_rejected.add(link_id)
+                            so.rejected += 1
+                            self._logger.info(
+                                "strategy_order_rejected",
+                                order_link_id=link_id,
+                                symbol=event.symbol or "",
+                            )
                     self._logger.info(
                         "order_state_transition",
                         order_link_id=event.order_link_id or "",
@@ -738,6 +774,7 @@ class RuntimeOrchestrator:
 
                 await self._order_manager.register_intent(intent)
                 self._metrics.inc("order_intents_total")
+                self._strategy_order_outcomes.intents += 1
                 await self._ledger.record(
                     "order_intent",
                     {
@@ -749,7 +786,7 @@ class RuntimeOrchestrator:
                     },
                 )
                 self._logger.info(
-                    "order_intent_created",
+                    "strategy_order_intent_created",
                     symbol=intent.symbol,
                     side=intent.side.value,
                     qty=str(intent.qty),
@@ -766,6 +803,8 @@ class RuntimeOrchestrator:
         if not isinstance(intent, OrderIntent):
             return
         self._metrics.inc("order_submissions_total")
+        if not is_drill:
+            self._strategy_order_outcomes.submissions += 1
         await self._ledger.record(
             "order_submission_attempt",
             {
@@ -783,6 +822,14 @@ class RuntimeOrchestrator:
             side=intent.side.value,
             qty=str(intent.qty),
         )
+        if not is_drill:
+            self._logger.info(
+                "strategy_order_submitted",
+                order_link_id=intent.order_link_id,
+                symbol=intent.symbol,
+                side=intent.side.value,
+                qty=str(intent.qty),
+            )
         try:
             ack = await self._rest.place_order(
                 PlaceOrderRequest(
@@ -814,6 +861,13 @@ class RuntimeOrchestrator:
                     {"order_link_id": ack.order_link_id, "order_id": ack.order_id},
                 )
                 self._logger.info("drill_ack_received", order_link_id=ack.order_link_id, order_id=ack.order_id)
+            else:
+                self._strategy_order_outcomes.acks += 1
+                self._logger.info(
+                    "strategy_order_ack_received",
+                    order_link_id=ack.order_link_id,
+                    order_id=ack.order_id,
+                )
             self._logger.info(
                 "order_ack_received",
                 order_link_id=ack.order_link_id,
@@ -1040,6 +1094,21 @@ class RuntimeOrchestrator:
                 elif post_ack == "ack_only_no_transition":
                     payload["note"] = "drill_ack_received_no_further_transition"
                 await self._ledger.record("drill_reconcile_result", payload)
+            open_orders = await self._order_manager.get_open_orders(None)
+            drill_link = self._drill_outcome.order_link_id or ""
+            strategy_resting = [
+                o for o in open_orders
+                if not o.metadata.get("drill") and o.order_link_id != drill_link
+            ]
+            if strategy_resting:
+                await self._ledger.record(
+                    "reconcile_strategy_orders_resting",
+                    {
+                        "count": len(strategy_resting),
+                        "order_link_ids": [o.order_link_id for o in strategy_resting],
+                        "note": "strategy_orders_resting_at_reconcile",
+                    },
+                )
         self._health.mark_reconcile()
 
     async def _watchdog_cycle(self) -> None:
@@ -1199,11 +1268,17 @@ class RuntimeOrchestrator:
             decisions_total=decisions,
         )
 
-    def _build_session_summary(self) -> dict[str, object]:
+    async def _build_session_summary(self) -> dict[str, object]:
         """Build concise session summary from metrics and session state."""
         metrics = self._metrics.snapshot()
         start = self._session_start_time or utc_now()
         end = utc_now()
+        so = self._strategy_order_outcomes
+        open_orders = await self._order_manager.get_open_orders(None)
+        drill_link = self._drill_outcome.order_link_id or ""
+        strategy_resting_opens = sum(
+            1 for o in open_orders if not o.metadata.get("drill") and o.order_link_id != drill_link
+        )
         summary: dict[str, object] = {
             "session_start": start.isoformat(),
             "session_end": end.isoformat(),
@@ -1258,6 +1333,16 @@ class RuntimeOrchestrator:
             summary["abort_reasons"] = self._abort_reasons
         if self._startup_auth_disabled:
             summary["startup_auth_disabled"] = True
+        summary["strategy_order_outcomes"] = {
+            "intents": so.intents,
+            "submissions": so.submissions,
+            "acks": so.acks,
+            "resting_opens": strategy_resting_opens,
+            "partially_filled": so.partially_filled,
+            "filled": so.filled,
+            "cancelled": so.cancelled,
+            "rejected": so.rejected,
+        }
         return summary
 
     def _build_markdown_summary(self, summary: dict[str, object]) -> str:
@@ -1304,6 +1389,18 @@ class RuntimeOrchestrator:
                 for k, v in details.items():
                     lines.append(f"  - {k}: {v}")
             lines.append("")
+        if outcomes := summary.get("strategy_order_outcomes"):
+            lines.append("## Strategy Order Outcomes")
+            o = outcomes
+            lines.append(f"- Intents: {o.get('intents', 0)}")
+            lines.append(f"- Submissions: {o.get('submissions', 0)}")
+            lines.append(f"- Acks: {o.get('acks', 0)}")
+            lines.append(f"- Resting opens: {o.get('resting_opens', 0)}")
+            lines.append(f"- Partially filled: {o.get('partially_filled', 0)}")
+            lines.append(f"- Filled: {o.get('filled', 0)}")
+            lines.append(f"- Cancelled: {o.get('cancelled', 0)}")
+            lines.append(f"- Rejected: {o.get('rejected', 0)}")
+            lines.append("")
         if summary.get("abort_reasons"):
             lines.append("## Abort Reasons")
             for r in summary["abort_reasons"]:
@@ -1315,7 +1412,7 @@ class RuntimeOrchestrator:
         """Write session summary to report path for demo/paper runs."""
         if self._settings.runtime.mode not in {RuntimeMode.PAPER, RuntimeMode.DEMO}:
             return
-        summary = self._build_session_summary()
+        summary = await self._build_session_summary()
         root = Path(self._parquet_store._root_dir)
         root.mkdir(parents=True, exist_ok=True)
         start = self._session_start_time or utc_now()

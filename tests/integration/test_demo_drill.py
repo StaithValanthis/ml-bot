@@ -499,7 +499,8 @@ async def test_drill_succeeds_when_ticker_becomes_available_during_wait() -> Non
     assert "drill_ack_received" in event_types
 
 
-def test_drill_abort_summary_includes_improved_details() -> None:
+@pytest.mark.asyncio
+async def test_drill_abort_summary_includes_improved_details() -> None:
     """Session summary includes drill_abort_details when drill aborts with structured reason."""
     settings = load_settings()
     settings.runtime.demo_drill.enabled = True
@@ -520,7 +521,7 @@ def test_drill_abort_summary_includes_improved_details() -> None:
         "reason": "timeout",
     }
 
-    summary = orch._build_session_summary()
+    summary = await orch._build_session_summary()
     assert summary.get("drill_abort_details") is not None
     details = summary["drill_abort_details"]
     assert details.get("waited_seconds") == 25.0
@@ -670,7 +671,8 @@ async def test_drill_ledger_payloads_with_decimal_serialize() -> None:
     # No serialization crash = success
 
 
-def test_session_summary_with_decimal_drill_details_serializes() -> None:
+@pytest.mark.asyncio
+async def test_session_summary_with_decimal_drill_details_serializes() -> None:
     """Session summary with Decimal in drill_abort_details serializes without crash."""
     from decimal import Decimal
 
@@ -696,7 +698,7 @@ def test_session_summary_with_decimal_drill_details_serializes() -> None:
         "max_notional_usdt": "10",
     }
     # Simulate Decimal leaking into summary (e.g. from a different code path)
-    summary = orch._build_session_summary()
+    summary = await orch._build_session_summary()
     summary["drill_abort_details"] = {
         "symbol": "BTCUSDT",
         "qty": Decimal("0.001"),
@@ -712,7 +714,8 @@ def test_session_summary_with_decimal_drill_details_serializes() -> None:
     assert parsed["drill_abort_details"]["estimated_notional_usdt"] == "50"
 
 
-def test_drill_refusal_details_in_summary() -> None:
+@pytest.mark.asyncio
+async def test_drill_refusal_details_in_summary() -> None:
     """Session summary includes structured refusal details (symbol, qty, min_qty, notional, cap)."""
     settings = load_settings()
     settings.runtime.demo_drill.enabled = True
@@ -731,7 +734,7 @@ def test_drill_refusal_details_in_summary() -> None:
         "max_notional_usdt": "10",
     }
 
-    summary = orch._build_session_summary()
+    summary = await orch._build_session_summary()
     assert summary.get("drill_abort_details") is not None
     details = summary["drill_abort_details"]
     assert details.get("symbol") == "BTCUSDT"
@@ -748,7 +751,8 @@ def test_drill_refusal_details_in_summary() -> None:
     assert "10" in md
 
 
-def test_drill_summary_fields() -> None:
+@pytest.mark.asyncio
+async def test_drill_summary_fields() -> None:
     """Session summary includes drill fields when drill is enabled."""
     settings = load_settings()
     settings.runtime.demo_drill.enabled = True
@@ -763,7 +767,7 @@ def test_drill_summary_fields() -> None:
     orch._drill_outcome.ack_received = True
     orch._drill_outcome.completed = True
 
-    summary = orch._build_session_summary()
+    summary = await orch._build_session_summary()
     assert summary.get("drill_enabled") is True
     assert summary.get("drill_attempted") is True
     assert summary.get("drill_symbol") == "BTCUSDT"
@@ -778,7 +782,8 @@ def test_drill_summary_fields() -> None:
     assert "completed" in md
 
 
-def test_drill_post_ack_status_ack_only_no_transition() -> None:
+@pytest.mark.asyncio
+async def test_drill_post_ack_status_ack_only_no_transition() -> None:
     """Session summary reports ack_only_no_transition when ack received but no order update."""
     settings = load_settings()
     settings.runtime.demo_drill.enabled = True
@@ -792,7 +797,7 @@ def test_drill_post_ack_status_ack_only_no_transition() -> None:
     orch._drill_outcome.final_status = None
     orch._drill_outcome.completed = False
 
-    summary = orch._build_session_summary()
+    summary = await orch._build_session_summary()
     assert summary.get("drill_post_ack_status") == "ack_only_no_transition"
     assert "drill_final_status" not in summary or summary.get("drill_final_status") is None
 
@@ -800,7 +805,8 @@ def test_drill_post_ack_status_ack_only_no_transition() -> None:
     assert "ack_only_no_transition" in md
 
 
-def test_drill_post_ack_status_resting_open() -> None:
+@pytest.mark.asyncio
+async def test_drill_post_ack_status_resting_open() -> None:
     """Session summary reports resting_open when drill order is resting (New/PartiallyFilled)."""
     settings = load_settings()
     settings.runtime.demo_drill.enabled = True
@@ -814,7 +820,7 @@ def test_drill_post_ack_status_resting_open() -> None:
     orch._drill_outcome.final_status = "New"
     orch._drill_outcome.completed = False
 
-    summary = orch._build_session_summary()
+    summary = await orch._build_session_summary()
     assert summary.get("drill_post_ack_status") == "resting_open"
     assert summary.get("drill_final_status") == "New"
 
@@ -823,7 +829,8 @@ def test_drill_post_ack_status_resting_open() -> None:
     assert "New" in md
 
 
-def test_drill_post_ack_status_filled() -> None:
+@pytest.mark.asyncio
+async def test_drill_post_ack_status_filled() -> None:
     """Session summary reports filled when drill order completed with Filled."""
     settings = load_settings()
     settings.runtime.demo_drill.enabled = True
@@ -836,7 +843,7 @@ def test_drill_post_ack_status_filled() -> None:
     orch._drill_outcome.final_status = "Filled"
     orch._drill_outcome.completed = True
 
-    summary = orch._build_session_summary()
+    summary = await orch._build_session_summary()
     assert summary.get("drill_post_ack_status") == "filled"
     assert summary.get("drill_final_status") == "Filled"
 

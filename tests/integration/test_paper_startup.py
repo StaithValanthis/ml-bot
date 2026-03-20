@@ -346,3 +346,59 @@ async def test_controlled_shutdown_writes_session_summary() -> None:
     data = json.loads(json_files[-1].read_text(encoding="utf-8"))
     assert "session_start" in data
     assert "session_end" in data
+
+
+@pytest.mark.asyncio
+async def test_strategy_order_outcomes_in_session_summary() -> None:
+    """Session summary includes strategy_order_outcomes section with intents, acks, resting_opens, etc."""
+    settings = load_settings()
+    archive_dir = Path.cwd() / "tmp_integration_archive"
+    summaries_dir = archive_dir / "session_summaries"
+
+    mock_rest = MagicMock()
+    mock_rest.get_server_time = AsyncMock(return_value=ServerTimeResult(time_second="1700000000", time_nano="0"))
+    mock_rest.get_wallet = AsyncMock(return_value=[])
+    mock_rest.get_positions = AsyncMock(return_value=[])
+    mock_rest.get_open_orders = AsyncMock(return_value=[])
+    mock_rest.close = AsyncMock()
+
+    mock_ws_public = MagicMock()
+    mock_ws_public.subscribe = AsyncMock()
+    mock_ws_public.run_forever = AsyncMock(side_effect=lambda: asyncio.sleep(0.05))
+    mock_ws_public.close = AsyncMock()
+
+    mock_ws_private = MagicMock()
+    mock_ws_private.subscribe = AsyncMock()
+    mock_ws_private.run_forever = AsyncMock(return_value=None)
+    mock_ws_private.close = AsyncMock()
+
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient", return_value=mock_rest),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient", return_value=mock_ws_public),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient", return_value=mock_ws_private),
+    ):
+        orch = RuntimeOrchestrator(settings)
+        orch._strategy_order_outcomes.intents = 2
+        orch._strategy_order_outcomes.submissions = 1
+        orch._strategy_order_outcomes.acks = 1
+        orch._strategy_order_outcomes.filled = 0
+        orch._strategy_order_outcomes.cancelled = 0
+        orch._strategy_order_outcomes.rejected = 0
+        orch._strategy_order_outcomes.partially_filled = 0
+
+        summary = await orch._build_session_summary()
+
+    outcomes = summary.get("strategy_order_outcomes")
+    assert outcomes is not None
+    assert outcomes.get("intents") == 2
+    assert outcomes.get("submissions") == 1
+    assert outcomes.get("acks") == 1
+    assert "resting_opens" in outcomes
+    assert "filled" in outcomes
+    assert "cancelled" in outcomes
+    assert "rejected" in outcomes
+
+    md = orch._build_markdown_summary(summary)
+    assert "## Strategy Order Outcomes" in md
+    assert "Intents: 2" in md
+    assert "Submissions: 1" in md
