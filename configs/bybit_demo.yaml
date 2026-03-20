@@ -17,6 +17,8 @@ trading:
 # DEMO-only: relaxed breakout thresholds to increase candidate frequency.
 # Applied only when runtime.mode is DEMO. PAPER/LIVE/BACKTEST use defaults.
 runtime:
+  # DEMO-only: even more relaxed profile (bps=1/2, vol=1.0, lookback=15). Overrides demo_candidate_overrides when enabled.
+  # demo_more_opportunities_enabled: true
   demo_candidate_overrides:
     min_breakout_bps: 3
     min_trend_bps: 5

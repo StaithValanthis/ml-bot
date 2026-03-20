@@ -184,8 +184,14 @@ class RuntimeOrchestrator:
 
     def _build_candidate_generator(self) -> BreakoutTrendCandidateGenerator:
         """Build candidate generator; apply DEMO-only overrides when mode is DEMO."""
+        from dataclasses import replace
+
         cfg = CandidateGeneratorConfig()
         overrides = self._settings.runtime.demo_candidate_overrides
+        more_opportunities = (
+            self._settings.runtime.mode == RuntimeMode.DEMO
+            and self._settings.runtime.demo_more_opportunities_enabled
+        )
         if (
             self._settings.runtime.mode == RuntimeMode.DEMO
             and overrides is not None
@@ -193,22 +199,36 @@ class RuntimeOrchestrator:
                 getattr(overrides, k) is not None
                 for k in ("min_breakout_bps", "min_trend_bps", "min_volume_multiplier")
             )
+            and not more_opportunities
         ):
-            updates: dict[str, Decimal] = {}
+            updates: dict[str, object] = {}
             if overrides.min_breakout_bps is not None:
                 updates["min_breakout_bps"] = Decimal(str(overrides.min_breakout_bps))
             if overrides.min_trend_bps is not None:
                 updates["min_trend_bps"] = Decimal(str(overrides.min_trend_bps))
             if overrides.min_volume_multiplier is not None:
                 updates["min_volume_multiplier"] = Decimal(str(overrides.min_volume_multiplier))
-            from dataclasses import replace
-
             cfg = replace(cfg, **updates)
             self._logger.info(
                 "demo_candidate_overrides_applied",
                 min_breakout_bps=float(cfg.min_breakout_bps),
                 min_trend_bps=float(cfg.min_trend_bps),
                 min_volume_multiplier=float(cfg.min_volume_multiplier),
+            )
+        if more_opportunities:
+            profile = {
+                "min_breakout_bps": Decimal("1"),
+                "min_trend_bps": Decimal("2"),
+                "min_volume_multiplier": Decimal("1.0"),
+                "lookback_bars": 15,
+            }
+            cfg = replace(cfg, **profile)
+            self._logger.info(
+                "demo_more_opportunities_profile_applied",
+                min_breakout_bps=1,
+                min_trend_bps=2,
+                min_volume_multiplier=1.0,
+                lookback_bars=15,
             )
         return BreakoutTrendCandidateGenerator(config=cfg)
 
@@ -1686,6 +1706,8 @@ class RuntimeOrchestrator:
             "blocking_stage": blocking_stage,
             "candidate_readiness": candidate_readiness,
         }
+        if self._settings.runtime.mode == RuntimeMode.DEMO:
+            log_payload["demo_more_opportunities_enabled"] = self._settings.runtime.demo_more_opportunities_enabled
         if model_filter_calibration is not None:
             log_payload["model_filter_calibration"] = model_filter_calibration
         self._logger.info("runtime_summary", **log_payload)
@@ -1742,6 +1764,8 @@ class RuntimeOrchestrator:
                 for r in self._warmup_results
             ],
         }
+        if self._settings.runtime.mode == RuntimeMode.DEMO:
+            summary["demo_more_opportunities_enabled"] = self._settings.runtime.demo_more_opportunities_enabled
         if self._health.snapshot().private_stream_error is not None:
             summary["private_stream_error"] = self._health.snapshot().private_stream_error
         if self._drill_outcome.enabled:
@@ -1830,6 +1854,10 @@ class RuntimeOrchestrator:
             f"- Blocking stage: {summary.get('blocking_stage', 'unknown')}",
             "",
         ]
+        if summary.get("mode") == "demo" and summary.get("demo_more_opportunities_enabled"):
+            lines.append("## Demo Profile")
+            lines.append("- More opportunities: enabled")
+            lines.append("")
         if warmup := summary.get("warmup_results"):
             lines.append("## Warmup Preload")
             for r in warmup:
