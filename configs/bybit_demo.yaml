@@ -21,3 +21,6 @@ runtime:
     min_breakout_bps: 3
     min_trend_bps: 5
     min_volume_multiplier: 1.05
+  # DEMO-only: minimum notional floor so valid candidates meet exchange min_qty.
+  # When computed qty < min_qty, use this floor (capped at 10% equity). ~75 USDT covers 0.001 BTC.
+  demo_sizing_min_notional_usdt: 75

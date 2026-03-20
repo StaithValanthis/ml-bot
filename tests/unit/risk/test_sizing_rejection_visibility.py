@@ -100,6 +100,117 @@ def test_reject_reason_qty_below_min_after_rounding() -> None:
     assert sizer.size_qty(inputs, symbol_info) == 0
 
 
+# --- DEMO min-notional floor tests ---
+
+
+def test_demo_floor_applied_when_qty_below_min() -> None:
+    """With demo_min_notional_floor_usdt, floor is applied when stepped_qty < min_qty."""
+    sizer = VolatilityAwareSizer(demo_min_notional_floor_usdt=Decimal("75"))
+    inputs = SizingInputs(
+        equity_usdt=Decimal("1000"),
+        confidence=Decimal("0.5"),
+        volatility_bps=Decimal("150"),
+        reference_price=Decimal("69850"),
+        max_leverage=Decimal("3"),
+    )
+    symbol_info = _market_symbol(min_qty=Decimal("0.001"), qty_step=Decimal("0.001"))
+    qty = sizer.size_qty(inputs, symbol_info)
+    assert qty >= symbol_info.min_qty
+    assert qty == Decimal("0.001")
+    assert sizer._last_floor_applied is True
+    assert sizer._last_floor_details is not None
+    assert sizer._last_floor_details["effective_notional"] >= 75
+    assert sizer._last_floor_details["qty"] == 0.001
+
+
+def test_no_floor_when_sizer_has_no_demo_floor() -> None:
+    """Without demo_min_notional_floor_usdt, qty below min is rejected (PAPER/LIVE behavior)."""
+    sizer = VolatilityAwareSizer()
+    inputs = SizingInputs(
+        equity_usdt=Decimal("1000"),
+        confidence=Decimal("0.5"),
+        volatility_bps=Decimal("150"),
+        reference_price=Decimal("69850"),
+        max_leverage=Decimal("3"),
+    )
+    symbol_info = _market_symbol(min_qty=Decimal("0.001"), qty_step=Decimal("0.001"))
+    qty = sizer.size_qty(inputs, symbol_info)
+    assert qty == 0
+    assert sizer.reject_reason(inputs, symbol_info) == "qty_below_min_after_rounding"
+    assert sizer._last_floor_applied is False
+
+
+def test_floor_not_applied_when_computed_qty_already_meets_min() -> None:
+    """Floor is not applied when computed qty already >= min_qty."""
+    sizer = VolatilityAwareSizer(demo_min_notional_floor_usdt=Decimal("75"))
+    inputs = SizingInputs(
+        equity_usdt=Decimal("10000"),
+        confidence=Decimal("0.5"),
+        volatility_bps=Decimal("100"),
+        reference_price=Decimal("50000"),
+        max_leverage=Decimal("3"),
+    )
+    symbol_info = _market_symbol(min_qty=Decimal("0.001"), qty_step=Decimal("0.001"))
+    qty = sizer.size_qty(inputs, symbol_info)
+    assert qty > 0
+    assert qty >= symbol_info.min_qty
+    assert sizer._last_floor_applied is False
+    assert sizer._last_floor_details is None
+
+
+def test_demo_floor_capped_by_equity_fraction() -> None:
+    """Floor is capped at max_equity_fraction_for_floor of equity."""
+    sizer = VolatilityAwareSizer(
+        demo_min_notional_floor_usdt=Decimal("500"),
+        max_equity_fraction_for_floor=Decimal("0.1"),
+    )
+    inputs = SizingInputs(
+        equity_usdt=Decimal("1000"),
+        confidence=Decimal("0.5"),
+        volatility_bps=Decimal("200"),
+        reference_price=Decimal("50000"),
+        max_leverage=Decimal("3"),
+    )
+    symbol_info = _market_symbol(min_qty=Decimal("0.001"), qty_step=Decimal("0.001"))
+    qty = sizer.size_qty(inputs, symbol_info)
+    assert qty >= symbol_info.min_qty
+    assert sizer._last_floor_applied is True
+    effective = sizer._last_floor_details["effective_notional"]
+    assert effective <= 100
+    assert effective == 100
+
+
+@pytest.mark.asyncio
+async def test_session_summary_includes_last_sizing_floor_applied() -> None:
+    """Session summary includes last_sizing_floor_applied when floor was applied."""
+    from trading.runtime.orchestrator import RuntimeOrchestrator
+    from trading.settings import load_settings
+
+    settings = load_settings()
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient", MagicMock()),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient", MagicMock()),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient", MagicMock()),
+    ):
+        orch = RuntimeOrchestrator(settings)
+        orch._last_sizing_floor_applied = {
+            "symbol": "BTCUSDT",
+            "original_notional": 8.5,
+            "effective_notional": 75.0,
+            "qty": 0.001,
+        }
+        summary = await orch._build_session_summary()
+        md = orch._build_markdown_summary(summary)
+
+    assert "last_sizing_floor_applied" in summary
+    lsf = summary["last_sizing_floor_applied"]
+    assert lsf["symbol"] == "BTCUSDT"
+    assert lsf["effective_notional"] == 75.0
+    assert lsf["qty"] == 0.001
+    assert "## Last Sizing Floor Applied" in md
+    assert "BTCUSDT" in md
+
+
 @pytest.mark.asyncio
 async def test_session_summary_includes_last_sizing_rejection() -> None:
     """Session summary includes last_sizing_rejection when sizing rejected a candidate."""

@@ -144,7 +144,13 @@ class RuntimeOrchestrator:
             circuit_breaker=self._circuit_breaker,
             per_symbol_limits=per_symbol,
         )
-        self._sizer = VolatilityAwareSizer()
+        demo_min_notional = None
+        if (
+            self._settings.runtime.mode == RuntimeMode.DEMO
+            and self._settings.runtime.demo_sizing_min_notional_usdt is not None
+        ):
+            demo_min_notional = self._settings.runtime.demo_sizing_min_notional_usdt
+        self._sizer = VolatilityAwareSizer(demo_min_notional_floor_usdt=demo_min_notional)
         self._candidate_generator = self._build_candidate_generator()
         self._regime_filter = RegimeFilter()
         self._signal_engine = SignalEngine()
@@ -153,6 +159,7 @@ class RuntimeOrchestrator:
         self._bar_history: dict[str, dict[str, deque]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=800)))
         self._last_candidate_readiness: dict[str, dict[str, object]] = {}
         self._last_sizing_rejection: dict[str, object] | None = None
+        self._last_sizing_floor_applied: dict[str, object] | None = None
         self._warmup_results: list[WarmupResult] = []
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
@@ -899,6 +906,16 @@ class RuntimeOrchestrator:
                     max_leverage=self._settings.risk.max_leverage,
                 )
                 qty = self._sizer.size_qty(sizing_inputs, symbol_spec)
+                if self._sizer._last_floor_applied and self._sizer._last_floor_details:
+                    self._last_sizing_floor_applied = {
+                        "symbol": signal.symbol,
+                        **self._sizer._last_floor_details,
+                    }
+                    self._logger.info(
+                        "sizing_floor_applied",
+                        symbol=signal.symbol,
+                        **self._sizer._last_floor_details,
+                    )
                 if qty <= 0:
                     self._metrics.inc("strategy_sizing_rejected")
                     reason = self._sizer.reject_reason(sizing_inputs, symbol_spec)
@@ -1690,6 +1707,8 @@ class RuntimeOrchestrator:
             summary["abort_reasons"] = self._abort_reasons
         if self._last_sizing_rejection is not None:
             summary["last_sizing_rejection"] = dict(self._last_sizing_rejection)
+        if self._last_sizing_floor_applied is not None:
+            summary["last_sizing_floor_applied"] = dict(self._last_sizing_floor_applied)
         if self._startup_auth_disabled:
             summary["startup_auth_disabled"] = True
         summary["strategy_order_outcomes"] = {
@@ -1774,6 +1793,11 @@ class RuntimeOrchestrator:
             lines.append(f"- Reason: {lsr.get('reason', '')}")
             lines.append(f"- equity_usdt={lsr.get('equity_usdt')} confidence={lsr.get('confidence')} volatility_bps={lsr.get('volatility_bps')}")
             lines.append(f"- reference_price={lsr.get('reference_price')} min_qty={lsr.get('min_qty')}")
+            lines.append("")
+        if lsf := summary.get("last_sizing_floor_applied"):
+            lines.append("## Last Sizing Floor Applied (DEMO min-notional)")
+            lines.append(f"- Symbol: {lsf.get('symbol', '')}")
+            lines.append(f"- original_notional={lsf.get('original_notional')} effective_notional={lsf.get('effective_notional')} qty={lsf.get('qty')}")
             lines.append("")
         if summary.get("drill_enabled"):
             lines.append("## Demo Drill")
