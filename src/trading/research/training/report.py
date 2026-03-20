@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from trading.research.training.baseline import BaselineExperimentResult, metrics_to_dict
 from trading.research.training.evaluate import OfflineEvalResult
 from trading.research.training.runner import OfflineTrainResult
 from trading.util.json_util import dumps_json_safe
@@ -22,12 +23,25 @@ class OfflineTrainReport:
     label_counts: dict[str, int]
     split_metadata: dict[str, str]
     metrics: dict[str, float]
+    model_type: str = "scaffold"
+    baseline_always_zero_metrics: dict[str, float | int] | None = None
+    baseline_majority_metrics: dict[str, float | int] | None = None
+    model_metrics: dict[str, float | int] | None = None
+    verdict: str = "baseline_only"
+    model_beats_always_zero: bool = False
+    model_beats_majority: bool = False
     error: str | None = None
 
 
-def _eval_to_report(eval_result: OfflineEvalResult | None) -> OfflineTrainReport | None:
+def _eval_to_report(
+    eval_result: OfflineEvalResult | None,
+    baseline_exp: BaselineExperimentResult | None,
+) -> OfflineTrainReport | None:
     if eval_result is None:
         return None
+    base_always = metrics_to_dict(baseline_exp.baseline_always_zero_metrics) if baseline_exp else None
+    base_majority = metrics_to_dict(baseline_exp.baseline_majority_metrics) if baseline_exp else None
+    model_m = metrics_to_dict(baseline_exp.model_metrics) if baseline_exp else None
     return OfflineTrainReport(
         run_id=eval_result.run_id,
         success=True,
@@ -50,13 +64,23 @@ def _eval_to_report(eval_result: OfflineEvalResult | None) -> OfflineTrainReport
             "recall": eval_result.metrics.recall,
             "f1": eval_result.metrics.f1,
         },
+        model_type=baseline_exp.model_type if baseline_exp else "scaffold",
+        baseline_always_zero_metrics=base_always,
+        baseline_majority_metrics=base_majority,
+        model_metrics=model_m,
+        verdict=baseline_exp.verdict.value if baseline_exp else "baseline_only",
+        model_beats_always_zero=baseline_exp.model_beats_always_zero if baseline_exp else False,
+        model_beats_majority=baseline_exp.model_beats_majority if baseline_exp else False,
     )
 
 
 def build_offline_train_report(result: OfflineTrainResult) -> OfflineTrainReport:
     """Build report from OfflineTrainResult."""
+    baseline_exp: BaselineExperimentResult | None = None
+    if hasattr(result, "baseline_experiment") and isinstance(result.baseline_experiment, BaselineExperimentResult):
+        baseline_exp = result.baseline_experiment
     if result.eval_result is not None:
-        r = _eval_to_report(result.eval_result)
+        r = _eval_to_report(result.eval_result, baseline_exp)
         if r is not None:
             return OfflineTrainReport(
                 run_id=r.run_id,
@@ -67,6 +91,13 @@ def build_offline_train_report(result: OfflineTrainResult) -> OfflineTrainReport
                 label_counts=r.label_counts,
                 split_metadata=r.split_metadata,
                 metrics=r.metrics,
+                model_type=r.model_type,
+                baseline_always_zero_metrics=r.baseline_always_zero_metrics,
+                baseline_majority_metrics=r.baseline_majority_metrics,
+                model_metrics=r.model_metrics,
+                verdict=r.verdict,
+                model_beats_always_zero=r.model_beats_always_zero,
+                model_beats_majority=r.model_beats_majority,
                 error=result.error,
             )
     return OfflineTrainReport(
@@ -84,7 +115,7 @@ def build_offline_train_report(result: OfflineTrainResult) -> OfflineTrainReport
 
 def report_to_dict(report: OfflineTrainReport) -> dict[str, object]:
     """Convert to JSON-serializable dict."""
-    return {
+    d: dict[str, object] = {
         "run_id": report.run_id,
         "success": report.success,
         "train_rows": report.train_rows,
@@ -93,8 +124,19 @@ def report_to_dict(report: OfflineTrainReport) -> dict[str, object]:
         "label_counts": report.label_counts,
         "split_metadata": report.split_metadata,
         "metrics": report.metrics,
+        "model_type": report.model_type,
+        "verdict": report.verdict,
+        "model_beats_always_zero": report.model_beats_always_zero,
+        "model_beats_majority": report.model_beats_majority,
         "error": report.error,
     }
+    if report.baseline_always_zero_metrics:
+        d["baseline_always_zero_metrics"] = report.baseline_always_zero_metrics
+    if report.baseline_majority_metrics:
+        d["baseline_majority_metrics"] = report.baseline_majority_metrics
+    if report.model_metrics:
+        d["model_metrics"] = report.model_metrics
+    return d
 
 
 def build_offline_train_markdown(report: OfflineTrainReport) -> str:
@@ -104,12 +146,14 @@ def build_offline_train_markdown(report: OfflineTrainReport) -> str:
         "",
         f"**Run ID:** {report.run_id}",
         f"**Success:** {report.success}",
+        f"**Model Type:** {report.model_type}",
+        f"**Verdict:** {report.verdict}",
         "",
         "## Sample Counts",
         f"- Train: {report.train_rows}",
         f"- Test: {report.test_rows}",
         "",
-        "## Label Counts (Class Balance)",
+        "## Label Balance",
     ]
     for k, v in sorted(report.label_counts.items()):
         lines.append(f"- {k}: {v}")
@@ -119,11 +163,31 @@ def build_offline_train_markdown(report: OfflineTrainReport) -> str:
         f"- Train: {report.split_metadata.get('train_start', '')} to {report.split_metadata.get('train_end', '')}",
         f"- Test: {report.split_metadata.get('test_start', '')} to {report.split_metadata.get('test_end', '')}",
         "",
-        "## Metrics",
+        "## Baseline Metrics (Always Zero)",
+    ])
+    if report.baseline_always_zero_metrics:
+        m = report.baseline_always_zero_metrics
+        lines.append(f"- Accuracy: {float(m.get('accuracy', 0)):.4f}")
+        lines.append(f"- F1: {float(m.get('f1', 0)):.4f}")
+    lines.extend([
+        "",
+        "## Baseline Metrics (Majority Class)",
+    ])
+    if report.baseline_majority_metrics:
+        m = report.baseline_majority_metrics
+        lines.append(f"- Accuracy: {float(m.get('accuracy', 0)):.4f}")
+        lines.append(f"- F1: {float(m.get('f1', 0)):.4f}")
+    lines.extend([
+        "",
+        "## Model Metrics",
         f"- Accuracy: {report.metrics.get('accuracy', 0):.4f}",
         f"- Precision: {report.metrics.get('precision', 0):.4f}",
         f"- Recall: {report.metrics.get('recall', 0):.4f}",
         f"- F1: {report.metrics.get('f1', 0):.4f}",
+        "",
+        "## Baseline Comparison",
+        f"- Model beats always-zero: {report.model_beats_always_zero}",
+        f"- Model beats majority: {report.model_beats_majority}",
         "",
     ])
     if report.error:

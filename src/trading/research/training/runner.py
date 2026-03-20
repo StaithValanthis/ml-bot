@@ -13,6 +13,10 @@ from trading.research.datasets.prepare import (
     prepare_training_rows,
     write_training_rows_csv,
 )
+from trading.research.training.baseline import (
+    run_baseline_experiment,
+    write_test_predictions,
+)
 from trading.research.training.evaluate import (
     EvalMetrics,
     OfflineEvalResult,
@@ -32,6 +36,8 @@ class OfflineTrainResult:
     test_rows: int
     eval_result: OfflineEvalResult | None
     prepared_csv_path: Path | None
+    baseline_experiment: object | None = None
+    predictions_path: Path | None = None
     error: str | None = None
 
 
@@ -163,7 +169,14 @@ def run_offline_training(
         test_start=split_result.test_start.isoformat(),
         test_end=split_result.test_end.isoformat(),
     )
-    metrics = EvalMetrics()
+
+    baseline_exp = run_baseline_experiment(train_rows, test_rows)
+    metrics = EvalMetrics(
+        accuracy=baseline_exp.model_metrics.accuracy,
+        precision=baseline_exp.model_metrics.precision,
+        recall=baseline_exp.model_metrics.recall,
+        f1=baseline_exp.model_metrics.f1,
+    )
     eval_result = OfflineEvalResult(
         sample_counts=SampleCounts(train_n=len(train_rows), test_n=len(test_rows)),
         label_counts=label_counts,
@@ -171,6 +184,12 @@ def run_offline_training(
         metrics=metrics,
         run_id=run_id,
     )
+
+    predictions_path: Path | None = None
+    if output_dir and test_rows and baseline_exp.model_predictions:
+        predictions_path = Path(output_dir) / f"predictions_{run_id}.json"
+        write_test_predictions(test_rows, baseline_exp.model_predictions, predictions_path)
+
     return OfflineTrainResult(
         success=True,
         run_id=run_id,
@@ -178,4 +197,6 @@ def run_offline_training(
         test_rows=len(test_rows),
         eval_result=eval_result,
         prepared_csv_path=prepared_csv_path,
+        baseline_experiment=baseline_exp,
+        predictions_path=predictions_path,
     )

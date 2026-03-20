@@ -1,5 +1,13 @@
 """Training: splits, train, evaluate, promote, offline runner workflow boundaries."""
 
+from trading.research.training.baseline import (
+    BaselineExperimentResult,
+    ComputedMetrics,
+    Verdict,
+    metrics_to_dict,
+    run_baseline_experiment,
+    write_test_predictions,
+)
 from trading.research.training.evaluate import (
     EvalMetrics,
     EvalResult,
@@ -23,6 +31,8 @@ from trading.research.training.splits import (
 from trading.research.training.train import TrainRequest, TrainResult, TrainingJob
 
 __all__ = [
+    "BaselineExperimentResult",
+    "ComputedMetrics",
     "DefaultTimeSeriesSplitter",
     "EvalMetrics",
     "EvalResult",
@@ -39,8 +49,12 @@ __all__ = [
     "TrainRequest",
     "TrainResult",
     "TrainingJob",
+    "Verdict",
     "build_offline_train_report",
     "decide_promotion",
+    "metrics_to_dict",
+    "run_baseline_experiment",
     "run_offline_training",
     "write_offline_train_report",
+    "write_test_predictions",
 ]

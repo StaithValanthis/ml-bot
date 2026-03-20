@@ -39,7 +39,7 @@ def test_report_to_dict_json_serializable() -> None:
 
 
 def test_build_offline_train_markdown_has_sections() -> None:
-    """Markdown has Sample Counts, Label Counts, Split Metadata, Metrics."""
+    """Markdown has Sample Counts, Label Balance, Baseline Comparison, Verdict."""
     report = OfflineTrainReport(
         run_id="run_001",
         success=True,
@@ -49,23 +49,47 @@ def test_build_offline_train_markdown_has_sections() -> None:
         label_counts={"train_0": 40, "train_1": 30},
         split_metadata={"train_start": "a", "train_end": "b", "test_start": "c", "test_end": "d"},
         metrics={"accuracy": 0.5, "precision": 0.0, "recall": 0.0, "f1": 0.0},
+        model_type="logistic_regression",
+        verdict="model_shows_promise",
+        model_beats_always_zero=True,
+        model_beats_majority=False,
     )
     md = build_offline_train_markdown(report)
     assert "## Sample Counts" in md
-    assert "## Label Counts" in md
+    assert "## Label Balance" in md
     assert "## Split Metadata" in md
-    assert "## Metrics" in md
+    assert "## Baseline Comparison" in md
     assert "run_001" in md
+    assert "model_shows_promise" in md
 
 
 def test_write_offline_train_report_creates_files(tmp_path: Path) -> None:
     """write_offline_train_report creates JSON and markdown in archive."""
+    from trading.research.training.baseline import (
+        BaselineExperimentResult,
+        ComputedMetrics,
+        Verdict,
+    )
+
     eval_result = OfflineEvalResult(
         sample_counts=SampleCounts(train_n=50, test_n=20),
         label_counts={"train_0": 30, "train_1": 20},
         split_metadata=SplitMetadata("a", "b", "c", "d"),
-        metrics=EvalMetrics(),
+        metrics=EvalMetrics(accuracy=0.6, precision=0.5, recall=0.5, f1=0.5),
         run_id="run_xyz",
+    )
+    baseline_exp = BaselineExperimentResult(
+        model_type="logistic_regression",
+        train_n=50,
+        test_n=20,
+        label_balance={"train_0": 30, "train_1": 20},
+        baseline_always_zero_metrics=ComputedMetrics(0.6, 0.0, 0.0, 0.0),
+        baseline_majority_metrics=ComputedMetrics(0.55, 0.5, 0.5, 0.5),
+        model_metrics=ComputedMetrics(0.65, 0.6, 0.6, 0.6),
+        verdict=Verdict.MODEL_SHOWS_PROMISE,
+        model_beats_always_zero=True,
+        model_beats_majority=True,
+        model_predictions=[],
     )
     result = OfflineTrainResult(
         success=True,
@@ -74,6 +98,7 @@ def test_write_offline_train_report_creates_files(tmp_path: Path) -> None:
         test_rows=20,
         eval_result=eval_result,
         prepared_csv_path=None,
+        baseline_experiment=baseline_exp,
     )
     json_path, md_path = write_offline_train_report(result, tmp_path)
     assert json_path.exists()
@@ -83,3 +108,5 @@ def test_write_offline_train_report_creates_files(tmp_path: Path) -> None:
     content = json_path.read_text(encoding="utf-8")
     assert "run_xyz" in content
     assert "sample_counts" in content
+    assert "verdict" in content
+    assert "model_type" in content
