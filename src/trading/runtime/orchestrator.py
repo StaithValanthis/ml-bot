@@ -800,6 +800,18 @@ class RuntimeOrchestrator:
             readiness["candidate_count"] = len(candidates)
             if readiness["reason"] == "ready" and len(candidates) == 0:
                 readiness["reason"] = "no_pattern_match"
+
+            if readiness["reason"] == "no_pattern_match":
+                precondition = self._candidate_generator.get_precondition_report(
+                    effective_symbol, bars_5m
+                )
+                if precondition is not None:
+                    readiness["breakout_precondition"] = precondition.to_log_dict()
+                    self._logger.info(
+                        "breakout_precondition_no_match",
+                        **precondition.to_log_dict(),
+                    )
+
             self._last_candidate_readiness[effective_symbol] = readiness
             if len(candidates) == 0:
                 self._logger.info(
@@ -812,6 +824,9 @@ class RuntimeOrchestrator:
                     unconfirmed_in_5m_window=readiness["unconfirmed_in_5m_window"],
                     reason=readiness["reason"],
                     candidate_count=len(candidates),
+                    failed_conditions=readiness.get("breakout_precondition", {}).get(
+                        "failed_conditions", []
+                    ),
                 )
 
             self._metrics.inc("strategy_bars_confirmed")
@@ -1679,6 +1694,11 @@ class RuntimeOrchestrator:
                 lines.append(f"- {sym}: bars_5m={r.get('bars_5m', 0)} bars_1h={r.get('bars_1h', 0)} "
                     f"enough_5m={r.get('has_enough_5m', False)} enough_1h={r.get('has_enough_1h', False)} "
                     f"reason={r.get('reason', '')} candidates={r.get('candidate_count', 0)}")
+                if bp := r.get("breakout_precondition"):
+                    failed = bp.get("failed_conditions", [])
+                    lines.append(f"  - breakout_precondition: failed={failed} "
+                        f"up_bps={bp.get('breakout_up_bps')} dn_bps={bp.get('breakout_dn_bps')} "
+                        f"move_bps={bp.get('candle_move_bps')} vol_mult={bp.get('vol_multiplier')}")
             lines.append("")
         if flow := summary.get("strategy_flow"):
             lines.append("## Strategy Flow")

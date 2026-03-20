@@ -8,6 +8,49 @@ from trading.strategy.base_alpha import AlphaCandidate, BaseAlpha, CandidateType
 from trading.util.types import OHLCVBar
 
 
+@dataclass(slots=True, frozen=True)
+class BreakoutPreconditionReport:
+    """Visibility report for breakout candidate preconditions (no strategy changes)."""
+
+    symbol: str
+    breakout_up_bps: Decimal
+    breakout_dn_bps: Decimal
+    candle_move_bps: Decimal
+    vol_multiplier: Decimal
+    lookback_high: Decimal
+    lookback_low: Decimal
+    last_close: Decimal
+    min_breakout_bps: Decimal
+    min_trend_bps: Decimal
+    min_volume_multiplier: Decimal
+    breakout_up_ok: bool
+    breakout_dn_ok: bool
+    trend_long_ok: bool
+    trend_short_ok: bool
+    failed_conditions: tuple[str, ...]
+
+    def to_log_dict(self) -> dict[str, Any]:
+        """Operator-friendly structured dict for logging."""
+        return {
+            "symbol": self.symbol,
+            "breakout_up_bps": float(self.breakout_up_bps),
+            "breakout_dn_bps": float(self.breakout_dn_bps),
+            "candle_move_bps": float(self.candle_move_bps),
+            "vol_multiplier": float(self.vol_multiplier),
+            "lookback_high": float(self.lookback_high),
+            "lookback_low": float(self.lookback_low),
+            "last_close": float(self.last_close),
+            "min_breakout_bps": float(self.min_breakout_bps),
+            "min_trend_bps": float(self.min_trend_bps),
+            "min_volume_multiplier": float(self.min_volume_multiplier),
+            "breakout_up_ok": self.breakout_up_ok,
+            "breakout_dn_ok": self.breakout_dn_ok,
+            "trend_long_ok": self.trend_long_ok,
+            "trend_short_ok": self.trend_short_ok,
+            "failed_conditions": list(self.failed_conditions),
+        }
+
+
 def get_candidate_readiness(
     symbol: str,
     bars_5m: list[OHLCVBar],
@@ -88,6 +131,75 @@ class BreakoutTrendCandidateGenerator(BaseAlpha):
         """Return candidate-generation readiness for operator visibility."""
         return get_candidate_readiness(
             symbol, bars_5m, bars_1h, lookback_bars=self._cfg.lookback_bars
+        )
+
+    def get_precondition_report(
+        self, symbol: str, bars_5m: list[OHLCVBar]
+    ) -> BreakoutPreconditionReport | None:
+        """
+        Return visibility report for breakout preconditions when no candidate produced.
+        Uses same computation as on_closed_candle; does not change strategy behavior.
+        Returns None if bars insufficient for evaluation.
+        """
+        if len(bars_5m) < self._cfg.lookback_bars + 2:
+            return None
+        if any(not bar.confirmed for bar in bars_5m[-(self._cfg.lookback_bars + 2) :]):
+            return None
+
+        window = bars_5m[-(self._cfg.lookback_bars + 1) : -1]
+        last = bars_5m[-1]
+        prev = bars_5m[-2]
+        lookback_high = max(bar.high for bar in window)
+        lookback_low = min(bar.low for bar in window)
+        avg_volume = sum((bar.volume for bar in window), start=Decimal("0")) / Decimal(
+            len(window)
+        )
+        vol_multiplier = (last.volume / avg_volume) if avg_volume > 0 else Decimal("0")
+        range_basis = max(last.close, Decimal("1"))
+        breakout_up_bps = ((last.close - lookback_high) / range_basis) * Decimal("10000")
+        breakout_dn_bps = ((lookback_low - last.close) / range_basis) * Decimal("10000")
+        candle_move_bps = (
+            (last.close - prev.close) / max(prev.close, Decimal("1"))
+        ) * Decimal("10000")
+
+        breakout_up_ok = breakout_up_bps >= self._cfg.min_breakout_bps
+        breakout_dn_ok = breakout_dn_bps >= self._cfg.min_breakout_bps
+        trend_long_ok = (
+            candle_move_bps >= self._cfg.min_trend_bps
+            and vol_multiplier >= self._cfg.min_volume_multiplier
+        )
+        trend_short_ok = (
+            candle_move_bps <= -self._cfg.min_trend_bps
+            and vol_multiplier >= self._cfg.min_volume_multiplier
+        )
+
+        failed: list[str] = []
+        if not breakout_up_ok:
+            failed.append("breakout_up")
+        if not breakout_dn_ok:
+            failed.append("breakout_dn")
+        if not trend_long_ok:
+            failed.append("trend_long")
+        if not trend_short_ok:
+            failed.append("trend_short")
+
+        return BreakoutPreconditionReport(
+            symbol=symbol,
+            breakout_up_bps=breakout_up_bps,
+            breakout_dn_bps=breakout_dn_bps,
+            candle_move_bps=candle_move_bps,
+            vol_multiplier=vol_multiplier,
+            lookback_high=lookback_high,
+            lookback_low=lookback_low,
+            last_close=last.close,
+            min_breakout_bps=self._cfg.min_breakout_bps,
+            min_trend_bps=self._cfg.min_trend_bps,
+            min_volume_multiplier=self._cfg.min_volume_multiplier,
+            breakout_up_ok=breakout_up_ok,
+            breakout_dn_ok=breakout_dn_ok,
+            trend_long_ok=trend_long_ok,
+            trend_short_ok=trend_short_ok,
+            failed_conditions=tuple(failed),
         )
 
     def on_closed_candle(self, symbol: str, bars_5m: list[OHLCVBar]) -> list[AlphaCandidate]:
