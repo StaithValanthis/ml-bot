@@ -505,13 +505,15 @@ class RuntimeOrchestrator:
             configured_symbols=self._settings.trading.symbols,
             symbol_spec=symbol_spec,
             reference_price=ref_price,
+            max_drill_notional_usdt=drill_cfg.max_notional_usdt,
         )
         if refuse:
             self._drill_outcome.attempted = True
             self._drill_outcome.aborted = True
-            self._drill_outcome.refused_reason = refuse
-            await self._ledger.record("drill_aborted", {"reason": refuse})
-            self._logger.warning("demo_drill_aborted", reason=refuse)
+            self._drill_outcome.refused_reason = refuse.reason
+            self._drill_outcome.abort_details = refuse.details
+            await self._ledger.record("drill_aborted", {"reason": refuse.reason, "details": refuse.details})
+            self._logger.warning("demo_drill_aborted", reason=refuse.reason, **refuse.details)
             return
 
         self._drill_outcome.attempted = True

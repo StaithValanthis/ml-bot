@@ -49,6 +49,7 @@ class DemoDrillSettings(BaseModel):
     side: str = "Buy"
     qty: Decimal = Decimal("0.001")
     mode: str = "post_only"
+    max_notional_usdt: Decimal = Decimal("100")
 
     @field_validator("side")
     @classmethod
@@ -62,6 +63,13 @@ class DemoDrillSettings(BaseModel):
     def _validate_mode(cls, value: str) -> str:
         if value not in ("post_only", "reduce_only"):
             raise ValueError("mode must be post_only or reduce_only")
+        return value
+
+    @field_validator("max_notional_usdt")
+    @classmethod
+    def _validate_max_notional(cls, value: Decimal) -> Decimal:
+        if value <= 0:
+            raise ValueError("max_notional_usdt must be positive")
         return value
 
 
@@ -312,6 +320,11 @@ def load_settings() -> AppSettings:
             pass
     if (drill_mode := os.getenv("TRADING_DEMO_DRILL_MODE")) is not None:
         demo_drill_cfg["mode"] = drill_mode.strip().lower()
+    if (drill_max_notional := os.getenv("TRADING_DEMO_DRILL_MAX_NOTIONAL_USDT")) is not None:
+        try:
+            demo_drill_cfg["max_notional_usdt"] = Decimal(drill_max_notional.strip())
+        except Exception:
+            pass
 
     if env.log_level is not None:
         data.setdefault("logging", {})["level"] = env.log_level

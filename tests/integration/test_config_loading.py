@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 
 import pytest
 
@@ -56,3 +57,10 @@ def test_load_settings_risk_per_symbol_optional() -> None:
     for sym, limit in settings.risk.per_symbol.items():
         assert limit.max_notional_usdt > 0
         assert limit.max_position_abs > 0
+
+
+def test_load_settings_demo_drill_max_notional_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TRADING_DEMO_DRILL_MAX_NOTIONAL_USDT overrides drill max notional cap."""
+    monkeypatch.setenv("TRADING_DEMO_DRILL_MAX_NOTIONAL_USDT", "500")
+    settings = load_settings()
+    assert settings.runtime.demo_drill.max_notional_usdt == Decimal("500")

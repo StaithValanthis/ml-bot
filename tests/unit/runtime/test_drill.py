@@ -21,46 +21,50 @@ from trading.util.types import OrderSide, PositionSide, RuntimeMode
 
 def test_validate_drill_refused_outside_demo() -> None:
     """Drill is refused when mode is not DEMO."""
-    assert validate_drill(
+    r = validate_drill(
         mode=RuntimeMode.PAPER,
         dry_run=False,
         symbol="BTCUSDT",
         qty=Decimal("0.001"),
         configured_symbols=["BTCUSDT"],
         symbol_spec=None,
-    ) == "drill_refused_mode_not_demo"
-    assert validate_drill(
+    )
+    assert r is not None and r.reason == "drill_refused_mode_not_demo"
+    r = validate_drill(
         mode=RuntimeMode.LIVE,
         dry_run=False,
         symbol="BTCUSDT",
         qty=Decimal("0.001"),
         configured_symbols=["BTCUSDT"],
         symbol_spec=None,
-    ) == "drill_refused_mode_not_demo"
+    )
+    assert r is not None and r.reason == "drill_refused_mode_not_demo"
 
 
 def test_validate_drill_refused_when_dry_run() -> None:
     """Drill is refused when dry_run is True."""
-    assert validate_drill(
+    r = validate_drill(
         mode=RuntimeMode.DEMO,
         dry_run=True,
         symbol="BTCUSDT",
         qty=Decimal("0.001"),
         configured_symbols=["BTCUSDT"],
         symbol_spec=None,
-    ) == "drill_refused_dry_run"
+    )
+    assert r is not None and r.reason == "drill_refused_dry_run"
 
 
 def test_validate_drill_refused_when_symbol_not_configured() -> None:
     """Drill is refused when symbol is not in configured trading symbols."""
-    assert validate_drill(
+    r = validate_drill(
         mode=RuntimeMode.DEMO,
         dry_run=False,
         symbol="ETHUSDT",
         qty=Decimal("0.001"),
         configured_symbols=["BTCUSDT"],
         symbol_spec=None,
-    ) == "drill_refused_symbol_not_configured"
+    )
+    assert r is not None and r.reason == "drill_refused_symbol_not_configured"
 
 
 def test_validate_drill_refused_when_qty_below_min() -> None:
@@ -68,19 +72,20 @@ def test_validate_drill_refused_when_qty_below_min() -> None:
     class FakeSpec:
         min_qty = Decimal("0.01")
 
-    assert validate_drill(
+    r = validate_drill(
         mode=RuntimeMode.DEMO,
         dry_run=False,
         symbol="BTCUSDT",
         qty=Decimal("0.001"),
         configured_symbols=["BTCUSDT"],
         symbol_spec=FakeSpec(),
-    ) == "drill_refused_qty_below_min_0.01"
+    )
+    assert r is not None and r.reason == "drill_refused_qty_below_min_0.01"
 
 
 def test_validate_drill_refused_when_notional_exceeds_cap() -> None:
     """Drill is refused when notional exceeds safe cap."""
-    assert validate_drill(
+    r = validate_drill(
         mode=RuntimeMode.DEMO,
         dry_run=False,
         symbol="BTCUSDT",
@@ -89,7 +94,8 @@ def test_validate_drill_refused_when_notional_exceeds_cap() -> None:
         symbol_spec=None,
         reference_price=Decimal("100000"),
         max_drill_notional_usdt=Decimal("10"),
-    ) == "drill_refused_notional_exceeds_cap_10"
+    )
+    assert r is not None and r.reason == "drill_refused_notional_exceeds_cap_10"
 
 
 def test_validate_drill_allowed() -> None:
@@ -110,6 +116,123 @@ def test_validate_drill_allowed() -> None:
         )
         is None
     )
+
+
+def test_validate_drill_configurable_max_notional() -> None:
+    """Drill max notional is configurable; higher cap allows larger orders."""
+    class FakeSpec:
+        min_qty = Decimal("0.001")
+
+    # Cap 10: 0.001 BTC @ 50000 = 50 USDT → refused
+    r = validate_drill(
+        mode=RuntimeMode.DEMO,
+        dry_run=False,
+        symbol="BTCUSDT",
+        qty=Decimal("0.001"),
+        configured_symbols=["BTCUSDT"],
+        symbol_spec=FakeSpec(),
+        reference_price=Decimal("50000"),
+        max_drill_notional_usdt=Decimal("10"),
+    )
+    assert r is not None and r.reason == "drill_refused_notional_exceeds_cap_10"
+
+    # Cap 100: 0.001 BTC @ 50000 = 50 USDT → allowed
+    assert (
+        validate_drill(
+            mode=RuntimeMode.DEMO,
+            dry_run=False,
+            symbol="BTCUSDT",
+            qty=Decimal("0.001"),
+            configured_symbols=["BTCUSDT"],
+            symbol_spec=FakeSpec(),
+            reference_price=Decimal("50000"),
+            max_drill_notional_usdt=Decimal("100"),
+        )
+        is None
+    )
+
+
+def test_validate_drill_conflicting_min_qty_vs_cap() -> None:
+    """BTCUSDT: min_qty 0.001, cap 10, ref 50000 → min notional 50 > cap, no valid qty."""
+    class FakeSpec:
+        min_qty = Decimal("0.001")
+
+    # 0.001 BTC (min) → notional 50 > cap 10 → refused
+    r = validate_drill(
+        mode=RuntimeMode.DEMO,
+        dry_run=False,
+        symbol="BTCUSDT",
+        qty=Decimal("0.001"),
+        configured_symbols=["BTCUSDT"],
+        symbol_spec=FakeSpec(),
+        reference_price=Decimal("50000"),
+        max_drill_notional_usdt=Decimal("10"),
+    )
+    assert r is not None
+    assert r.reason == "drill_refused_notional_exceeds_cap_10"
+    assert r.details["symbol"] == "BTCUSDT"
+    assert r.details["qty"] == "0.001"
+    assert r.details["min_qty"] == "0.001"
+    assert r.details["estimated_notional_usdt"] == "50"
+    assert r.details["max_notional_usdt"] == "10"
+
+    # 0.0001 BTC → below min_qty → refused
+    r2 = validate_drill(
+        mode=RuntimeMode.DEMO,
+        dry_run=False,
+        symbol="BTCUSDT",
+        qty=Decimal("0.0001"),
+        configured_symbols=["BTCUSDT"],
+        symbol_spec=FakeSpec(),
+        reference_price=Decimal("50000"),
+        max_drill_notional_usdt=Decimal("10"),
+    )
+    assert r2 is not None
+    assert r2.reason == "drill_refused_qty_below_min_0.001"
+
+
+def test_validate_drill_refusal_details_qty_below_min() -> None:
+    """Refusal for qty below min includes structured details."""
+    class FakeSpec:
+        min_qty = Decimal("0.001")
+
+    r = validate_drill(
+        mode=RuntimeMode.DEMO,
+        dry_run=False,
+        symbol="BTCUSDT",
+        qty=Decimal("0.0001"),
+        configured_symbols=["BTCUSDT"],
+        symbol_spec=FakeSpec(),
+        reference_price=Decimal("50000"),
+        max_drill_notional_usdt=Decimal("100"),
+    )
+    assert r is not None
+    assert r.reason == "drill_refused_qty_below_min_0.001"
+    assert r.details["symbol"] == "BTCUSDT"
+    assert r.details["qty"] == "0.0001"
+    assert r.details["min_qty"] == "0.001"
+    assert r.details["max_notional_usdt"] == "100"
+    assert r.details["estimated_notional_usdt"] == "5"
+
+
+def test_validate_drill_refusal_details_notional_exceeds_cap() -> None:
+    """Refusal for notional exceeds cap includes structured details."""
+    r = validate_drill(
+        mode=RuntimeMode.DEMO,
+        dry_run=False,
+        symbol="BTCUSDT",
+        qty=Decimal("0.01"),
+        configured_symbols=["BTCUSDT"],
+        symbol_spec=None,
+        reference_price=Decimal("100000"),
+        max_drill_notional_usdt=Decimal("500"),
+    )
+    assert r is not None
+    assert r.reason == "drill_refused_notional_exceeds_cap_500"
+    assert r.details["symbol"] == "BTCUSDT"
+    assert r.details["qty"] == "0.01"
+    assert r.details["estimated_notional_usdt"] == "1000"
+    assert r.details["max_notional_usdt"] == "500"
 
 
 def test_build_drill_intent_post_only() -> None:

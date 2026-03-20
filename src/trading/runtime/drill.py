@@ -55,6 +55,22 @@ def generate_drill_order_link_id(symbol: str) -> str:
     return f"drill-{symbol_compact}-{ts}"[:36]
 
 
+def _fmt_decimal(d: Decimal) -> str:
+    """Format Decimal for refusal details; avoid scientific notation, strip trailing zeros."""
+    s = format(d, "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+@dataclass(frozen=True, slots=True)
+class DrillRefusal:
+    """Structured refusal result from validate_drill."""
+
+    reason: str
+    details: dict[str, object]
+
+
 def validate_drill(
     *,
     mode: RuntimeMode,
@@ -64,29 +80,48 @@ def validate_drill(
     configured_symbols: list[str],
     symbol_spec: object | None,
     reference_price: Decimal | None = None,
-    max_drill_notional_usdt: Decimal = Decimal("10"),
-) -> str | None:
+    max_drill_notional_usdt: Decimal = Decimal("100"),
+) -> DrillRefusal | None:
     """
-    Validate drill parameters. Returns refusal reason or None if allowed.
+    Validate drill parameters. Returns DrillRefusal with reason and details if refused, None if allowed.
     """
     if mode != RuntimeMode.DEMO:
-        return "drill_refused_mode_not_demo"
+        return DrillRefusal("drill_refused_mode_not_demo", {"symbol": symbol, "qty": str(qty)})
     if dry_run:
-        return "drill_refused_dry_run"
+        return DrillRefusal("drill_refused_dry_run", {"symbol": symbol, "qty": str(qty)})
     if symbol not in configured_symbols:
-        return "drill_refused_symbol_not_configured"
+        return DrillRefusal("drill_refused_symbol_not_configured", {"symbol": symbol, "qty": str(qty)})
     if qty <= 0:
-        return "drill_refused_qty_invalid"
+        return DrillRefusal("drill_refused_qty_invalid", {"symbol": symbol, "qty": str(qty)})
 
-    if symbol_spec is not None:
-        min_qty = getattr(symbol_spec, "min_qty", None)
-        if min_qty is not None and qty < min_qty:
-            return f"drill_refused_qty_below_min_{min_qty}"
-
+    min_qty: Decimal | None = getattr(symbol_spec, "min_qty", None) if symbol_spec is not None else None
+    estimated_notional_usdt: Decimal | None = None
     if reference_price is not None and reference_price > 0:
-        notional = qty * reference_price
-        if notional > max_drill_notional_usdt:
-            return f"drill_refused_notional_exceeds_cap_{max_drill_notional_usdt}"
+        estimated_notional_usdt = qty * reference_price
+
+    if min_qty is not None and qty < min_qty:
+        details: dict[str, object] = {
+            "symbol": symbol,
+            "qty": _fmt_decimal(qty),
+            "min_qty": _fmt_decimal(min_qty),
+            "max_notional_usdt": _fmt_decimal(max_drill_notional_usdt),
+        }
+        if estimated_notional_usdt is not None:
+            details["estimated_notional_usdt"] = _fmt_decimal(estimated_notional_usdt)
+        return DrillRefusal(f"drill_refused_qty_below_min_{min_qty}", details)
+
+    if estimated_notional_usdt is not None and estimated_notional_usdt > max_drill_notional_usdt:
+        details = {
+            "symbol": symbol,
+            "qty": _fmt_decimal(qty),
+            "min_qty": _fmt_decimal(min_qty) if min_qty is not None else None,
+            "estimated_notional_usdt": _fmt_decimal(estimated_notional_usdt),
+            "max_notional_usdt": _fmt_decimal(max_drill_notional_usdt),
+        }
+        return DrillRefusal(
+            f"drill_refused_notional_exceeds_cap_{max_drill_notional_usdt}",
+            details,
+        )
 
     return None
 

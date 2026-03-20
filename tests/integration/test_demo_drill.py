@@ -448,6 +448,42 @@ def test_drill_abort_summary_includes_improved_details() -> None:
     assert "25.0" in md
 
 
+def test_drill_refusal_details_in_summary() -> None:
+    """Session summary includes structured refusal details (symbol, qty, min_qty, notional, cap)."""
+    settings = load_settings()
+    settings.runtime.demo_drill.enabled = True
+    settings.runtime.mode = RuntimeMode.DEMO
+
+    orch = RuntimeOrchestrator(settings)
+    orch._drill_outcome.enabled = True
+    orch._drill_outcome.attempted = True
+    orch._drill_outcome.aborted = True
+    orch._drill_outcome.refused_reason = "drill_refused_notional_exceeds_cap_10"
+    orch._drill_outcome.abort_details = {
+        "symbol": "BTCUSDT",
+        "qty": "0.001",
+        "min_qty": "0.001",
+        "estimated_notional_usdt": "50",
+        "max_notional_usdt": "10",
+    }
+
+    summary = orch._build_session_summary()
+    assert summary.get("drill_abort_details") is not None
+    details = summary["drill_abort_details"]
+    assert details.get("symbol") == "BTCUSDT"
+    assert details.get("qty") == "0.001"
+    assert details.get("min_qty") == "0.001"
+    assert details.get("estimated_notional_usdt") == "50"
+    assert details.get("max_notional_usdt") == "10"
+
+    md = orch._build_markdown_summary(summary)
+    assert "Abort details" in md
+    assert "BTCUSDT" in md
+    assert "0.001" in md
+    assert "50" in md
+    assert "10" in md
+
+
 def test_drill_summary_fields() -> None:
     """Session summary includes drill fields when drill is enabled."""
     settings = load_settings()
