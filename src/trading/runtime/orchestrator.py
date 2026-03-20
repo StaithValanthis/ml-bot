@@ -41,7 +41,7 @@ from trading.strategy.signal_engine import SignalEngine
 from trading.util.json_util import dumps_json_safe
 from trading.util.logging import get_logger
 from trading.util.time import utc_now
-from trading.util.types import MarketSymbol, OrderSide, PositionSide, RuntimeMode
+from trading.util.types import MarketSymbol, OHLCVBar, OrderSide, PositionSide, RuntimeMode
 from trading.storage.parquet_store import ParquetArchiveStore
 from trading.runtime.drill import (
     DrillConfig,
@@ -739,28 +739,72 @@ class RuntimeOrchestrator:
     async def _decision_loop(self) -> None:
         while not self._stop_event.is_set():
             kline = await self._market_state.next_confirmed_kline()
+            self._logger.debug(
+                "decision_loop_kline_consumed",
+                symbol=kline.symbol,
+                interval=kline.interval,
+                confirmed=kline.confirmed,
+            )
             bar = self._candle_builder.on_confirmed_kline(kline)
             if bar is None or not bar.confirmed:
                 continue
 
-            history = self._bar_history[bar.symbol][bar.timeframe]
-            history.append(bar)
-            if bar.timeframe != self._settings.trading.candle_timeframe:
+            configured = self._settings.trading.symbols
+            effective_symbol = bar.symbol or (
+                configured[0] if len(configured) == 1 else ""
+            )
+            if not effective_symbol:
+                self._logger.warning(
+                    "decision_loop_empty_symbol_skip",
+                    kline_symbol=kline.symbol,
+                    bar_symbol=bar.symbol,
+                    configured_symbols=configured,
+                )
                 continue
 
-            bars_5m = list(self._bar_history[bar.symbol][self._settings.trading.candle_timeframe])
-            bars_1h = list(self._bar_history[bar.symbol][self._settings.trading.regime_timeframe])
-            readiness = self._candidate_generator.get_readiness(bar.symbol, bars_5m, bars_1h)
-            candidates = self._candidate_generator.on_closed_candle(bar.symbol, bars_5m)
+            bar_to_append: OHLCVBar = (
+                bar
+                if bar.symbol == effective_symbol
+                else OHLCVBar(
+                    symbol=effective_symbol,
+                    timeframe=bar.timeframe,
+                    open_time=bar.open_time,
+                    close_time=bar.close_time,
+                    open=bar.open,
+                    high=bar.high,
+                    low=bar.low,
+                    close=bar.close,
+                    volume=bar.volume,
+                    turnover=bar.turnover,
+                    confirmed=bar.confirmed,
+                )
+            )
+            if not bar.symbol:
+                self._logger.info(
+                    "decision_loop_symbol_fallback_applied",
+                    kline_symbol=kline.symbol,
+                    effective_symbol=effective_symbol,
+                    timeframe=bar_to_append.timeframe,
+                )
+
+            history = self._bar_history[effective_symbol][bar_to_append.timeframe]
+            history.append(bar_to_append)
+            if bar_to_append.timeframe != self._settings.trading.candle_timeframe:
+                continue
+
+            bars_5m = list(self._bar_history[effective_symbol][self._settings.trading.candle_timeframe])
+            bars_1h = list(self._bar_history[effective_symbol][self._settings.trading.regime_timeframe])
+            readiness = self._candidate_generator.get_readiness(effective_symbol, bars_5m, bars_1h)
+            candidates = self._candidate_generator.on_closed_candle(effective_symbol, bars_5m)
             readiness = dict(readiness)
             readiness["candidate_count"] = len(candidates)
             if readiness["reason"] == "ready" and len(candidates) == 0:
                 readiness["reason"] = "no_pattern_match"
-            self._last_candidate_readiness[bar.symbol] = readiness
+            self._last_candidate_readiness[effective_symbol] = readiness
             if len(candidates) == 0:
                 self._logger.info(
                     "candidate_readiness",
-                    symbol=bar.symbol,
+                    symbol=effective_symbol,
                     bars_5m=readiness["bars_5m"],
                     bars_1h=readiness["bars_1h"],
                     has_enough_5m=readiness["has_enough_5m"],

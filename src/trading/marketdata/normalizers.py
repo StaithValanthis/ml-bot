@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from trading.util.logging import get_logger
 from trading.util.types import OrderSide, OrderStatus, OrderType, TimeInForce
 
 
@@ -131,6 +132,13 @@ def normalize_public_message(payload: dict[str, Any]) -> list[NormalizedEvent]:
         parts = topic.split(".")
         interval = parts[1] if len(parts) > 1 else ""
         symbol = parts[2] if len(parts) > 2 else ""
+        if not symbol:
+            get_logger("trading.marketdata.normalizers").warning(
+                "kline_topic_missing_symbol",
+                topic=topic,
+                parts=parts,
+                parts_len=len(parts),
+            )
         return [_normalize_kline(item, interval, symbol) for item in data if isinstance(item, dict)]
     return []
 
