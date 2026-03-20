@@ -152,6 +152,7 @@ class RuntimeOrchestrator:
 
         self._bar_history: dict[str, dict[str, deque]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=800)))
         self._last_candidate_readiness: dict[str, dict[str, object]] = {}
+        self._last_sizing_rejection: dict[str, object] | None = None
         self._warmup_results: list[WarmupResult] = []
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
@@ -890,18 +891,37 @@ class RuntimeOrchestrator:
                     self._logger.warning("missing_symbol_spec", symbol=signal.symbol)
                     continue
 
-                qty = self._sizer.size_qty(
-                    SizingInputs(
-                        equity_usdt=max(self._portfolio.equity_usdt, Decimal("1")),
-                        confidence=signal.confidence,
-                        volatility_bps=regime.volatility_bps,
-                        reference_price=signal.reference_price,
-                        max_leverage=self._settings.risk.max_leverage,
-                    ),
-                    symbol_spec,
+                sizing_inputs = SizingInputs(
+                    equity_usdt=max(self._portfolio.equity_usdt, Decimal("1")),
+                    confidence=signal.confidence,
+                    volatility_bps=regime.volatility_bps,
+                    reference_price=signal.reference_price,
+                    max_leverage=self._settings.risk.max_leverage,
                 )
+                qty = self._sizer.size_qty(sizing_inputs, symbol_spec)
                 if qty <= 0:
                     self._metrics.inc("strategy_sizing_rejected")
+                    reason = self._sizer.reject_reason(sizing_inputs, symbol_spec)
+                    self._last_sizing_rejection = {
+                        "symbol": signal.symbol,
+                        "reason": reason or "qty_zero",
+                        "equity_usdt": float(sizing_inputs.equity_usdt),
+                        "confidence": float(sizing_inputs.confidence),
+                        "volatility_bps": float(sizing_inputs.volatility_bps),
+                        "reference_price": float(sizing_inputs.reference_price),
+                        "min_qty": float(symbol_spec.min_qty),
+                        "qty_step": float(symbol_spec.qty_step),
+                    }
+                    self._logger.info(
+                        "sizing_rejected",
+                        symbol=signal.symbol,
+                        reason=reason or "qty_zero",
+                        equity_usdt=float(sizing_inputs.equity_usdt),
+                        confidence=float(sizing_inputs.confidence),
+                        volatility_bps=float(sizing_inputs.volatility_bps),
+                        reference_price=float(sizing_inputs.reference_price),
+                        min_qty=float(symbol_spec.min_qty),
+                    )
                     continue
 
                 risk = self._risk_engine.evaluate(
@@ -1668,6 +1688,8 @@ class RuntimeOrchestrator:
                 summary["drill_outcome"] = "pending"
         if self._abort_reasons:
             summary["abort_reasons"] = self._abort_reasons
+        if self._last_sizing_rejection is not None:
+            summary["last_sizing_rejection"] = dict(self._last_sizing_rejection)
         if self._startup_auth_disabled:
             summary["startup_auth_disabled"] = True
         summary["strategy_order_outcomes"] = {
@@ -1745,6 +1767,13 @@ class RuntimeOrchestrator:
             lines.append(f"- Model filter reached: {f.get('model_filter_reached', 0)}")
             lines.append(f"- Model blocked: {f.get('model_blocked', 0)}")
             lines.append(f"- Submitted: {f.get('submitted', 0)}")
+            lines.append("")
+        if lsr := summary.get("last_sizing_rejection"):
+            lines.append("## Last Sizing Rejection")
+            lines.append(f"- Symbol: {lsr.get('symbol', '')}")
+            lines.append(f"- Reason: {lsr.get('reason', '')}")
+            lines.append(f"- equity_usdt={lsr.get('equity_usdt')} confidence={lsr.get('confidence')} volatility_bps={lsr.get('volatility_bps')}")
+            lines.append(f"- reference_price={lsr.get('reference_price')} min_qty={lsr.get('min_qty')}")
             lines.append("")
         if summary.get("drill_enabled"):
             lines.append("## Demo Drill")

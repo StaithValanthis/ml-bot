@@ -45,6 +45,32 @@ class VolatilityAwareSizer:
             return Decimal("0")
         return stepped_qty
 
+    def reject_reason(
+        self, inputs: SizingInputs, symbol_info: MarketSymbol
+    ) -> str | None:
+        """
+        Return concise reason when size_qty would return 0. For visibility only.
+        Does not change sizing behavior.
+        """
+        if inputs.reference_price <= 0 or inputs.equity_usdt <= 0:
+            return "reference_price_or_equity_zero"
+        if inputs.confidence < self._min_confidence:
+            return "confidence_below_min"
+        vol_factor = Decimal("1") / max(Decimal("1"), inputs.volatility_bps / Decimal("100"))
+        confidence_factor = max(Decimal("0.1"), min(Decimal("1"), inputs.confidence))
+        notional_budget = (
+            inputs.equity_usdt
+            * self._base_risk_fraction
+            * confidence_factor
+            * vol_factor
+            * min(inputs.max_leverage, symbol_info.max_leverage)
+        )
+        raw_qty = notional_budget / inputs.reference_price
+        stepped_qty = self._round_down_to_step(raw_qty, symbol_info.qty_step)
+        if stepped_qty < symbol_info.min_qty:
+            return "qty_below_min_after_rounding"
+        return None
+
     @staticmethod
     def _round_down_to_step(value: Decimal, step: Decimal) -> Decimal:
         if step <= 0:
