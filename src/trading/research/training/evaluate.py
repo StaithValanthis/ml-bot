@@ -25,3 +25,38 @@ class EvalResult:
     model_path: Path | None = None
     run_id: str | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SampleCounts:
+    """Sample counts for train/test splits."""
+
+    train_n: int
+    test_n: int
+
+
+@dataclass(frozen=True, slots=True)
+class SplitMetadata:
+    """Train/test split metadata for reproducibility."""
+
+    train_start: str
+    train_end: str
+    test_start: str
+    test_end: str
+
+
+@dataclass(frozen=True, slots=True)
+class OfflineEvalResult:
+    """
+    Typed evaluation result for offline experiments.
+
+    Includes sample counts, class balance, baseline metrics placeholders,
+    and train/test split metadata. Does not fake strong ML results.
+    """
+
+    sample_counts: SampleCounts
+    label_counts: dict[str, int]
+    split_metadata: SplitMetadata
+    metrics: EvalMetrics
+    run_id: str
+    error: str | None = None

@@ -41,3 +41,33 @@ class TimeSeriesSplitter(Protocol):
     ) -> SplitResult:
         """Compute train/val/test splits with purging and embargo."""
         ...
+
+
+class DefaultTimeSeriesSplitter:
+    """Concrete time-series splitter using config ratios."""
+
+    def split(
+        self,
+        start: datetime,
+        end: datetime,
+        config: SplitConfig,
+    ) -> SplitResult:
+        """Compute train/val/test splits by ratio of total duration."""
+        from datetime import timedelta
+
+        delta = end - start
+        total_sec = delta.total_seconds()
+        train_sec = total_sec * config.train_ratio
+        val_sec = total_sec * config.val_ratio
+        test_sec = total_sec * config.test_ratio
+        train_end = start + timedelta(seconds=train_sec)
+        val_end = train_end + timedelta(seconds=val_sec)
+        test_end = end
+        return SplitResult(
+            train_start=start,
+            train_end=train_end,
+            val_start=train_end,
+            val_end=val_end,
+            test_start=val_end,
+            test_end=test_end,
+        )

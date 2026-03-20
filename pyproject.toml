@@ -42,6 +42,7 @@ dev = [
 [project.scripts]
 trading-bot = "trading.main:main"
 trading-backtest = "trading.backtest.run:main"
+trading-offline-train = "trading.research.training.run_offline:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/trading"]
