@@ -765,6 +765,23 @@ class RuntimeOrchestrator:
                                 order_link_id=link_id,
                                 symbol=event.symbol or "",
                             )
+                            await self._ledger.record(
+                                "entry_fill_received",
+                                {
+                                    "order_link_id": link_id,
+                                    "symbol": event.symbol or "",
+                                    "filled_qty": str(event.qty) if event.qty is not None else "",
+                                    "avg_price": str(event.avg_price) if event.avg_price is not None else "",
+                                },
+                            )
+                            self._logger.info(
+                                "entry_fill_received",
+                                order_link_id=link_id,
+                                symbol=event.symbol or "",
+                                filled_qty=str(event.qty) if event.qty else "",
+                                avg_price=str(event.avg_price) if event.avg_price else "",
+                            )
+                            await self._place_protective_exit_after_fill(link_id=link_id, event=event, prev=prev)
                         elif new_status == "Cancelled" and link_id not in so._seen_cancelled:
                             so._seen_cancelled.add(link_id)
                             so.cancelled += 1
@@ -1112,6 +1129,180 @@ class RuntimeOrchestrator:
 
                 if self._can_place_exchange_orders():
                     await self._submit_intent(intent, is_drill=False)
+
+    async def _place_protective_exit_after_fill(
+        self,
+        *,
+        link_id: str,
+        event: NormalizedOrderUpdate,
+        prev: object,
+    ) -> None:
+        """On entry fill: create, register, and submit reduce-only protective exit. Orphan block remains if placement fails."""
+        from trading.execution.order_manager import ManagedOrder
+
+        if not isinstance(prev, ManagedOrder):
+            return
+        if prev.reduce_only:
+            return
+        signal_action = prev.metadata.get("signal_action")
+        if signal_action == "enter_long":
+            side_to_close = PositionSide.LONG
+        elif signal_action == "enter_short":
+            side_to_close = PositionSide.SHORT
+        else:
+            self._logger.warning(
+                "protective_exit_placement_skipped",
+                order_link_id=link_id,
+                reason="unknown_signal_action",
+                signal_action=signal_action,
+            )
+            return
+        symbol = prev.symbol or event.symbol or ""
+        if not symbol:
+            self._logger.warning("protective_exit_placement_skipped", order_link_id=link_id, reason="missing_symbol")
+            return
+        filled_qty = prev.filled_qty if prev.filled_qty and prev.filled_qty > 0 else event.qty
+        if not filled_qty or filled_qty <= 0:
+            self._logger.warning(
+                "protective_exit_placement_skipped",
+                order_link_id=link_id,
+                symbol=symbol,
+                reason="zero_filled_qty",
+            )
+            return
+        entry_avg_price = prev.avg_price or event.avg_price
+        if not entry_avg_price or entry_avg_price <= 0:
+            self._logger.warning(
+                "protective_exit_placement_skipped",
+                order_link_id=link_id,
+                symbol=symbol,
+                reason="missing_avg_price",
+            )
+            return
+        symbol_spec = self._symbol_specs.get(symbol)
+        if symbol_spec is None:
+            self._logger.warning(
+                "protective_exit_placement_skipped",
+                order_link_id=link_id,
+                symbol=symbol,
+                reason="missing_symbol_spec",
+            )
+            return
+        exit_intent = self._execution_engine.build_protective_limit_exit(
+            symbol=symbol,
+            side_to_close=side_to_close,
+            qty=filled_qty,
+            entry_avg_price=entry_avg_price,
+            price_tick=symbol_spec.price_tick,
+            qty_step=symbol_spec.qty_step,
+            now=utc_now(),
+        )
+        if exit_intent is None:
+            self._logger.warning(
+                "protective_exit_placement_failed",
+                order_link_id=link_id,
+                symbol=symbol,
+                reason="build_intent_returned_none",
+            )
+            await self._ledger.record(
+                "protective_exit_placement_failed",
+                {
+                    "entry_order_link_id": link_id,
+                    "symbol": symbol,
+                    "reason": "build_intent_returned_none",
+                },
+            )
+            return
+        await self._ledger.record(
+            "protective_exit_plan_created",
+            {
+                "entry_order_link_id": link_id,
+                "symbol": symbol,
+                "qty": str(exit_intent.qty),
+                "price": str(exit_intent.price) if exit_intent.price else "",
+                "side": exit_intent.side.value,
+            },
+        )
+        self._logger.info(
+            "protective_exit_plan_created",
+            entry_order_link_id=link_id,
+            symbol=symbol,
+            qty=str(exit_intent.qty),
+            price=str(exit_intent.price) if exit_intent.price else "",
+        )
+        await self._order_manager.register_intent(exit_intent)
+        await self._ledger.record(
+            "protective_exit_tracking_registered",
+            {"order_link_id": exit_intent.order_link_id, "symbol": symbol},
+        )
+        self._logger.info(
+            "protective_exit_tracking_registered",
+            order_link_id=exit_intent.order_link_id,
+            symbol=symbol,
+        )
+        if not self._can_place_exchange_orders():
+            self._logger.warning(
+                "protective_exit_order_not_submitted",
+                order_link_id=exit_intent.order_link_id,
+                symbol=symbol,
+                reason="placement_disabled",
+            )
+            await self._ledger.record(
+                "protective_exit_placement_failed",
+                {
+                    "order_link_id": exit_intent.order_link_id,
+                    "symbol": symbol,
+                    "reason": "placement_disabled",
+                },
+            )
+            return
+        await self._ledger.record(
+            "protective_exit_order_submitted",
+            {
+                "order_link_id": exit_intent.order_link_id,
+                "symbol": symbol,
+                "qty": str(exit_intent.qty),
+            },
+        )
+        self._logger.info(
+            "protective_exit_order_submitted",
+            order_link_id=exit_intent.order_link_id,
+            symbol=symbol,
+            qty=str(exit_intent.qty),
+        )
+        try:
+            await self._submit_intent(exit_intent, is_drill=False)
+            order_after = await self._order_manager.get_by_link_id(exit_intent.order_link_id)
+            if order_after and order_after.order_id:
+                await self._ledger.record(
+                    "protective_exit_order_ack_received",
+                    {"order_link_id": exit_intent.order_link_id, "order_id": order_after.order_id, "symbol": symbol},
+                )
+                self._logger.info(
+                    "protective_exit_order_ack_received",
+                    order_link_id=exit_intent.order_link_id,
+                    order_id=order_after.order_id,
+                    symbol=symbol,
+                )
+        except BybitRestError as exc:
+            reason = str(exc)
+            if isinstance(exc, BybitAPIError):
+                reason = f"ret_code={exc.ret_code} ret_msg={exc.ret_msg}"
+            self._logger.warning(
+                "protective_exit_placement_failed",
+                order_link_id=exit_intent.order_link_id,
+                symbol=symbol,
+                reason=reason,
+            )
+            await self._ledger.record(
+                "protective_exit_placement_failed",
+                {
+                    "entry_order_link_id": link_id,
+                    "order_link_id": exit_intent.order_link_id,
+                    "symbol": symbol,
+                    "reason": reason,
+                },
+            )
 
     async def _submit_intent(self, intent: object, *, is_drill: bool = False) -> None:
         from trading.execution.order_intent import OrderIntent

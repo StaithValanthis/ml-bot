@@ -238,6 +238,7 @@ async def test_reconcile_positions_symbol_scoped_when_symbols_configured() -> No
 async def test_reconcile_positions_ok_when_reduce_only_has_exit() -> None:
     mock_rest = AsyncMock(spec=BybitRestClient)
     mock_rest.get_positions.return_value = [_position(symbol="BTCUSDT", size=Decimal("0.1"))]
+    mock_rest.get_open_orders.return_value = [_open_order(order_link_id="link-exit", symbol="BTCUSDT", reduce_only=True)]
     mgr = OrderManager()
     await mgr.register_intent(
         OrderIntent(
@@ -260,3 +261,33 @@ async def test_reconcile_positions_ok_when_reduce_only_has_exit() -> None:
     report = await reconciler.reconcile_positions()
 
     assert report.ok is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_positions_requires_exchange_presence_for_protective_exit() -> None:
+    """Protective exit must exist on exchange; local-only is insufficient."""
+    mock_rest = AsyncMock(spec=BybitRestClient)
+    mock_rest.get_positions.return_value = [_position(symbol="BTCUSDT", size=Decimal("0.1"))]
+    mock_rest.get_open_orders.return_value = []
+    mgr = OrderManager()
+    await mgr.register_intent(
+        OrderIntent(
+            symbol="BTCUSDT",
+            side=OrderSide.SELL,
+            qty=Decimal("0.1"),
+            order_type=OrderType.MARKET,
+            time_in_force=TimeInForce.GTC,
+            reduce_only=True,
+            price=None,
+            order_link_id="link-exit",
+            purpose=IntentPurpose.EXIT,
+            created_at=datetime.now(UTC),
+            metadata={},
+        )
+    )
+
+    reconciler = Reconciler(rest_client=mock_rest, order_manager=mgr, category="linear")
+    report = await reconciler.reconcile_positions()
+
+    assert report.ok is False
+    assert any(i.issue_type == "missing_reduce_only_exit" for i in report.issues)

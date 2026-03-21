@@ -14,6 +14,7 @@ from trading.util.types import OrderSide, OrderType, TimeInForce, PositionSide
 @dataclass(slots=True, frozen=True)
 class ExecutionPolicyConfig:
     entry_post_only_offset_bps: Decimal = Decimal("2")
+    protective_exit_take_profit_pct: Decimal = Decimal("0.02")
 
 
 class ExecutionEngine:
@@ -85,6 +86,56 @@ class ExecutionEngine:
             purpose=IntentPurpose.EXIT,
             created_at=now,
             metadata={"reason": reason, "reduce_only": True},
+        )
+
+    def build_protective_limit_exit(
+        self,
+        *,
+        symbol: str,
+        side_to_close: PositionSide,
+        qty: Decimal,
+        entry_avg_price: Decimal,
+        price_tick: Decimal,
+        qty_step: Decimal,
+        now: datetime,
+        take_profit_pct: Decimal | None = None,
+    ) -> OrderIntent | None:
+        """
+        Build a resting reduce-only LIMIT order for take-profit protection.
+
+        For LONG: limit sell above entry. For SHORT: limit buy below entry.
+        Order rests until price hits target; satisfies reconciler's protective-exit check.
+        """
+        if qty <= 0 or entry_avg_price <= 0 or side_to_close == PositionSide.FLAT:
+            return None
+        pct = take_profit_pct if take_profit_pct is not None else self._cfg.protective_exit_take_profit_pct
+        close_side = OrderSide.SELL if side_to_close == PositionSide.LONG else OrderSide.BUY
+        if side_to_close == PositionSide.LONG:
+            raw_price = entry_avg_price * (Decimal("1") + pct)
+        else:
+            raw_price = entry_avg_price * (Decimal("1") - pct)
+        if price_tick > 0:
+            price = (raw_price / price_tick).quantize(Decimal("1")) * price_tick
+        else:
+            price = raw_price
+        if qty_step > 0:
+            stepped_qty = (qty / qty_step).quantize(Decimal("1")) * qty_step
+        else:
+            stepped_qty = qty
+        if stepped_qty <= 0:
+            return None
+        return OrderIntent(
+            symbol=symbol,
+            side=close_side,
+            qty=stepped_qty,
+            order_type=OrderType.LIMIT,
+            time_in_force=TimeInForce.GTC,
+            reduce_only=True,
+            price=price,
+            order_link_id=generate_order_link_id(strategy_id=self._strategy_id, symbol=symbol),
+            purpose=IntentPurpose.EXIT,
+            created_at=now,
+            metadata={"reason": "protective_take_profit", "reduce_only": True},
         )
 
     def build_stop_intent(

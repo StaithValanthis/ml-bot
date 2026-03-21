@@ -126,23 +126,32 @@ class Reconciler:
 
     async def reconcile_positions(self, symbol: str | None = None) -> ReconciliationReport:
         # v1 scaffold: verify protective reduce-only exits exist for non-flat positions.
+        # Requires BOTH local tracking AND exchange presence (order must be submitted and acked).
         if symbol is not None:
             positions = await self._rest_client.get_positions(category=self._category, symbol=symbol)
+            exchange_open = await self._rest_client.get_open_orders(category=self._category, symbol=symbol)
         elif self._symbols:
             positions = []
+            exchange_open = []
             for s in self._symbols:
                 pos_list = await self._rest_client.get_positions(category=self._category, symbol=s)
                 positions.extend(pos_list)
+                orders = await self._rest_client.get_open_orders(category=self._category, symbol=s)
+                exchange_open.extend(orders)
         else:
             positions = await self._rest_client.get_positions(category=self._category, symbol=None)
+            exchange_open = await self._rest_client.get_open_orders(category=self._category, symbol=None)
         local_open = await self._order_manager.get_open_orders(None)
-        reduce_only_open = [order for order in local_open if order.reduce_only]
+        local_reduce_only = [o for o in local_open if o.reduce_only]
+        exchange_reduce_only_symbols = {o.symbol for o in exchange_open if o.reduce_only and o.symbol}
         issues: list[ReconciliationIssue] = []
 
         for position in positions:
             if position.size <= 0:
                 continue
-            has_protective_exit = any(order.symbol == position.symbol for order in reduce_only_open)
+            local_has_exit = any(o.symbol == position.symbol for o in local_reduce_only)
+            exchange_has_exit = position.symbol in exchange_reduce_only_symbols
+            has_protective_exit = local_has_exit and exchange_has_exit
             if not has_protective_exit:
                 issues.append(
                     ReconciliationIssue(
