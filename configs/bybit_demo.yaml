@@ -19,6 +19,8 @@ trading:
 runtime:
   # DEMO-only: even more relaxed profile (bps=1/2, vol=1.0, lookback=15). Overrides demo_candidate_overrides when enabled.
   # demo_more_opportunities_enabled: true
+  # DEMO-only: when no normal candidates, create validation candidates from near-miss breakouts to exercise ML filter.
+  # demo_relaxed_candidate_validation: true
   demo_candidate_overrides:
     min_breakout_bps: 3
     min_trend_bps: 5

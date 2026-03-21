@@ -102,6 +102,7 @@ class RuntimeSettings(BaseModel):
     demo_drill: DemoDrillSettings = Field(default_factory=DemoDrillSettings)
     demo_candidate_overrides: DemoCandidateOverrides | None = None
     demo_more_opportunities_enabled: bool = False
+    demo_relaxed_candidate_validation: bool = False
     demo_sizing_min_notional_usdt: Decimal | None = None
     demo_force_marketable_entries: bool = False
     model_filter_enabled: bool = False
@@ -420,6 +421,9 @@ def load_settings() -> AppSettings:
 
     if (more_opps := os.getenv("TRADING_DEMO_MORE_OPPORTUNITIES_ENABLED")) is not None:
         runtime_cfg["demo_more_opportunities_enabled"] = more_opps.lower() in ("true", "1", "yes")
+
+    if (relaxed_val := os.getenv("TRADING_DEMO_RELAXED_CANDIDATE_VALIDATION")) is not None:
+        runtime_cfg["demo_relaxed_candidate_validation"] = relaxed_val.lower() in ("true", "1", "yes")
 
     if (demo_min_notional := os.getenv("TRADING_DEMO_SIZING_MIN_NOTIONAL_USDT")) is not None:
         try:

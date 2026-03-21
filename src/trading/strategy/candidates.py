@@ -290,6 +290,87 @@ class BreakoutTrendCandidateGenerator(BaseAlpha):
             )
         return self._dedupe_candidates(candidates)
 
+    def create_relaxed_validation_candidates(
+        self, symbol: str, precondition: BreakoutPreconditionReport, bars_5m: list[OHLCVBar]
+    ) -> list[AlphaCandidate]:
+        """
+        DEMO-only: create validation candidates from near-miss breakout preconditions.
+        Used when normal path yields no candidates, to exercise model filter in sparse regimes.
+        Returns at most one candidate (strongest near-miss). Does not change primary strategy.
+        """
+        if len(bars_5m) < 2:
+            return []
+        last = bars_5m[-1]
+        window = bars_5m[-(self._cfg.lookback_bars + 1) : -1] if len(bars_5m) >= self._cfg.lookback_bars + 1 else bars_5m[:-1]
+        atr = self._estimate_atr(window + [last])
+        failed = list(precondition.failed_conditions)
+        confidence = Decimal("0.35")
+        best: AlphaCandidate | None = None
+        best_score = Decimal("-999999")
+
+        if precondition.breakout_up_bps > 0 and "breakout_up" in failed:
+            cand = AlphaCandidate(
+                symbol=symbol,
+                candidate_type=CandidateType.BREAKOUT_LONG,
+                confidence=confidence,
+                reference_price=precondition.last_close,
+                stop_price=precondition.last_close - (atr * self._cfg.stop_atr_multiplier),
+                timeframe="5",
+                signal_time=last.close_time,
+                metadata={
+                    "breakout_bps": precondition.breakout_up_bps,
+                    "volume_multiplier": precondition.vol_multiplier,
+                    "relaxed_validation": True,
+                    "original_failed_conditions": failed,
+                    "relaxed_reason": "breakout_up_near_miss",
+                },
+            )
+            if precondition.breakout_up_bps > best_score:
+                best, best_score = cand, precondition.breakout_up_bps
+        if precondition.breakout_dn_bps > 0 and "breakout_dn" in failed:
+            cand = AlphaCandidate(
+                symbol=symbol,
+                candidate_type=CandidateType.BREAKOUT_SHORT,
+                confidence=confidence,
+                reference_price=precondition.last_close,
+                stop_price=precondition.last_close + (atr * self._cfg.stop_atr_multiplier),
+                timeframe="5",
+                signal_time=last.close_time,
+                metadata={
+                    "breakout_bps": precondition.breakout_dn_bps,
+                    "volume_multiplier": precondition.vol_multiplier,
+                    "relaxed_validation": True,
+                    "original_failed_conditions": failed,
+                    "relaxed_reason": "breakout_dn_near_miss",
+                },
+            )
+            if precondition.breakout_dn_bps > best_score:
+                best, best_score = cand, precondition.breakout_dn_bps
+        if best is None and precondition.candle_move_bps != Decimal("0"):
+            ct = CandidateType.TREND_CONTINUATION_LONG if precondition.candle_move_bps > 0 else CandidateType.TREND_CONTINUATION_SHORT
+            stop = (
+                precondition.last_close - (atr * self._cfg.stop_atr_multiplier)
+                if ct == CandidateType.TREND_CONTINUATION_LONG
+                else precondition.last_close + (atr * self._cfg.stop_atr_multiplier)
+            )
+            best = AlphaCandidate(
+                symbol=symbol,
+                candidate_type=ct,
+                confidence=confidence,
+                reference_price=precondition.last_close,
+                stop_price=stop,
+                timeframe="5",
+                signal_time=last.close_time,
+                metadata={
+                    "trend_bps": precondition.candle_move_bps,
+                    "volume_multiplier": precondition.vol_multiplier,
+                    "relaxed_validation": True,
+                    "original_failed_conditions": failed,
+                    "relaxed_reason": "trend_near_miss",
+                },
+            )
+        return [best] if best is not None else []
+
     @staticmethod
     def _estimate_atr(bars: list[OHLCVBar]) -> Decimal:
         if len(bars) < 2:

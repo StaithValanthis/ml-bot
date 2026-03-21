@@ -897,6 +897,9 @@ class RuntimeOrchestrator:
             bars_1h = list(self._bar_history[effective_symbol][self._settings.trading.regime_timeframe])
             readiness = self._candidate_generator.get_readiness(effective_symbol, bars_5m, bars_1h)
             candidates = self._candidate_generator.on_closed_candle(effective_symbol, bars_5m)
+            raw_candidates_count = len(candidates)
+            for _ in range(raw_candidates_count):
+                self._metrics.inc("strategy_raw_candidates_total")
             readiness = dict(readiness)
             readiness["candidate_count"] = len(candidates)
             if readiness["reason"] == "ready" and len(candidates) == 0:
@@ -912,6 +915,27 @@ class RuntimeOrchestrator:
                         "breakout_precondition_no_match",
                         **precondition.to_log_dict(),
                     )
+                    if (
+                        self._settings.runtime.mode == RuntimeMode.DEMO
+                        and self._settings.runtime.demo_relaxed_candidate_validation
+                        and len(candidates) == 0
+                        and precondition.failed_conditions
+                    ):
+                        relaxed = self._candidate_generator.create_relaxed_validation_candidates(
+                            effective_symbol, precondition, bars_5m
+                        )
+                        for cand in relaxed:
+                            meta = cand.metadata or {}
+                            self._metrics.inc("strategy_relaxed_demo_candidates_created")
+                            self._logger.info(
+                                "demo_candidate_validation_relaxed",
+                                symbol=cand.symbol,
+                                candidate_type=cand.candidate_type.value,
+                                side="Buy" if "long" in cand.candidate_type.value else "Sell",
+                                original_failed_conditions=list(meta.get("original_failed_conditions", [])),
+                                relaxed_reason=meta.get("relaxed_reason", "near_miss"),
+                            )
+                        candidates = relaxed
 
             self._last_candidate_readiness[effective_symbol] = readiness
             if len(candidates) == 0:
@@ -2152,6 +2176,30 @@ class RuntimeOrchestrator:
             "blocking_stage": blocking_stage,
             "candidate_readiness": candidate_readiness,
         }
+        if self._settings.runtime.mode == RuntimeMode.DEMO:
+            log_payload["demo_relaxed_candidate_validation"] = self._settings.runtime.demo_relaxed_candidate_validation
+            log_payload["demo_validation_candidates_created"] = int(c.get("strategy_relaxed_demo_candidates_created", 0))
+            raw = int(c.get("strategy_raw_candidates_total", 0))
+            relaxed = int(c.get("strategy_relaxed_demo_candidates_created", 0))
+            regime_rej = int(c.get("strategy_regime_rejected", 0))
+            signal_rej = int(c.get("strategy_signal_rejected", 0))
+            sizing_rej = int(c.get("strategy_sizing_rejected", 0))
+            risk_rej = int(c.get("strategy_risk_rejected", 0))
+            total_cand = int(c.get("strategy_candidates_total", 0))
+            model_reached = int(c.get("strategy_model_filter_reached", 0))
+            model_blocked = int(c.get("strategy_model_blocked", 0))
+            submitted = int(c.get("order_intents_total", 0))
+            log_payload["candidate_pipeline_detail"] = {
+                "raw_candidates": raw,
+                "relaxed_demo_candidates": relaxed,
+                "regime_passed": total_cand - regime_rej,
+                "signal_passed": total_cand - regime_rej - signal_rej,
+                "sizing_passed": total_cand - regime_rej - signal_rej - sizing_rej,
+                "risk_passed": total_cand - regime_rej - signal_rej - sizing_rej - risk_rej,
+                "model_reached": model_reached,
+                "model_blocked": model_blocked,
+                "submitted": submitted,
+            }
         if self._orphan_position_blocked:
             log_payload["orphan_position_blocked"] = True
             log_payload["orphan_position_details"] = list(self._orphan_position_details)
