@@ -2160,7 +2160,23 @@ class RuntimeOrchestrator:
                     "prob_p99": rc["probability_distribution"]["p99"],
                     "threshold_above_observed_max": rc["current_threshold_above_observed_max"],
                     "retention_thresholds": rc["retention_thresholds"],
+                    "suggested_thresholds_when_above_max": rc.get("suggested_thresholds_when_above_max"),
                 }
+                sug = rc.get("suggested_thresholds_when_above_max")
+                if rc.get("current_threshold_above_observed_max") and sug:
+                    self._logger.info(
+                        "model_filter_threshold_recommendation",
+                        current_threshold=mf.threshold,
+                        prob_max=rc["probability_distribution"]["max"],
+                        prob_p95=rc["probability_distribution"]["p95"],
+                        prob_p99=rc["probability_distribution"]["p99"],
+                        threshold_above_observed_max=True,
+                        suggested_threshold_near_max=sug.get("threshold_near_max"),
+                        suggested_threshold_near_p99=sug.get("threshold_near_p99"),
+                        suggested_threshold_near_p95=sug.get("threshold_near_p95"),
+                        suggested_threshold_keep_50pct=sug.get("threshold_keep_50pct"),
+                        suggested_threshold_keep_25pct=sug.get("threshold_keep_25pct"),
+                    )
         blocking_stage = self._infer_strategy_blocking_stage(c)
         candidate_readiness = dict(self._last_candidate_readiness)
         log_payload: dict[str, object] = {

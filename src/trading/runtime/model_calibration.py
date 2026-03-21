@@ -112,12 +112,27 @@ def build_runtime_calibration_stats(
         if current_threshold is not None
         else None
     )
+    retention = compute_retention_thresholds(probs)
+    suggested: dict[str, float | None] | None = None
+    if threshold_above_max and current_threshold is not None:
+        pm = dist["max"]
+        p95 = dist["p95"]
+        p99 = dist["p99"]
+        suggested = {
+            "threshold_near_max": round(pm, 8) if pm is not None else None,
+            "threshold_near_p99": p99,
+            "threshold_near_p95": p95,
+            "threshold_keep_50pct": retention.get("threshold_keep_50pct"),
+            "threshold_keep_25pct": retention.get("threshold_keep_25pct"),
+        }
+
     return {
         "total_shadow_evaluations": n,
         "probability_distribution": dist,
         "probability_buckets_log": build_log_scale_buckets(probs),
-        "retention_thresholds": compute_retention_thresholds(probs),
+        "retention_thresholds": retention,
         "current_threshold_above_observed_max": threshold_above_max,
+        "suggested_thresholds_when_above_max": suggested,
     }
 
 

@@ -306,6 +306,28 @@ def test_build_runtime_calibration_stats_threshold_above_max() -> None:
     assert stats["probability_distribution"]["max"] == 3e-7
 
 
+def test_build_runtime_calibration_stats_suggested_thresholds_when_above_max() -> None:
+    """When threshold above observed max, suggested_thresholds_when_above_max is populated."""
+    probs = [1e-7, 1.5e-7, 2e-7]
+    stats = build_runtime_calibration_stats(probs, current_threshold=0.45)
+    assert stats["current_threshold_above_observed_max"] is True
+    sug = stats.get("suggested_thresholds_when_above_max")
+    assert sug is not None
+    assert sug["threshold_near_max"] == 2e-7
+    assert sug["threshold_near_p99"] is not None
+    assert sug["threshold_near_p95"] is not None
+    assert sug["threshold_keep_50pct"] is not None
+    assert sug["threshold_keep_25pct"] is not None
+
+
+def test_build_runtime_calibration_stats_no_suggested_when_threshold_ok() -> None:
+    """When threshold <= observed max, suggested_thresholds_when_above_max is None."""
+    probs = [0.3, 0.5, 0.7]
+    stats = build_runtime_calibration_stats(probs, current_threshold=0.45)
+    assert stats["current_threshold_above_observed_max"] is False
+    assert stats.get("suggested_thresholds_when_above_max") is None
+
+
 def test_build_runtime_calibration_stats_empty() -> None:
     """Empty probs yields empty stats."""
     stats = build_runtime_calibration_stats([])
@@ -368,6 +390,59 @@ async def test_session_summary_no_decisions_no_promotion() -> None:
     orch._model_shadow_decisions = []
     summary = await orch._build_session_summary()
     assert "promotion_recommendation" not in summary
+
+
+@pytest.mark.asyncio
+async def test_runtime_summary_includes_suggested_thresholds_when_above_max() -> None:
+    """When threshold above observed max, runtime summary includes suggested thresholds and emits recommendation log."""
+    from trading.runtime.orchestrator import RuntimeOrchestrator
+    from trading.settings import load_settings
+    from trading.util.types import RuntimeMode
+
+    settings = load_settings()
+    settings.runtime.mode = RuntimeMode.DEMO
+    captured: list[tuple[str, dict]] = []
+
+    def capture(event: str, **kwargs: object) -> None:
+        captured.append((event, dict(kwargs)))
+
+    mock_rest = MagicMock()
+    mock_ws_public = MagicMock()
+    mock_ws_private = MagicMock()
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient", return_value=mock_rest),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient", return_value=mock_ws_public),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient", return_value=mock_ws_private),
+    ):
+        orch = RuntimeOrchestrator(settings)
+        orch._model_filter_active = True
+        orch._strategy_order_outcomes.model_filter.threshold = 0.45
+        orch._strategy_order_outcomes.model_filter.mode = "hard_block"
+        orch._model_shadow_decisions = [
+            {"model_probability": 1e-7},
+            {"model_probability": 2e-7},
+        ]
+        orch._logger.info = capture
+
+    await orch._runtime_summary_cycle()
+
+    runtime_events = [(e, p) for e, p in captured if e == "runtime_summary"]
+    assert len(runtime_events) == 1
+    payload = runtime_events[0][1]
+    mfc = payload.get("model_filter_calibration")
+    assert mfc is not None
+    sc = mfc.get("shadow_calibration")
+    assert sc is not None
+    assert sc.get("threshold_above_observed_max") is True
+    sug = sc.get("suggested_thresholds_when_above_max")
+    assert sug is not None
+    assert sug.get("threshold_near_max") == 2e-7
+    assert sug.get("threshold_keep_50pct") is not None
+
+    rec_events = [(e, p) for e, p in captured if e == "model_filter_threshold_recommendation"]
+    assert len(rec_events) >= 1
+    assert rec_events[0][1].get("threshold_above_observed_max") is True
+    assert "suggested_threshold_near_max" in rec_events[0][1]
 
 
 def test_markdown_includes_promotion_recommendation() -> None:
