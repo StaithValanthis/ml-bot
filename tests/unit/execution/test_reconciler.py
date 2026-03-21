@@ -186,7 +186,10 @@ async def test_reconcile_positions_detects_missing_reduce_only() -> None:
     report = await reconciler.reconcile_positions()
 
     assert report.ok is False
-    assert any(i.issue_type == "missing_reduce_only_exit" for i in report.issues)
+    issue = next(i for i in report.issues if i.issue_type == "missing_reduce_only_exit")
+    assert issue.symbol == "BTCUSDT"
+    assert issue.position_size == Decimal("0.1")
+    assert issue.position_side == "Buy"
 
 
 @pytest.mark.asyncio

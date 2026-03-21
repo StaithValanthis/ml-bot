@@ -15,6 +15,8 @@ class ReconciliationIssue:
     details: str
     order_link_id: str | None = None
     order_id: str | None = None
+    position_size: Decimal | None = None
+    position_side: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -147,6 +149,8 @@ class Reconciler:
                         issue_type="missing_reduce_only_exit",
                         symbol=position.symbol,
                         details="Non-flat position has no local tracked reduce-only exit order.",
+                        position_size=position.size,
+                        position_side=position.side,
                     )
                 )
         return ReconciliationReport(ok=len(issues) == 0, issues=issues)

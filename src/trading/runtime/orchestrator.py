@@ -163,6 +163,8 @@ class RuntimeOrchestrator:
         self._last_sizing_rejection: dict[str, object] | None = None
         self._last_sizing_floor_applied: dict[str, object] | None = None
         self._last_regime_rejection: dict[str, object] | None = None
+        self._orphan_position_blocked: bool = False
+        self._orphan_position_details: list[dict[str, object]] = []
         self._warmup_results: list[WarmupResult] = []
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
@@ -1068,6 +1070,14 @@ class RuntimeOrchestrator:
                             threshold=model_filter_threshold,
                         )
 
+                if self._orphan_position_blocked:
+                    self._logger.info(
+                        "orphan_position_skipped_trade",
+                        symbol=signal.symbol,
+                        reason="orphan_position_blocked",
+                    )
+                    continue
+
                 intent = self._execution_engine.build_entry_intent(
                     signal=signal,
                     qty=qty,
@@ -1323,6 +1333,26 @@ class RuntimeOrchestrator:
         if not report_orders.ok or not report_positions.ok:
             self._metrics.inc("reconcile_mismatch_cycles")
             self._consecutive_reconcile_mismatches += 1
+            orphan_issues = [i for i in report_positions.issues if i.issue_type == "missing_reduce_only_exit"]
+            if orphan_issues:
+                self._orphan_position_blocked = True
+                self._orphan_position_details = [
+                    {
+                        "symbol": i.symbol or "unknown",
+                        "position_size": float(i.position_size) if i.position_size is not None else None,
+                        "side": i.position_side or "unknown",
+                        "reason": "non_flat_position_no_tracked_reduce_only_exit",
+                    }
+                    for i in orphan_issues
+                ]
+                for d in self._orphan_position_details:
+                    self._logger.warning(
+                        "orphan_position_blocked",
+                        symbol=d["symbol"],
+                        position_size=d["position_size"],
+                        side=d["side"],
+                        reason=d["reason"],
+                    )
             if self._consecutive_reconcile_mismatches >= 3 and "repeated_reconcile_mismatch" not in self._abort_reasons:
                 self._abort_reasons.append("repeated_reconcile_mismatch")
                 self._logger.warning(
@@ -1385,6 +1415,10 @@ class RuntimeOrchestrator:
             self._metrics.inc("reconcile_issues_total", float(len(order_issues) + len(position_issues)))
         else:
             self._consecutive_reconcile_mismatches = 0
+            if self._orphan_position_blocked:
+                self._orphan_position_blocked = False
+                self._orphan_position_details = []
+                self._logger.info("orphan_position_block_cleared", note="position_flat_or_protected")
             await self._ledger.record(
                 "reconcile_ok",
                 {"order_issues": 0, "position_issues": 0},
@@ -1717,6 +1751,9 @@ class RuntimeOrchestrator:
             "blocking_stage": blocking_stage,
             "candidate_readiness": candidate_readiness,
         }
+        if self._orphan_position_blocked:
+            log_payload["orphan_position_blocked"] = True
+            log_payload["orphan_position_details"] = list(self._orphan_position_details)
         if self._settings.runtime.mode == RuntimeMode.DEMO:
             log_payload["demo_more_opportunities_enabled"] = self._settings.runtime.demo_more_opportunities_enabled
         if model_filter_calibration is not None:
@@ -1811,6 +1848,9 @@ class RuntimeOrchestrator:
             summary["last_sizing_floor_applied"] = dict(self._last_sizing_floor_applied)
         if self._last_regime_rejection is not None:
             summary["last_regime_rejection"] = dict(self._last_regime_rejection)
+        if self._orphan_position_blocked:
+            summary["orphan_position_blocked"] = True
+            summary["orphan_position_details"] = list(self._orphan_position_details)
         if self._startup_auth_disabled:
             summary["startup_auth_disabled"] = True
         summary["strategy_order_outcomes"] = {
@@ -1919,6 +1959,13 @@ class RuntimeOrchestrator:
             lines.append(f"- Failed conditions: {lrr.get('failed_conditions', [])}")
             lines.append(f"- State: {lrr.get('state', '')} candidate_type: {lrr.get('candidate_type', '')}")
             lines.append(f"- volatility_bps={lrr.get('volatility_bps')} trend_bps={lrr.get('trend_bps')} adaptive_threshold={lrr.get('adaptive_trend_threshold_bps')}")
+            lines.append("")
+        if summary.get("orphan_position_blocked"):
+            lines.append("## Orphan Position Blocked (SAFETY)")
+            lines.append("- Non-flat exchange position has no local tracked reduce-only exit order.")
+            lines.append("- Trading blocked until operator resolves manually.")
+            for d in summary.get("orphan_position_details", []):
+                lines.append(f"- {d.get('symbol', '')}: size={d.get('position_size')} side={d.get('side', '')} reason={d.get('reason', '')}")
             lines.append("")
         if lsf := summary.get("last_sizing_floor_applied"):
             lines.append("## Last Sizing Floor Applied (DEMO min-notional)")
