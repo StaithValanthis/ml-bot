@@ -39,7 +39,7 @@ from trading.strategy.candidates import (
     BreakoutTrendCandidateGenerator,
     CandidateGeneratorConfig,
 )
-from trading.strategy.regime_filter import RegimeFilter
+from trading.strategy.regime_filter import RegimeFilter, RegimeFilterReport
 from trading.strategy.signal_engine import SignalEngine
 from trading.util.json_util import dumps_json_safe
 from trading.util.logging import get_logger
@@ -162,6 +162,7 @@ class RuntimeOrchestrator:
         self._last_candidate_readiness: dict[str, dict[str, object]] = {}
         self._last_sizing_rejection: dict[str, object] | None = None
         self._last_sizing_floor_applied: dict[str, object] | None = None
+        self._last_regime_rejection: dict[str, object] | None = None
         self._warmup_results: list[WarmupResult] = []
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
@@ -895,9 +896,19 @@ class RuntimeOrchestrator:
             self._metrics.inc("strategy_bars_confirmed")
             for candidate in candidates:
                 self._metrics.inc("strategy_candidates_total")
-                regime = self._regime_filter.evaluate(candidate=candidate, bars_1h=bars_1h)
+                regime, regime_report = self._regime_filter.evaluate_with_report(
+                    candidate=candidate, bars_1h=bars_1h
+                )
                 if not regime.allow:
                     self._metrics.inc("strategy_regime_rejected")
+                    self._last_regime_rejection = regime_report.to_log_dict()
+                    readiness_with_regime = dict(self._last_candidate_readiness.get(effective_symbol, {}))
+                    readiness_with_regime["regime_rejection"] = regime_report.to_log_dict()
+                    self._last_candidate_readiness[effective_symbol] = readiness_with_regime
+                    self._logger.info(
+                        "regime_rejected_detail",
+                        **regime_report.to_log_dict(),
+                    )
                     continue
                 signal = self._signal_engine.evaluate(candidate, regime)
                 if signal.side is None or signal.reference_price is None:
@@ -1798,6 +1809,8 @@ class RuntimeOrchestrator:
             summary["last_sizing_rejection"] = dict(self._last_sizing_rejection)
         if self._last_sizing_floor_applied is not None:
             summary["last_sizing_floor_applied"] = dict(self._last_sizing_floor_applied)
+        if self._last_regime_rejection is not None:
+            summary["last_regime_rejection"] = dict(self._last_regime_rejection)
         if self._startup_auth_disabled:
             summary["startup_auth_disabled"] = True
         summary["strategy_order_outcomes"] = {
@@ -1874,6 +1887,10 @@ class RuntimeOrchestrator:
                     lines.append(f"  - breakout_precondition: failed={failed} "
                         f"up_bps={bp.get('breakout_up_bps')} dn_bps={bp.get('breakout_dn_bps')} "
                         f"move_bps={bp.get('candle_move_bps')} vol_mult={bp.get('vol_multiplier')}")
+                if rr := r.get("regime_rejection"):
+                    failed = rr.get("failed_conditions", [])
+                    lines.append(f"  - regime_rejection: reason={rr.get('reason', '')} failed={failed} "
+                        f"state={rr.get('state', '')} trend_bps={rr.get('trend_bps')} vol_bps={rr.get('volatility_bps')}")
             lines.append("")
         if flow := summary.get("strategy_flow"):
             lines.append("## Strategy Flow")
@@ -1894,6 +1911,14 @@ class RuntimeOrchestrator:
             lines.append(f"- Reason: {lsr.get('reason', '')}")
             lines.append(f"- equity_usdt={lsr.get('equity_usdt')} confidence={lsr.get('confidence')} volatility_bps={lsr.get('volatility_bps')}")
             lines.append(f"- reference_price={lsr.get('reference_price')} min_qty={lsr.get('min_qty')}")
+            lines.append("")
+        if lrr := summary.get("last_regime_rejection"):
+            lines.append("## Last Regime Rejection")
+            lines.append(f"- Symbol: {lrr.get('symbol', '')}")
+            lines.append(f"- Reason: {lrr.get('reason', '')}")
+            lines.append(f"- Failed conditions: {lrr.get('failed_conditions', [])}")
+            lines.append(f"- State: {lrr.get('state', '')} candidate_type: {lrr.get('candidate_type', '')}")
+            lines.append(f"- volatility_bps={lrr.get('volatility_bps')} trend_bps={lrr.get('trend_bps')} adaptive_threshold={lrr.get('adaptive_trend_threshold_bps')}")
             lines.append("")
         if lsf := summary.get("last_sizing_floor_applied"):
             lines.append("## Last Sizing Floor Applied (DEMO min-notional)")
