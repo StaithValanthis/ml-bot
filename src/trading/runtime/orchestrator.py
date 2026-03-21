@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import json
 import os
 from collections import defaultdict, deque
@@ -54,6 +55,7 @@ from trading.runtime.drill import (
     generate_drill_order_link_id,
     validate_drill,
 )
+from trading.runtime.model_calibration import build_model_calibration_summary
 from trading.runtime.strategy_orders import ModelFilterOutcomes, StrategyOrderOutcomes
 from trading.runtime.warmup import preload_warmup_klines, WarmupResult
 from trading.storage.postgres import PostgresJournalStore
@@ -168,6 +170,8 @@ class RuntimeOrchestrator:
         self._orphan_position_details: list[dict[str, object]] = []
         self._startup_state_blocked: bool = False
         self._startup_state_details: list[dict[str, object]] = []
+        self._model_shadow_decisions: list[dict[str, object]] = []
+        self._model_shadow_decisions_max: int = 100
         self._warmup_results: list[WarmupResult] = []
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
@@ -1069,6 +1073,20 @@ class RuntimeOrchestrator:
                     if pred_result.features_used is not None:
                         mf.latest_features = dict(pred_result.features_used)
                     would_block = not allow
+                    bar_close_time = bars_5m[-1].close_time if bars_5m else None
+                    self._record_model_decision(
+                        symbol=signal.symbol,
+                        candidate_type=candidate.candidate_type.value,
+                        side=signal.side.value if signal.side else None,
+                        bar_close_time=bar_close_time,
+                        model_probability=float(prob),
+                        threshold=model_filter_threshold,
+                        shadow_would_block=would_block,
+                        allow=allow if mf_mode != ModelFilterMode.SHADOW else None,
+                        reference_price=signal.reference_price,
+                        confidence=signal.confidence,
+                        qty=qty,
+                    )
                     if mf_mode == ModelFilterMode.SHADOW:
                         if would_block:
                             mf.shadow_would_have_blocked += 1
@@ -1819,6 +1837,69 @@ class RuntimeOrchestrator:
             and not self._settings.runtime.dry_run
         )
 
+    def _record_model_decision(
+        self,
+        *,
+        symbol: str,
+        candidate_type: str,
+        side: str | None,
+        bar_close_time: datetime | None,
+        model_probability: float,
+        threshold: float,
+        shadow_would_block: bool,
+        allow: bool | None = None,
+        reference_price: Decimal | None = None,
+        confidence: Decimal | None = None,
+        qty: Decimal | None = None,
+    ) -> None:
+        """Record per-candidate model decision for shadow evaluation. Bounded to last N."""
+        ts = utc_now()
+        record: dict[str, object] = {
+            "symbol": symbol,
+            "candidate_type": candidate_type,
+            "side": side,
+            "timestamp": ts.isoformat(),
+            "bar_close_time": bar_close_time.isoformat() if bar_close_time else None,
+            "model_probability": model_probability,
+            "threshold": threshold,
+            "shadow_would_block": shadow_would_block,
+            "strategy_submitted": False,
+            "blocking_stage": "model_evaluated",
+        }
+        if allow is not None:
+            record["allow"] = allow
+        if reference_price is not None:
+            record["reference_price"] = float(reference_price)
+        if confidence is not None:
+            record["confidence"] = float(confidence)
+        if qty is not None:
+            record["qty"] = float(qty)
+        while len(self._model_shadow_decisions) >= self._model_shadow_decisions_max:
+            self._model_shadow_decisions.pop(0)
+        self._model_shadow_decisions.append(record)
+        if self._model_filter_mode == ModelFilterMode.SHADOW:
+            self._logger.info(
+                "model_filter_shadow_decision",
+                symbol=symbol,
+                candidate_type=candidate_type,
+                side=side,
+                timestamp=record["timestamp"],
+                bar_close_time=record["bar_close_time"],
+                model_probability=model_probability,
+                threshold=threshold,
+                shadow_would_block=shadow_would_block,
+            )
+        else:
+            self._logger.info(
+                "model_filter_active_decision",
+                symbol=symbol,
+                candidate_type=candidate_type,
+                side=side,
+                allow=allow,
+                model_probability=model_probability,
+                threshold=threshold,
+            )
+
     def _init_model_filter(self) -> None:
         """Load model artifact and enable DEMO-only filter. Never active in LIVE."""
         from trading.models.filter_artifact import load_model_artifact
@@ -2196,6 +2277,26 @@ class RuntimeOrchestrator:
             "prob_count": so.model_filter.prob_count,
             "latest_features": dict(so.model_filter.latest_features) if so.model_filter.latest_features else None,
         }
+        decisions = list(self._model_shadow_decisions)
+        if decisions:
+            probs = [float(d.get("model_probability", 0)) for d in decisions if "model_probability" in d]
+            summary["model_shadow_decisions"] = {
+                "decisions": decisions,
+                "total_model_evaluations": len(decisions),
+                "shadow_would_block_count": sum(1 for d in decisions if d.get("shadow_would_block")),
+                "shadow_would_allow_count": sum(1 for d in decisions if not d.get("shadow_would_block")),
+                "avg_probability": round(sum(probs) / len(probs), 6) if probs else None,
+                "min_probability": min(probs) if probs else None,
+                "max_probability": max(probs) if probs else None,
+            }
+            so = self._strategy_order_outcomes
+            threshold_cfg = self._strategy_order_outcomes.model_filter.threshold
+            summary["model_calibration"] = build_model_calibration_summary(
+                decisions,
+                threshold_configured=threshold_cfg,
+                session_submitted=so.intents,
+                session_filled=so.filled,
+            )
         return summary
 
     def _build_markdown_summary(self, summary: dict[str, object]) -> str:
@@ -2370,6 +2471,45 @@ class RuntimeOrchestrator:
             if lf := mf.get("latest_features"):
                 lines.append(f"- Latest features: reference_price={lf.get('reference_price')} confidence={lf.get('confidence')} qty={lf.get('qty')} ts_ordinal={lf.get('ts_ordinal')}")
             lines.append("")
+        if msd := summary.get("model_shadow_decisions"):
+            lines.append("## Model Shadow Evaluation")
+            lines.append(f"- Total model evaluations: {msd.get('total_model_evaluations', 0)}")
+            lines.append(f"- Shadow would block: {msd.get('shadow_would_block_count', 0)}")
+            lines.append(f"- Shadow would allow: {msd.get('shadow_would_allow_count', 0)}")
+            if msd.get("avg_probability") is not None:
+                lines.append(f"- Prob: avg={msd.get('avg_probability')} min={msd.get('min_probability')} max={msd.get('max_probability')}")
+            lines.append("")
+            lines.append("## Recent Model Shadow Decisions")
+            for d in msd.get("decisions", [])[-20:]:
+                sym = d.get("symbol", "")
+                ct = d.get("candidate_type", "")
+                side = d.get("side", "")
+                prob = d.get("model_probability", "")
+                thresh = d.get("threshold", "")
+                block = d.get("shadow_would_block", False)
+                ts_ = d.get("timestamp", "")[:19] if d.get("timestamp") else ""
+                lines.append(f"- {ts_} | {sym} {ct} {side} | prob={prob} thresh={thresh} | would_block={block}")
+            lines.append("")
+        if cal := summary.get("model_calibration"):
+            lines.append("## Model Calibration Review")
+            lines.append(f"- Evaluations: {cal.get('total_model_evaluations', 0)} | blocks: {cal.get('total_shadow_blocks', 0)} | allows: {cal.get('total_shadow_allows', 0)}")
+            lines.append(f"- Block rate: {cal.get('block_rate', 0)} | mean prob: {cal.get('mean_probability')} | median prob: {cal.get('median_probability')}")
+            lines.append(f"- Threshold configured: {cal.get('threshold_configured')}")
+            lines.append(f"- Session submitted: {cal.get('session_submitted_count', 0)} | filled: {cal.get('session_filled_count', 0)}")
+            lines.append(f"- Outcome linkage: {cal.get('outcome_linkage_note', '')}")
+            if buckets := cal.get("probability_buckets"):
+                lines.append("- Probability buckets (sample_count | shadow_block | shadow_allow):")
+                for b in buckets:
+                    lines.append(f"  - {b.get('probability_bucket', '')}: n={b.get('sample_count', 0)} block={b.get('shadow_block_count', 0)} allow={b.get('shadow_allow_count', 0)}")
+            lines.append("")
+            lines.append("## Threshold Readiness")
+            for row in cal.get("threshold_sweep", []):
+                t = row.get("threshold", 0)
+                wb = row.get("would_block_count", 0)
+                wa = row.get("would_allow_count", 0)
+                br = row.get("block_rate", 0)
+                lines.append(f"- thresh={t}: would_block={wb} would_allow={wa} block_rate={br}")
+            lines.append("")
         if summary.get("abort_reasons"):
             lines.append("## Abort Reasons")
             for r in summary["abort_reasons"]:
@@ -2412,7 +2552,75 @@ class RuntimeOrchestrator:
                 file_type="markdown",
                 error=str(exc),
             )
+        csv_ok = False
+        csv_path: Path | None = None
+        cal_json_ok = False
+        cal_json_path: Path | None = None
+        if cal_data := summary.get("model_calibration"):
+            _cal_path = report_dir / f"model_calibration_{ts}.json"
+            try:
+                _cal_path.write_text(dumps_json_safe(cal_data, indent=2), encoding="utf-8")
+                cal_json_ok = True
+                cal_json_path = _cal_path
+            except OSError as exc:
+                self._logger.warning(
+                    "session_summary_write_failed",
+                    path=str(_cal_path),
+                    file_type="calibration_json",
+                    error=str(exc),
+                )
+        if decisions := summary.get("model_shadow_decisions", {}).get("decisions"):
+            _csv_path = report_dir / f"model_shadow_decisions_{ts}.csv"
+            session_id = f"session_{ts}"
+            try:
+                with _csv_path.open("w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(
+                        f,
+                        fieldnames=[
+                            "session_id",
+                            "timestamp",
+                            "symbol",
+                            "candidate_type",
+                            "side",
+                            "model_probability",
+                            "threshold",
+                            "shadow_would_block",
+                            "strategy_submitted",
+                            "blocking_stage",
+                        ],
+                    )
+                    writer.writeheader()
+                    for d in decisions:
+                        writer.writerow({
+                            "session_id": session_id,
+                            "timestamp": d.get("timestamp", ""),
+                            "symbol": d.get("symbol", ""),
+                            "candidate_type": d.get("candidate_type", ""),
+                            "side": d.get("side", ""),
+                            "model_probability": d.get("model_probability", ""),
+                            "threshold": d.get("threshold", ""),
+                            "shadow_would_block": d.get("shadow_would_block", False),
+                            "strategy_submitted": d.get("strategy_submitted", False),
+                            "blocking_stage": d.get("blocking_stage", ""),
+                        })
+                csv_ok = True
+                csv_path = _csv_path
+            except OSError as exc:
+                self._logger.warning(
+                    "session_summary_write_failed",
+                    path=str(_csv_path),
+                    file_type="csv",
+                    error=str(exc),
+                )
         if json_ok and md_ok:
+            ledger_payload: dict[str, object] = {
+                "json_path": str(json_path),
+                "md_path": str(md_path),
+            }
+            if csv_ok and csv_path is not None:
+                ledger_payload["csv_path"] = str(csv_path)
+            if cal_json_ok and cal_json_path is not None:
+                ledger_payload["calibration_json_path"] = str(cal_json_path)
             self._logger.info(
                 "session_summary_written",
                 path=str(json_path),
@@ -2421,10 +2629,7 @@ class RuntimeOrchestrator:
             )
             await self._ledger.record(
                 "session_summary_written",
-                {
-                    "json_path": str(json_path),
-                    "md_path": str(md_path),
-                },
+                ledger_payload,
             )
 
 

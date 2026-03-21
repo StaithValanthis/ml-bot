@@ -69,6 +69,10 @@ To run offline training, generate decision exports first:
 2. **Run training:** `trading-offline-train` or `python -m trading.research.training.run_offline`
    - Uses most recent `decisions_*.json` in `data/archive/decision_exports/`
    - Output: `data/archive/offline_train/`
+3. **Run offline evaluation:** `trading-eval --model data/archive/offline_train/model_<id>.pkl`
+   - Purged CV + threshold analysis for model filter promotion-readiness
+   - Output: `data/archive/eval/` (JSON, CSV, markdown)
+   - See `docs/OFFLINE_EVAL.md`
 
 ## Production Installation (Ubuntu 22.04/24.04)
 
