@@ -32,7 +32,7 @@ from trading.monitoring.health import HealthState
 from trading.monitoring.metrics import MetricsRegistry
 from trading.risk.circuit_breaker import CircuitBreaker
 from trading.risk.portfolio_state import PortfolioState, PositionRiskView
-from trading.risk.risk_engine import PerSymbolLimit, RiskEngine
+from trading.risk.risk_engine import PerSymbolLimit, RiskDecisionReport, RiskEngine, RiskEvaluationContext
 from trading.risk.sizing import SizingInputs, VolatilityAwareSizer
 from trading.settings import AppSettings
 from trading.strategy.candidates import (
@@ -163,8 +163,11 @@ class RuntimeOrchestrator:
         self._last_sizing_rejection: dict[str, object] | None = None
         self._last_sizing_floor_applied: dict[str, object] | None = None
         self._last_regime_rejection: dict[str, object] | None = None
+        self._last_risk_rejection: dict[str, object] | None = None
         self._orphan_position_blocked: bool = False
         self._orphan_position_details: list[dict[str, object]] = []
+        self._startup_state_blocked: bool = False
+        self._startup_state_details: list[dict[str, object]] = []
         self._warmup_results: list[WarmupResult] = []
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
@@ -270,6 +273,7 @@ class RuntimeOrchestrator:
 
             if self._has_auth_credentials():
                 await self._refresh_portfolio_snapshot()
+                await self._inspect_startup_exchange_state()
                 self._tasks.append(
                     asyncio.create_task(
                         run_periodic(
@@ -920,6 +924,7 @@ class RuntimeOrchestrator:
                 )
 
             self._metrics.inc("strategy_bars_confirmed")
+            open_orders = await self._order_manager.get_open_orders(None)
             for candidate in candidates:
                 self._metrics.inc("strategy_candidates_total")
                 regime, regime_report = self._regime_filter.evaluate_with_report(
@@ -1000,19 +1005,25 @@ class RuntimeOrchestrator:
                     )
                     continue
 
-                risk = self._risk_engine.evaluate(
+                risk_ctx = RiskEvaluationContext(
+                    candidate_type=candidate.candidate_type.value,
+                    orphan_position_blocked=self._orphan_position_blocked,
+                    current_open_orders_count=sum(1 for o in open_orders if o.symbol == signal.symbol),
+                )
+                risk, risk_report = self._risk_engine.evaluate_with_report(
                     signal=signal,
                     portfolio=self._portfolio,
                     expected_order_notional=qty * signal.reference_price,
+                    context=risk_ctx,
                 )
                 if not risk.approved:
                     self._metrics.inc("strategy_risk_rejected")
-                    self._logger.info(
-                        "signal_blocked_by_risk",
-                        symbol=signal.symbol,
-                        reason=risk.reason,
-                        metadata=risk.metadata,
-                    )
+                    report_dict = risk_report.to_log_dict()
+                    self._last_risk_rejection = report_dict
+                    readiness_with_risk = dict(self._last_candidate_readiness.get(effective_symbol, {}))
+                    readiness_with_risk["risk_rejection"] = report_dict
+                    self._last_candidate_readiness[effective_symbol] = readiness_with_risk
+                    self._logger.info("risk_rejected_detail", **report_dict)
                     continue
 
                 if self._model_filter_active:
@@ -1094,6 +1105,13 @@ class RuntimeOrchestrator:
                             threshold=model_filter_threshold,
                         )
 
+                if self._startup_state_blocked:
+                    self._logger.info(
+                        "startup_state_skipped_trade",
+                        symbol=signal.symbol,
+                        reason="startup_state_blocked",
+                    )
+                    continue
                 if self._orphan_position_blocked:
                     self._logger.info(
                         "orphan_position_skipped_trade",
@@ -1510,6 +1528,74 @@ class RuntimeOrchestrator:
         self._metrics.set_gauge("equity_usdt", float(self._portfolio.equity_usdt))
         self._metrics.set_gauge("available_usdt", float(self._portfolio.available_balance_usdt))
 
+    async def _inspect_startup_exchange_state(self) -> None:
+        """Inspect exchange positions and orders at startup; block if dirty state detected."""
+        if not self._has_auth_credentials():
+            return
+        try:
+            positions: list = []
+            exchange_orders: list = []
+            for sym in self._settings.trading.symbols:
+                pos_list = await self._rest.get_positions(
+                    category=self._settings.trading.category, symbol=sym
+                )
+                positions.extend(pos_list)
+                orders = await self._rest.get_open_orders(
+                    category=self._settings.trading.category, symbol=sym
+                )
+                exchange_orders.extend(orders)
+        except BybitRestError as exc:
+            self._logger.warning("startup_exchange_inspect_failed", error=str(exc))
+            return
+        local_open = await self._order_manager.get_open_orders(None)
+        local_order_state_empty = len(local_open) == 0
+        details: list[dict[str, object]] = []
+        dirty = False
+        for sym in self._settings.trading.symbols:
+            sym_positions = [p for p in positions if p.symbol == sym]
+            sym_orders = [o for o in exchange_orders if o.symbol == sym]
+            non_flat = any(p.size > 0 for p in sym_positions)
+            pos_size = Decimal("0")
+            pos_side = ""
+            for p in sym_positions:
+                if p.size > 0:
+                    pos_size = p.size
+                    pos_side = p.side or ""
+                    break
+            reduce_only_count = sum(1 for o in sym_orders if o.reduce_only)
+            non_reduce_only_count = len(sym_orders) - reduce_only_count
+            order_count = len(sym_orders)
+            sym_dirty = non_flat or order_count > 0
+            if sym_dirty:
+                dirty = True
+                d: dict[str, object] = {
+                    "symbol": sym,
+                    "position_size": float(pos_size),
+                    "position_side": pos_side,
+                    "open_order_count": order_count,
+                    "reduce_only_order_count": reduce_only_count,
+                    "non_reduce_only_order_count": non_reduce_only_count,
+                    "local_order_state_empty_or_not": local_order_state_empty,
+                }
+                details.append(d)
+        if dirty:
+            self._logger.warning(
+                "startup_dirty_exchange_state",
+                details=details,
+                local_order_state_empty=local_order_state_empty,
+            )
+            self._startup_state_blocked = True
+            self._startup_state_details = details
+            self._logger.warning(
+                "startup_state_blocked",
+                details_count=len(details),
+                note="Exchange has non-flat position or open orders. No new entries until resolved.",
+            )
+            await self._ledger.record(
+                "startup_dirty_exchange_state",
+                {"details": details, "local_order_state_empty": local_order_state_empty},
+            )
+
     async def _reconcile_cycle(self) -> None:
         if not self._has_auth_credentials():
             return
@@ -1536,7 +1622,18 @@ class RuntimeOrchestrator:
         if not report_orders.ok or not report_positions.ok:
             self._metrics.inc("reconcile_mismatch_cycles")
             self._consecutive_reconcile_mismatches += 1
+            self._startup_state_blocked = True
             orphan_issues = [i for i in report_positions.issues if i.issue_type == "missing_reduce_only_exit"]
+            if orphan_issues:
+                self._startup_state_details = [
+                    {
+                        "symbol": i.symbol or "unknown",
+                        "position_size": float(i.position_size) if i.position_size is not None else None,
+                        "position_side": i.position_side or "unknown",
+                        "reason": "reconcile_missing_reduce_only_exit",
+                    }
+                    for i in orphan_issues
+                ]
             if orphan_issues:
                 self._orphan_position_blocked = True
                 self._orphan_position_details = [
@@ -1622,6 +1719,10 @@ class RuntimeOrchestrator:
                 self._orphan_position_blocked = False
                 self._orphan_position_details = []
                 self._logger.info("orphan_position_block_cleared", note="position_flat_or_protected")
+            if self._startup_state_blocked:
+                self._startup_state_blocked = False
+                self._startup_state_details = []
+                self._logger.info("startup_state_block_cleared", note="exchange_flat_no_unsafe_orders")
             await self._ledger.record(
                 "reconcile_ok",
                 {"order_issues": 0, "position_issues": 0},
@@ -1879,9 +1980,10 @@ class RuntimeOrchestrator:
 
     def _infer_strategy_blocking_stage(self, m: dict[str, float]) -> str:
         """Infer which stage is blocking decisions for operator visibility."""
-        decisions = int(m.get("decisions_total", 0))
+        if self._startup_state_blocked:
+            return "startup_state_blocked"
         intents = int(m.get("order_intents_total", 0))
-        if decisions > 0 or intents > 0:
+        if intents > 0:
             return "submitted"
         bars = int(m.get("strategy_bars_confirmed", 0))
         if bars == 0:
@@ -1957,6 +2059,11 @@ class RuntimeOrchestrator:
         if self._orphan_position_blocked:
             log_payload["orphan_position_blocked"] = True
             log_payload["orphan_position_details"] = list(self._orphan_position_details)
+        if self._last_risk_rejection is not None:
+            log_payload["last_risk_rejection"] = self._last_risk_rejection
+        if self._startup_state_blocked:
+            log_payload["startup_state_blocked"] = True
+            log_payload["startup_state_details"] = self._startup_state_details
         if self._settings.runtime.mode == RuntimeMode.DEMO:
             log_payload["demo_more_opportunities_enabled"] = self._settings.runtime.demo_more_opportunities_enabled
             log_payload["demo_force_marketable_entries"] = self._settings.runtime.demo_force_marketable_entries
@@ -2053,9 +2160,14 @@ class RuntimeOrchestrator:
             summary["last_sizing_floor_applied"] = dict(self._last_sizing_floor_applied)
         if self._last_regime_rejection is not None:
             summary["last_regime_rejection"] = dict(self._last_regime_rejection)
+        if self._last_risk_rejection is not None:
+            summary["last_risk_rejection"] = dict(self._last_risk_rejection)
         if self._orphan_position_blocked:
             summary["orphan_position_blocked"] = True
             summary["orphan_position_details"] = list(self._orphan_position_details)
+        if self._startup_state_blocked:
+            summary["startup_state_blocked"] = True
+            summary["startup_state_details"] = list(self._startup_state_details)
         if self._startup_auth_disabled:
             summary["startup_auth_disabled"] = True
         summary["strategy_order_outcomes"] = {
@@ -2141,6 +2253,10 @@ class RuntimeOrchestrator:
                     failed = rr.get("failed_conditions", [])
                     lines.append(f"  - regime_rejection: reason={rr.get('reason', '')} failed={failed} "
                         f"state={rr.get('state', '')} trend_bps={rr.get('trend_bps')} vol_bps={rr.get('volatility_bps')}")
+                if rkr := r.get("risk_rejection"):
+                    failed = rkr.get("failed_conditions", [])
+                    lines.append(f"  - risk_rejection: reason={rkr.get('reason', '')} failed={failed} "
+                        f"projected_notional={rkr.get('projected_notional')} max_notional={rkr.get('max_total_notional_usdt')}")
             lines.append("")
         if flow := summary.get("strategy_flow"):
             lines.append("## Strategy Flow")
@@ -2169,6 +2285,30 @@ class RuntimeOrchestrator:
             lines.append(f"- Failed conditions: {lrr.get('failed_conditions', [])}")
             lines.append(f"- State: {lrr.get('state', '')} candidate_type: {lrr.get('candidate_type', '')}")
             lines.append(f"- volatility_bps={lrr.get('volatility_bps')} trend_bps={lrr.get('trend_bps')} adaptive_threshold={lrr.get('adaptive_trend_threshold_bps')}")
+            lines.append("")
+        if lkr := summary.get("last_risk_rejection"):
+            lines.append("## Last Risk Rejection")
+            lines.append(f"- Symbol: {lkr.get('symbol', '')}")
+            lines.append(f"- Reason: {lkr.get('reason', '')}")
+            lines.append(f"- Failed conditions: {lkr.get('failed_conditions', [])}")
+            lines.append(f"- Side: {lkr.get('side', '')} candidate_type: {lkr.get('candidate_type', '')}")
+            lines.append(f"- notional={lkr.get('notional')} projected_notional={lkr.get('projected_notional')} max_total_notional_usdt={lkr.get('max_total_notional_usdt')}")
+            lines.append(f"- max_leverage={lkr.get('max_leverage')} effective_leverage={lkr.get('effective_leverage')} position_leverage={lkr.get('position_leverage')}")
+            lines.append(f"- confidence={lkr.get('confidence')} min_confidence_threshold={lkr.get('min_confidence_threshold')}")
+            lines.append(f"- realized_pnl_today_usdt={lkr.get('realized_pnl_today_usdt')} daily_loss_limit_usdt={lkr.get('daily_loss_limit_usdt')}")
+            lines.append("")
+        if summary.get("startup_state_blocked"):
+            lines.append("## Last Startup Dirty State")
+            lines.append("- Non-flat position or unexpected open orders detected at startup/reconcile. No new entries until resolved.")
+            for d in summary.get("startup_state_details", []):
+                parts = [f"{d.get('symbol', '')}: position_size={d.get('position_size')} side={d.get('position_side', '')}"]
+                if "open_order_count" in d:
+                    parts.append(f"open_orders={d.get('open_order_count')} reduce_only={d.get('reduce_only_order_count')} non_reduce_only={d.get('non_reduce_only_order_count')}")
+                if "local_order_state_empty_or_not" in d:
+                    parts.append(f"local_empty={d.get('local_order_state_empty_or_not')}")
+                if "reason" in d:
+                    parts.append(f"reason={d.get('reason')}")
+                lines.append("- " + " ".join(parts))
             lines.append("")
         if summary.get("orphan_position_blocked"):
             lines.append("## Orphan Position Blocked (SAFETY)")

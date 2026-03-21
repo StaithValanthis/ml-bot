@@ -107,6 +107,25 @@ def test_infer_blocking_stage_submitted_when_intents() -> None:
     assert orch._infer_strategy_blocking_stage(m) == "submitted"
 
 
+def test_infer_blocking_stage_never_submitted_when_intents_zero() -> None:
+    """blocking_stage must never be 'submitted' when order_intents_total is 0."""
+    settings = load_settings()
+    with patch("trading.runtime.orchestrator.BybitRestClient", MagicMock()), patch(
+        "trading.runtime.orchestrator.BybitWsPublicClient", MagicMock()
+    ), patch("trading.runtime.orchestrator.BybitWsPrivateClient", MagicMock()):
+        orch = RuntimeOrchestrator(settings)
+    m = {
+        "decisions_total": 1,
+        "order_intents_total": 0,
+        "strategy_bars_confirmed": 10,
+        "strategy_candidates_total": 1,
+        "strategy_regime_rejected": 0,
+        "strategy_signal_rejected": 0,
+        "strategy_risk_rejected": 1,
+    }
+    assert orch._infer_strategy_blocking_stage(m) == "risk_rejected"
+
+
 @pytest.mark.asyncio
 async def test_session_summary_includes_strategy_flow_and_blocking_stage() -> None:
     """Session summary includes strategy_flow and blocking_stage."""
@@ -157,3 +176,28 @@ async def test_markdown_summary_includes_strategy_flow_section() -> None:
     assert "Model blocked:" in md
     assert "Submitted:" in md
     assert "Blocking stage:" in md
+
+
+@pytest.mark.asyncio
+async def test_session_summary_includes_last_risk_rejection_when_set() -> None:
+    """Session summary includes last_risk_rejection when risk has rejected."""
+    settings = load_settings()
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient", MagicMock()),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient", MagicMock()),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient", MagicMock()),
+    ):
+        orch = RuntimeOrchestrator(settings)
+        orch._last_risk_rejection = {
+            "symbol": "BTCUSDT",
+            "reason": "max_total_notional_exceeded",
+            "failed_conditions": ["max_total_notional_exceeded"],
+        }
+        summary = await orch._build_session_summary()
+
+    assert "last_risk_rejection" in summary
+    lrr = summary["last_risk_rejection"]
+    assert lrr["symbol"] == "BTCUSDT"
+    assert lrr["reason"] == "max_total_notional_exceeded"
+    md = orch._build_markdown_summary(summary)
+    assert "## Last Risk Rejection" in md

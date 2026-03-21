@@ -7,7 +7,7 @@ from decimal import Decimal
 
 from trading.risk.circuit_breaker import CircuitBreaker
 from trading.risk.portfolio_state import PortfolioState, PositionRiskView
-from trading.risk.risk_engine import RiskEngine
+from trading.risk.risk_engine import RiskDecisionReport, RiskEngine, RiskEvaluationContext
 from trading.strategy.signal_engine import SignalAction, SignalDecision
 from trading.util.types import OrderSide, PositionSide
 
@@ -194,3 +194,114 @@ def test_risk_engine_blocks_very_low_confidence() -> None:
     )
     assert decision.approved is False
     assert "confidence" in decision.reason.lower()
+
+
+def test_evaluate_with_report_returns_decision_and_report() -> None:
+    """evaluate_with_report returns (RiskDecision, RiskDecisionReport)."""
+    engine = RiskEngine(
+        max_total_notional_usdt=Decimal("50000"),
+        max_leverage=Decimal("10"),
+        daily_loss_limit_usdt=Decimal("500"),
+        liquidation_buffer_bps=500,
+        circuit_breaker=CircuitBreaker(),
+    )
+    portfolio = _portfolio()
+    signal = _signal()
+    decision, report = engine.evaluate_with_report(
+        signal=signal,
+        portfolio=portfolio,
+        expected_order_notional=Decimal("6000"),
+    )
+    assert decision.approved is True
+    assert isinstance(report, RiskDecisionReport)
+    assert report.symbol == "BTCUSDT"
+    assert report.allow is True
+    assert report.reason == "approved"
+    assert report.failed_conditions == ()
+    d = report.to_log_dict()
+    assert "symbol" in d
+    assert "allow" in d
+    assert "reason" in d
+    assert "notional" in d
+    assert "projected_notional" in d
+
+
+def test_evaluate_with_report_rejection_includes_failed_conditions() -> None:
+    """Rejection report includes failed_conditions and reason."""
+    engine = RiskEngine(
+        max_total_notional_usdt=Decimal("10000"),
+        max_leverage=Decimal("10"),
+        daily_loss_limit_usdt=Decimal("500"),
+        liquidation_buffer_bps=500,
+        circuit_breaker=CircuitBreaker(),
+    )
+    portfolio = _portfolio(equity=Decimal("50000"))
+    signal = _signal()
+    decision, report = engine.evaluate_with_report(
+        signal=signal,
+        portfolio=portfolio,
+        expected_order_notional=Decimal("15000"),
+    )
+    assert decision.approved is False
+    assert report.allow is False
+    assert "max_total_notional_exceeded" in report.reason
+    assert "max_total_notional_exceeded" in report.failed_conditions
+    d = report.to_log_dict()
+    assert d["reason"] == "max_total_notional_exceeded"
+    assert "max_total_notional_exceeded" in d["failed_conditions"]
+
+
+def test_evaluate_with_report_context_enriches_report() -> None:
+    """RiskEvaluationContext enriches report with candidate_type, orphan_position_blocked."""
+    engine = RiskEngine(
+        max_total_notional_usdt=Decimal("50000"),
+        max_leverage=Decimal("10"),
+        daily_loss_limit_usdt=Decimal("500"),
+        liquidation_buffer_bps=500,
+        circuit_breaker=CircuitBreaker(),
+    )
+    portfolio = _portfolio()
+    signal = _signal()
+    ctx = RiskEvaluationContext(
+        candidate_type="breakout_long",
+        orphan_position_blocked=True,
+        current_open_orders_count=2,
+    )
+    decision, report = engine.evaluate_with_report(
+        signal=signal,
+        portfolio=portfolio,
+        expected_order_notional=Decimal("6000"),
+        context=ctx,
+    )
+    assert report.candidate_type == "breakout_long"
+    assert report.orphan_position_blocked is True
+    assert report.current_open_orders_count == 2
+    d = report.to_log_dict()
+    assert d.get("candidate_type") == "breakout_long"
+    assert d.get("orphan_position_blocked") is True
+    assert d.get("current_open_orders_count") == 2
+
+
+def test_evaluate_delegates_to_evaluate_with_report() -> None:
+    """evaluate() returns same decision as evaluate_with_report()[0]."""
+    engine = RiskEngine(
+        max_total_notional_usdt=Decimal("50000"),
+        max_leverage=Decimal("10"),
+        daily_loss_limit_usdt=Decimal("500"),
+        liquidation_buffer_bps=500,
+        circuit_breaker=CircuitBreaker(),
+    )
+    portfolio = _portfolio()
+    signal = _signal()
+    decision_direct = engine.evaluate(
+        signal=signal,
+        portfolio=portfolio,
+        expected_order_notional=Decimal("6000"),
+    )
+    decision_from_report, _ = engine.evaluate_with_report(
+        signal=signal,
+        portfolio=portfolio,
+        expected_order_notional=Decimal("6000"),
+    )
+    assert decision_direct.approved == decision_from_report.approved
+    assert decision_direct.reason == decision_from_report.reason
