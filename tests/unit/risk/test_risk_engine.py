@@ -282,6 +282,71 @@ def test_evaluate_with_report_context_enriches_report() -> None:
     assert d.get("current_open_orders_count") == 2
 
 
+def test_position_with_high_exchange_leverage_but_low_effective_leverage_approves() -> None:
+    """Existing long + protective reduce-only + new long: no false position_max_leverage_exceeded.
+
+    Bybit reports position.leverage as margin-mode setting (e.g. 10x), not actual exposure.
+    Risk engine must use position_effective_leverage (notional/equity), not exchange leverage.
+    """
+    engine = RiskEngine(
+        max_total_notional_usdt=Decimal("50000"),
+        max_leverage=Decimal("3"),
+        daily_loss_limit_usdt=Decimal("500"),
+        liquidation_buffer_bps=500,
+        circuit_breaker=CircuitBreaker(),
+    )
+    pos = PositionRiskView(
+        symbol="BTCUSDT",
+        side=PositionSide.LONG,
+        qty=Decimal("0.001"),
+        entry_price=Decimal("50000"),
+        mark_price=Decimal("50000"),
+        leverage=Decimal("10"),
+        liquidation_price=Decimal("45000"),
+    )
+    portfolio = _portfolio(equity=Decimal("2000"), positions={"BTCUSDT": pos})
+    signal = _signal()
+    decision, report = engine.evaluate_with_report(
+        signal=signal,
+        portfolio=portfolio,
+        expected_order_notional=Decimal("141"),
+    )
+    assert decision.approved is True, f"Expected approved, got reason={decision.reason} metadata={decision.metadata}"
+    assert "position_max_leverage_exceeded" not in decision.reason
+    assert report.position_effective_leverage is not None
+    assert report.position_effective_leverage <= Decimal("3")
+
+
+def test_position_effective_leverage_in_report_when_position_exists() -> None:
+    """Report includes position_effective_leverage when position exists for correct diagnostics."""
+    engine = RiskEngine(
+        max_total_notional_usdt=Decimal("50000"),
+        max_leverage=Decimal("10"),
+        daily_loss_limit_usdt=Decimal("500"),
+        liquidation_buffer_bps=500,
+        circuit_breaker=CircuitBreaker(),
+    )
+    pos = PositionRiskView(
+        symbol="BTCUSDT",
+        side=PositionSide.LONG,
+        qty=Decimal("0.001"),
+        entry_price=Decimal("50000"),
+        mark_price=Decimal("50000"),
+        leverage=Decimal("20"),
+        liquidation_price=Decimal("45000"),
+    )
+    portfolio = _portfolio(equity=Decimal("2000"), positions={"BTCUSDT": pos})
+    signal = _signal()
+    _, report = engine.evaluate_with_report(
+        signal=signal,
+        portfolio=portfolio,
+        expected_order_notional=Decimal("141"),
+    )
+    assert report.position_effective_leverage is not None
+    assert report.position_effective_leverage == Decimal("0.025")
+    assert report.position_leverage == Decimal("20")
+
+
 def test_evaluate_delegates_to_evaluate_with_report() -> None:
     """evaluate() returns same decision as evaluate_with_report()[0]."""
     engine = RiskEngine(

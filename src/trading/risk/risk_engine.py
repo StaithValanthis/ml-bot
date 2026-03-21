@@ -43,6 +43,7 @@ class RiskDecisionReport:
     max_leverage: Decimal
     effective_leverage: Decimal | None
     position_leverage: Decimal | None
+    position_effective_leverage: Decimal | None
     distance_to_liq_bps: Decimal | None
     liquidation_buffer_bps: Decimal
     min_confidence_threshold: Decimal
@@ -80,6 +81,7 @@ class RiskDecisionReport:
             "max_leverage": float(self.max_leverage),
             "effective_leverage": float(self.effective_leverage) if self.effective_leverage is not None else None,
             "position_leverage": float(self.position_leverage) if self.position_leverage is not None else None,
+            "position_effective_leverage": float(self.position_effective_leverage) if self.position_effective_leverage is not None else None,
             "distance_to_liq_bps": float(self.distance_to_liq_bps) if self.distance_to_liq_bps is not None else None,
             "liquidation_buffer_bps": float(self.liquidation_buffer_bps),
             "min_confidence_threshold": float(self.min_confidence_threshold),
@@ -178,6 +180,11 @@ class RiskEngine:
         pos_side = pos.side.value if pos is not None else None
         limit = self._per_symbol_limits.get(signal.symbol)
         proj = portfolio.total_notional() + expected_order_notional
+        pos_effective_lev = (
+            pos.notional / portfolio.equity_usdt
+            if pos is not None and portfolio.equity_usdt > 0
+            else None
+        )
         return RiskDecisionReport(
             symbol=signal.symbol,
             allow=allow,
@@ -208,6 +215,7 @@ class RiskEngine:
             max_leverage=self._max_leverage,
             effective_leverage=portfolio.max_effective_leverage() if portfolio.equity_usdt > 0 else None,
             position_leverage=pos.leverage if pos is not None else None,
+            position_effective_leverage=pos_effective_lev,
             distance_to_liq_bps=pos.distance_to_liq_bps if pos is not None else None,
             liquidation_buffer_bps=self._liquidation_buffer_bps,
             min_confidence_threshold=self.MIN_CONFIDENCE,
@@ -248,10 +256,17 @@ class RiskEngine:
             r = self._base_report(signal=signal, portfolio=portfolio, expected_order_notional=expected_order_notional, allow=False, reason=d.reason, failed_conditions=("portfolio_max_leverage_exceeded",), confidence=Decimal("0"), ctx=ctx)
             return (d, r)
         position = portfolio.position_for(signal.symbol)
-        if position is not None and position.leverage > self._max_leverage:
-            d = RiskDecision(False, "position_max_leverage_exceeded", Decimal("0"), {"stage": "hard_limits", "position_leverage": position.leverage})
-            r = self._base_report(signal=signal, portfolio=portfolio, expected_order_notional=expected_order_notional, allow=False, reason=d.reason, failed_conditions=("position_max_leverage_exceeded",), confidence=Decimal("0"), ctx=ctx)
-            return (d, r)
+        if position is not None and portfolio.equity_usdt > 0:
+            position_effective_leverage = position.notional / portfolio.equity_usdt
+            if position_effective_leverage > self._max_leverage:
+                d = RiskDecision(
+                    False,
+                    "position_max_leverage_exceeded",
+                    Decimal("0"),
+                    {"stage": "hard_limits", "position_effective_leverage": position_effective_leverage},
+                )
+                r = self._base_report(signal=signal, portfolio=portfolio, expected_order_notional=expected_order_notional, allow=False, reason=d.reason, failed_conditions=("position_max_leverage_exceeded",), confidence=Decimal("0"), ctx=ctx)
+                return (d, r)
 
         if position is not None:
             distance = position.distance_to_liq_bps
