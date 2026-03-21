@@ -276,6 +276,7 @@ async def test_controlled_shutdown_emits_shutdown_logs() -> None:
 
     assert any(msg == "runtime_stopping" for msg, _ in log_calls)
     assert any(msg == "session_summary_written" for msg, _ in log_calls)
+    assert any(msg == "soak_report_written" for msg, _ in log_calls)
     assert any(msg == "runtime_stopped" for msg, _ in log_calls)
 
 
@@ -385,6 +386,14 @@ async def test_controlled_shutdown_writes_session_summary() -> None:
     data = json.loads(json_files[-1].read_text(encoding="utf-8"))
     assert "session_start" in data
     assert "session_end" in data
+
+    soak_jsons = list(summaries_dir.glob("soak_report_*.json"))
+    soak_mds = list(summaries_dir.glob("soak_report_*.md"))
+    assert len(soak_jsons) >= 1
+    assert len(soak_mds) >= 1
+    soak_data = json.loads(soak_jsons[-1].read_text(encoding="utf-8"))
+    assert "health_verdict" in soak_data
+    assert soak_data["health_verdict"]["verdict"] in ("PASS", "PASS_WITH_WARNINGS", "FAIL")
 
 
 @pytest.mark.asyncio

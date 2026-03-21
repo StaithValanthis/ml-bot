@@ -59,6 +59,10 @@ from trading.runtime.model_calibration import (
     build_model_calibration_summary,
     build_promotion_recommendation,
 )
+from trading.runtime.soak_report import (
+    build_soak_markdown,
+    build_soak_report,
+)
 from trading.runtime.strategy_orders import ModelFilterOutcomes, StrategyOrderOutcomes
 from trading.runtime.warmup import preload_warmup_klines, WarmupResult
 from trading.storage.postgres import PostgresJournalStore
@@ -783,6 +787,7 @@ class RuntimeOrchestrator:
                                 order_link_id=link_id,
                                 symbol=event.symbol or "",
                             )
+                            self._metrics.inc("entry_fill_received_count")
                             await self._ledger.record(
                                 "entry_fill_received",
                                 {
@@ -1280,6 +1285,7 @@ class RuntimeOrchestrator:
                 symbol=symbol,
                 reason="build_intent_returned_none",
             )
+            self._metrics.inc("protective_exit_placement_failed_count")
             await self._ledger.record(
                 "protective_exit_placement_failed",
                 {
@@ -1289,6 +1295,7 @@ class RuntimeOrchestrator:
                 },
             )
             return
+        self._metrics.inc("protective_exit_plan_created_count")
         await self._ledger.record(
             "protective_exit_plan_created",
             {
@@ -1307,6 +1314,7 @@ class RuntimeOrchestrator:
             price=str(exit_intent.price) if exit_intent.price else "",
         )
         await self._order_manager.register_intent(exit_intent)
+        self._metrics.inc("protective_exit_tracking_registered_count")
         await self._ledger.record(
             "protective_exit_tracking_registered",
             {"order_link_id": exit_intent.order_link_id, "symbol": symbol},
@@ -1323,6 +1331,7 @@ class RuntimeOrchestrator:
                 symbol=symbol,
                 reason="placement_disabled",
             )
+            self._metrics.inc("protective_exit_placement_failed_count")
             await self._ledger.record(
                 "protective_exit_placement_failed",
                 {
@@ -1332,6 +1341,7 @@ class RuntimeOrchestrator:
                 },
             )
             return
+        self._metrics.inc("protective_exit_order_submitted_count")
         await self._ledger.record(
             "protective_exit_order_submitted",
             {
@@ -1350,6 +1360,7 @@ class RuntimeOrchestrator:
             await self._submit_intent(exit_intent, is_drill=False)
             order_after = await self._order_manager.get_by_link_id(exit_intent.order_link_id)
             if order_after and order_after.order_id:
+                self._metrics.inc("protective_exit_order_ack_received_count")
                 await self._ledger.record(
                     "protective_exit_order_ack_received",
                     {"order_link_id": exit_intent.order_link_id, "order_id": order_after.order_id, "symbol": symbol},
@@ -1370,6 +1381,7 @@ class RuntimeOrchestrator:
                 symbol=symbol,
                 reason=reason,
             )
+            self._metrics.inc("protective_exit_placement_failed_count")
             await self._ledger.record(
                 "protective_exit_placement_failed",
                 {
@@ -1630,6 +1642,8 @@ class RuntimeOrchestrator:
                 details=details,
                 local_order_state_empty=local_order_state_empty,
             )
+            if not self._startup_state_blocked:
+                self._metrics.inc("startup_state_blocked_count")
             self._startup_state_blocked = True
             self._startup_state_details = details
             self._logger.warning(
@@ -1668,6 +1682,8 @@ class RuntimeOrchestrator:
         if not report_orders.ok or not report_positions.ok:
             self._metrics.inc("reconcile_mismatch_cycles")
             self._consecutive_reconcile_mismatches += 1
+            if not self._startup_state_blocked:
+                self._metrics.inc("startup_state_blocked_count")
             self._startup_state_blocked = True
             orphan_issues = [i for i in report_positions.issues if i.issue_type == "missing_reduce_only_exit"]
             if orphan_issues:
@@ -1681,6 +1697,8 @@ class RuntimeOrchestrator:
                     for i in orphan_issues
                 ]
             if orphan_issues:
+                if not self._orphan_position_blocked:
+                    self._metrics.inc("orphan_position_blocked_count")
                 self._orphan_position_blocked = True
                 self._orphan_position_details = [
                     {
@@ -1763,10 +1781,12 @@ class RuntimeOrchestrator:
             self._consecutive_reconcile_mismatches = 0
             if self._orphan_position_blocked:
                 self._orphan_position_blocked = False
+                self._metrics.inc("orphan_position_block_cleared_count")
                 self._orphan_position_details = []
                 self._logger.info("orphan_position_block_cleared", note="position_flat_or_protected")
             if self._startup_state_blocked:
                 self._startup_state_blocked = False
+                self._metrics.inc("startup_state_block_cleared_count")
                 self._startup_state_details = []
                 self._logger.info("startup_state_block_cleared", note="exchange_flat_no_unsafe_orders")
             await self._ledger.record(
@@ -2766,6 +2786,70 @@ class RuntimeOrchestrator:
                 "session_summary_written",
                 ledger_payload,
             )
+
+        soak_result = await self._write_soak_report(summary, report_dir, ts)
+        if soak_result is not None:
+            soak_json_path, soak_md_path, soak_report = soak_result
+            verdict_block = soak_report.get("health_verdict") or {}
+            self._logger.info(
+                "soak_report_written",
+                json_path=str(soak_json_path),
+                markdown_path=str(soak_md_path),
+                verdict=verdict_block.get("verdict", ""),
+                warnings_count=len(verdict_block.get("warnings") or []),
+                failures_count=len(verdict_block.get("failures") or []),
+            )
+            self._logger.info(
+                "soak_report_verdict",
+                verdict=verdict_block.get("verdict", ""),
+                failures=verdict_block.get("failures"),
+                warnings=verdict_block.get("warnings"),
+            )
+            await self._ledger.record(
+                "soak_report_written",
+                {
+                    "json_path": str(soak_json_path),
+                    "markdown_path": str(soak_md_path),
+                    "verdict": verdict_block.get("verdict", ""),
+                    "warnings_count": len(verdict_block.get("warnings") or []),
+                    "failures_count": len(verdict_block.get("failures") or []),
+                },
+            )
+
+    async def _write_soak_report(
+        self, summary: dict[str, object], report_dir: Path, ts: str
+    ) -> tuple[Path, Path, dict[str, object]] | None:
+        """Write soak report JSON and markdown. Returns (json_path, md_path, report) or None."""
+        session_id = f"session_{ts}"
+        soak_json_path = report_dir / f"soak_report_{session_id}.json"
+        soak_md_path = report_dir / f"soak_report_{session_id}.md"
+        metrics_snap = self._metrics.snapshot()
+        report = build_soak_report(summary, metrics_snap)
+        json_ok = False
+        md_ok = False
+        try:
+            soak_json_path.write_text(dumps_json_safe(report, indent=2), encoding="utf-8")
+            json_ok = True
+        except OSError as exc:
+            self._logger.warning(
+                "soak_report_write_failed",
+                path=str(soak_json_path),
+                file_type="json",
+                error=str(exc),
+            )
+        try:
+            soak_md_path.write_text(build_soak_markdown(report), encoding="utf-8")
+            md_ok = True
+        except OSError as exc:
+            self._logger.warning(
+                "soak_report_write_failed",
+                path=str(soak_md_path),
+                file_type="markdown",
+                error=str(exc),
+            )
+        if json_ok and md_ok:
+            return (soak_json_path, soak_md_path, report)
+        return None
 
 
 def _public_topics(*, symbols: list[str], candle_timeframe: str, regime_timeframe: str) -> list[str]:
