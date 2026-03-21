@@ -27,7 +27,7 @@ def main() -> None:
         "--dataset",
         type=Path,
         default=None,
-        help="Path to decision export JSON (default: latest from decision_exports/)",
+        help="Dataset path. Supported: .json (decision export), .csv (prepared), .parquet. Default: latest decisions_*.json or prepared_*.csv",
     )
     parser.add_argument(
         "--model",
@@ -95,20 +95,20 @@ def main() -> None:
     archive_dir = Path(os.getenv("TRADING_ARCHIVE_DIR", "data/archive"))
     dataset_path = args.dataset
     if dataset_path is None:
+        candidates: list[Path] = []
         export_dir = archive_dir / "decision_exports"
         if export_dir.exists():
-            json_files = sorted(
-                export_dir.glob("decisions_*.json"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if json_files:
-                dataset_path = json_files[0]
-                logger.info("using_latest_export", path=str(dataset_path))
+            candidates.extend(export_dir.glob("decisions_*.json"))
+        train_dir = archive_dir / "offline_train"
+        if train_dir.exists():
+            candidates.extend(train_dir.glob("prepared_*.csv"))
+        if candidates:
+            dataset_path = max(candidates, key=lambda p: p.stat().st_mtime)
+            logger.info("using_latest_dataset", path=str(dataset_path), format=dataset_path.suffix)
     if dataset_path is None:
         logger.error(
             "no_dataset",
-            hint="Provide --dataset or run backtest to produce decision_exports/decisions_*.json",
+            hint="Provide --dataset path. Supported: .json (decision_exports/), .csv (offline_train/prepared_*.csv), .parquet. Run backtest or offline-train first.",
         )
         raise SystemExit(1)
 

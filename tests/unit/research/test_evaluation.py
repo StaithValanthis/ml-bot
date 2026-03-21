@@ -183,6 +183,134 @@ def test_report_generation(tmp_path: Path) -> None:
     assert "Promotion Readiness" in md
 
 
+def test_load_json_decision_export(tmp_path: Path) -> None:
+    """JSON decision export loads and produces ModelReadyRows via prepare_training_rows."""
+    import json
+
+    from trading.research.evaluation.offline_evaluator import _load_dataset
+
+    path = tmp_path / "decisions.json"
+    records = [
+        {
+            "ts_utc": "2025-01-01T00:00:00+00:00",
+            "symbol": "BTCUSDT",
+            "action": "entry_long",
+            "side": "Buy",
+            "qty": "0.001",
+            "reference_price": "50000",
+            "order_link_id": "a",
+            "filled": True,
+            "fill_ts_utc": "2025-01-01T00:05:00+00:00",
+            "fill_qty": "0.001",
+            "fill_price": "50100",
+            "risk_approved": True,
+            "risk_reason": None,
+            "confidence": "0.8",
+        },
+    ]
+    path.write_text(json.dumps({"records": records}), encoding="utf-8")
+    rows, fmt = _load_dataset(path)
+    assert fmt == "json"
+    assert len(rows) == 1
+    assert rows[0].symbol == "BTCUSDT"
+    assert rows[0].label == 1
+
+
+def test_load_csv_prepared_dataset(tmp_path: Path) -> None:
+    """CSV prepared dataset loads directly to ModelReadyRows."""
+    from trading.research.evaluation.offline_evaluator import _load_dataset
+
+    csv_path = tmp_path / "prepared_test.csv"
+    header = "ts_utc,symbol,ts_ordinal,symbol_hash,action_encoded,qty,risk_approved,side_encoded,reference_price,confidence,filled"
+    row1 = "2025-01-01T00:00:00+00:00,BTCUSDT,1735689600.0,1234.0,1.0,0.001,1.0,1.0,50000.0,0.8,1"
+    row2 = "2025-01-01T01:00:00+00:00,ETHUSDT,1735693200.0,5678.0,2.0,0.01,1.0,-1.0,3000.0,0.7,0"
+    csv_path.write_text(f"{header}\n{row1}\n{row2}", encoding="utf-8")
+    rows, fmt = _load_dataset(csv_path)
+    assert fmt == "csv"
+    assert len(rows) == 2
+    assert rows[0].symbol == "BTCUSDT"
+    assert rows[0].label == 1
+    assert rows[1].symbol == "ETHUSDT"
+    assert rows[1].label == 0
+
+
+def test_load_unsupported_format_fails_cleanly(tmp_path: Path) -> None:
+    """Unsupported file suffix raises DatasetLoadError with clear message."""
+    from trading.research.evaluation.offline_evaluator import DatasetLoadError, _load_dataset
+
+    bad_path = tmp_path / "data.txt"
+    bad_path.write_text("not json or csv", encoding="utf-8")
+    with pytest.raises(DatasetLoadError) as exc_info:
+        _load_dataset(bad_path)
+    assert "Unsupported dataset format" in str(exc_info.value)
+    assert ".json" in str(exc_info.value)
+    assert ".csv" in str(exc_info.value)
+
+
+def test_load_json_missing_required_fields_fails_cleanly(tmp_path: Path) -> None:
+    """JSON with missing required fields raises DatasetLoadError with required list."""
+    import json
+
+    from trading.research.evaluation.offline_evaluator import DatasetLoadError, _load_dataset
+
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps({"records": [{"symbol": "X"}]}), encoding="utf-8")
+    with pytest.raises(DatasetLoadError) as exc_info:
+        _load_dataset(path)
+    assert "missing required" in str(exc_info.value).lower()
+    assert "ts_utc" in str(exc_info.value) or "action" in str(exc_info.value)
+
+
+def test_load_csv_missing_required_columns_fails_cleanly(tmp_path: Path) -> None:
+    """CSV with missing required columns raises DatasetLoadError with required list."""
+    from trading.research.evaluation.offline_evaluator import DatasetLoadError, _load_dataset
+
+    path = tmp_path / "bad.csv"
+    path.write_text("ts_utc,symbol\n2025-01-01T00:00:00,BTCUSDT", encoding="utf-8")
+    with pytest.raises(DatasetLoadError) as exc_info:
+        _load_dataset(path)
+    assert "missing required" in str(exc_info.value).lower()
+    assert "reference_price" in str(exc_info.value) or "filled" in str(exc_info.value)
+
+
+def test_eval_with_csv_dataset(tmp_path: Path) -> None:
+    """Full evaluation run works with CSV prepared dataset."""
+    try:
+        import joblib
+        from sklearn.linear_model import LogisticRegression
+    except ImportError:
+        pytest.skip("sklearn/joblib not available")
+    from trading.research.evaluation.offline_evaluator import run_offline_evaluation
+    from trading.research.evaluation.report import write_eval_reports
+
+    model_path = tmp_path / "model.pkl"
+    clf = LogisticRegression(max_iter=100, random_state=42)
+    clf.fit(
+        [[0, 0, 1, 0.001, 1, 1, 50000, 0.8], [1, 0, 1, 0.002, 1, 1, 50100, 0.7]],
+        [0, 1],
+    )
+    joblib.dump(clf, model_path)
+
+    csv_path = tmp_path / "prepared.csv"
+    header = "ts_utc,symbol,ts_ordinal,symbol_hash,action_encoded,qty,risk_approved,side_encoded,reference_price,confidence,filled"
+    lines = [header]
+    for i in range(50):
+        lines.append(f"2025-01-01T{i % 24:02d}:00:00+00:00,BTCUSDT,{1735689600 + i * 3600}.0,1234.0,1.0,0.001,1.0,1.0,50000.0,0.7,{i % 2}")
+    csv_path.write_text("\n".join(lines), encoding="utf-8")
+
+    result = run_offline_evaluation(
+        dataset_path=csv_path,
+        model_path=model_path,
+        output_dir=tmp_path / "eval_out",
+        threshold_grid=(0.5,),
+        cv_config=PurgedCVConfig(n_splits=2, embargo_seconds=60, purge_seconds=60, min_train_size=5, min_val_size=5),
+    )
+    assert result.success
+    assert result.total_rows == 50
+    written = write_eval_reports(result, tmp_path / "eval_out")
+    assert "json" in written
+
+
 def test_eval_no_control_flow_change() -> None:
     """Evaluation module does not alter runtime or strategy behavior."""
     from datetime import timedelta

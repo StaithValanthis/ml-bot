@@ -3,21 +3,23 @@ Offline model filter evaluator: purged CV, threshold analysis, report generation
 
 Orchestrates: load dataset -> prepare rows -> load model -> purged splits ->
 predict on each fold -> aggregate threshold metrics -> write artifacts.
+
+Supports dataset formats: JSON (decision export), CSV (prepared), Parquet (prepared).
 """
 
 from __future__ import annotations
 
+import csv
 import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-
 from trading.models.filter_artifact import load_model_artifact
 from trading.models.filter_predictor import RUNTIME_FEATURE_NAMES, predict_proba_fill
 from trading.research.datasets.prepare import (
-    MISSING_SENTINEL,
+    FEATURE_NAMES,
     LABEL_NAME,
-    LABEL_PROFITABLE_FILL,
+    MISSING_SENTINEL,
     ModelReadyRow,
     prepare_training_rows,
 )
@@ -29,12 +31,37 @@ from trading.research.evaluation.threshold_analysis import (
     shadow_vs_baseline_report,
 )
 from trading.util.json_util import dumps_json_safe
+from trading.util.logging import get_logger
+
+# Required columns for prepared CSV/Parquet (ts_utc, symbol, FEATURE_NAMES, LABEL_NAME).
+_PREPARED_REQUIRED = ("ts_utc", "symbol") + FEATURE_NAMES + (LABEL_NAME,)
+
+# Required keys for JSON decision export records.
+_JSON_REQUIRED = ("ts_utc", "symbol", "action", "qty", "filled", "risk_approved")
 
 
-def _load_records(path: Path) -> list[DecisionExportRecord]:
-    """Load decision export records from JSON."""
-    data = json.loads(path.read_text(encoding="utf-8"))
+class DatasetLoadError(Exception):
+    """Raised when dataset load fails due to format or validation."""
+
+    pass
+
+
+def _load_from_json(path: Path) -> list[DecisionExportRecord]:
+    """Load decision export JSON. Returns DecisionExportRecord list."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise DatasetLoadError(f"Invalid JSON: {e}") from e
     rows_raw = data.get("records", [])
+    if not rows_raw:
+        return []
+    first = rows_raw[0]
+    missing = [k for k in _JSON_REQUIRED if k not in first]
+    if missing:
+        raise DatasetLoadError(
+            f"JSON decision export missing required fields: {missing}. "
+            f"Required: {list(_JSON_REQUIRED)}"
+        )
     records: list[DecisionExportRecord] = []
     for r in rows_raw:
         ts = datetime.fromisoformat(r["ts_utc"]) if r.get("ts_utc") else datetime.min.replace(tzinfo=timezone.utc)
@@ -58,6 +85,102 @@ def _load_records(path: Path) -> list[DecisionExportRecord]:
             )
         )
     return records
+
+
+def _load_from_csv(path: Path) -> list[ModelReadyRow]:
+    """Load prepared CSV. Returns ModelReadyRow list."""
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise DatasetLoadError("CSV has no header row")
+        header = set(reader.fieldnames)
+        missing = [c for c in _PREPARED_REQUIRED if c not in header]
+        if missing:
+            raise DatasetLoadError(
+                f"Prepared CSV missing required columns: {missing}. "
+                f"Required: {list(_PREPARED_REQUIRED)}"
+            )
+        rows: list[ModelReadyRow] = []
+        for i, r in enumerate(reader):
+            try:
+                ts_str = r.get("ts_utc", "")
+                ts = datetime.fromisoformat(ts_str) if ts_str else datetime.min.replace(tzinfo=timezone.utc)
+                symbol = r.get("symbol", "")
+                features = {k: float(r.get(k, 0) or 0) for k in FEATURE_NAMES}
+                label = 1 if str(r.get(LABEL_NAME, "0")).strip() in ("1", "true", "True") else 0
+                rows.append(
+                    ModelReadyRow(
+                        ts_utc=ts,
+                        symbol=symbol,
+                        features=features,
+                        label=label,
+                        optional_labels=None,
+                    )
+                )
+            except (ValueError, TypeError) as e:
+                raise DatasetLoadError(f"CSV row {i + 2}: invalid value: {e}") from e
+        return rows
+
+
+def _load_from_parquet(path: Path) -> list[ModelReadyRow]:
+    """Load prepared Parquet. Returns ModelReadyRow list."""
+    try:
+        import pandas as pd
+    except ImportError as e:
+        raise DatasetLoadError("Parquet support requires pandas") from e
+    try:
+        df = pd.read_parquet(path)
+    except Exception as e:
+        raise DatasetLoadError(f"Parquet read failed: {e}") from e
+    missing = [c for c in _PREPARED_REQUIRED if c not in df.columns]
+    if missing:
+        raise DatasetLoadError(
+            f"Prepared Parquet missing required columns: {missing}. "
+            f"Required: {list(_PREPARED_REQUIRED)}"
+        )
+    rows: list[ModelReadyRow] = []
+    for _, r in df.iterrows():
+        ts_val = r.get("ts_utc")
+        if ts_val is None or (isinstance(ts_val, float) and str(ts_val) == "nan"):
+            ts = datetime.min.replace(tzinfo=timezone.utc)
+        elif hasattr(ts_val, "to_pydatetime"):
+            ts = ts_val.to_pydatetime()
+        else:
+            ts = datetime.fromisoformat(str(ts_val))
+        symbol = str(r.get("symbol", ""))
+        features = {k: float(r.get(k, 0) or 0) for k in FEATURE_NAMES}
+        label = 1 if int(r.get(LABEL_NAME, 0) or 0) == 1 else 0
+        rows.append(
+            ModelReadyRow(
+                ts_utc=ts,
+                symbol=symbol,
+                features=features,
+                label=label,
+                optional_labels=None,
+            )
+        )
+    return rows
+
+
+def _load_dataset(path: Path) -> tuple[list[ModelReadyRow], str]:
+    """
+    Load dataset by format (JSON, CSV, Parquet). Returns (rows, format_type).
+    Raises DatasetLoadError on validation failure.
+    """
+    suff = path.suffix.lower()
+    if suff == ".json":
+        records = _load_from_json(path)
+        rows = prepare_training_rows(records)
+        return (rows, "json")
+    if suff == ".csv":
+        rows = _load_from_csv(path)
+        return (rows, "csv")
+    if suff in (".parquet", ".pq"):
+        rows = _load_from_parquet(path)
+        return (rows, "parquet")
+    raise DatasetLoadError(
+        f"Unsupported dataset format: {suff}. Supported: .json, .csv, .parquet"
+    )
 
 
 def _predict_probs(model: object, rows: list[ModelReadyRow]) -> list[tuple[int, float, bool]]:
@@ -150,8 +273,28 @@ def run_offline_evaluation(
             error=f"model load failed: {load_result.error}",
         )
     model = load_result.model
-    records = _load_records(dataset_path)
-    rows = prepare_training_rows(records)
+    _eval_logger = get_logger("trading.research.evaluation.offline_evaluator")
+    try:
+        rows, dataset_fmt = _load_dataset(dataset_path)
+        _eval_logger.info(
+            "dataset_loaded",
+            path=str(dataset_path),
+            format=dataset_fmt,
+            row_count=len(rows),
+        )
+    except DatasetLoadError as e:
+        return OfflineEvalResult(
+            success=False,
+            run_id=run_id,
+            dataset_path=str(dataset_path),
+            model_path=str(model_path),
+            total_rows=0,
+            cv_config={},
+            fold_results=[],
+            aggregated_threshold_metrics=[],
+            shadow_vs_baseline={},
+            error=str(e),
+        )
     if not rows:
         return OfflineEvalResult(
             success=False,

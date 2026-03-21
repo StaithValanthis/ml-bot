@@ -29,8 +29,13 @@ The offline evaluator performs **purged cross-validation** and **threshold analy
 # Using the installed script (after pip install -e .)
 trading-eval --model data/archive/offline_train/model_20250101_120000.pkl
 
-# Or with explicit paths
-trading-eval --dataset data/archive/decision_exports/decisions_20250101_120000.json \
+# JSON decision export (from backtest)
+trading-eval --dataset data/archive/decision_exports/decisions_20240101_000500.json \
+  --model data/archive/offline_train/model_20250101_120000.pkl \
+  --output-dir data/archive/eval
+
+# CSV prepared dataset (from trading-offline-train)
+trading-eval --dataset data/archive/offline_train/prepared_20260320_115323.csv \
   --model data/archive/offline_train/model_20250101_120000.pkl \
   --output-dir data/archive/eval
 
@@ -45,9 +50,21 @@ trading-eval --model model.pkl \
 
 ### Inputs
 
+### Supported Dataset Formats
+
+| Format | Path / source | Required fields |
+|--------|---------------|-----------------|
+| **JSON** | `decision_exports/decisions_*.json` | `ts_utc`, `symbol`, `action`, `qty`, `filled`, `risk_approved` |
+| **CSV** | `offline_train/prepared_*.csv` | `ts_utc`, `symbol`, `ts_ordinal`, `symbol_hash`, `action_encoded`, `qty`, `risk_approved`, `side_encoded`, `reference_price`, `confidence`, `filled` |
+| **Parquet** | Any `.parquet` / `.pq` | Same as CSV (prepared schema) |
+
+Unsupported suffixes raise a clear error. Missing required columns/fields raise `DatasetLoadError` with the required list.
+
+### Inputs
+
 | Argument   | Default                          | Description                          |
 |-----------|-----------------------------------|--------------------------------------|
-| `--dataset` | Latest in `decision_exports/`   | Path to decision export JSON         |
+| `--dataset` | Latest `decisions_*.json` or `prepared_*.csv` | Path to dataset (.json, .csv, .parquet) |
 | `--model`   | Required                        | Path to model artifact (.pkl)       |
 | `--output-dir` | `TRADING_ARCHIVE_DIR/eval`   | Output directory                     |
 | `--thresholds` | `0.3,0.4,0.5,0.6,0.7`       | Comma-separated threshold grid       |
