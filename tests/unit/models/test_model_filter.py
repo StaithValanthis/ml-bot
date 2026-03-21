@@ -207,6 +207,68 @@ def test_score_for_filter_trade_allowed() -> None:
     assert allow is True
 
 
+def test_score_for_filter_threshold_045_blocks_below() -> None:
+    """Active mode with threshold 0.45 blocks candidates with prob < 0.45."""
+    try:
+        from sklearn.linear_model import LogisticRegression
+    except ImportError:
+        pytest.skip("sklearn not available")
+
+    clf = LogisticRegression(max_iter=100, random_state=42)
+    X = [[0, 0, 1, 0.001, 1, 1, 50000, 0.1] for _ in range(10)] + [
+        [0, 0, 1, 0.001, 1, 1, 50000, 0.9] for _ in range(10)
+    ]
+    y = [0] * 10 + [1] * 10
+    clf.fit(X, y)
+
+    result, allow = score_for_filter(
+        clf,
+        symbol="BTCUSDT",
+        action="enter_long",
+        side="Buy",
+        qty=0.001,
+        risk_approved=True,
+        reference_price=Decimal("50000"),
+        confidence=Decimal("0.1"),
+        ts_utc=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+        threshold=0.45,
+    )
+    assert result.available is True
+    assert result.prob_fill < 0.45
+    assert allow is False
+
+
+def test_score_for_filter_threshold_045_allows_at_or_above() -> None:
+    """Active mode with threshold 0.45 allows candidates with prob >= 0.45."""
+    try:
+        from sklearn.linear_model import LogisticRegression
+    except ImportError:
+        pytest.skip("sklearn not available")
+
+    clf = LogisticRegression(max_iter=100, random_state=42)
+    X = [[0, 0, 1, 0.001, 1, 1, 50000, 0.1] for _ in range(10)] + [
+        [0, 0, 1, 0.001, 1, 1, 50000, 0.9] for _ in range(10)
+    ]
+    y = [0] * 10 + [1] * 10
+    clf.fit(X, y)
+
+    result, allow = score_for_filter(
+        clf,
+        symbol="BTCUSDT",
+        action="enter_long",
+        side="Buy",
+        qty=0.001,
+        risk_approved=True,
+        reference_price=Decimal("50000"),
+        confidence=Decimal("0.9"),
+        ts_utc=datetime(2024, 1, 1, 12, 0, 0, tzinfo=UTC),
+        threshold=0.45,
+    )
+    assert result.available is True
+    assert result.prob_fill >= 0.45
+    assert allow is True
+
+
 def test_model_filter_outcomes_defaults() -> None:
     """ModelFilterOutcomes has expected defaults for calibration visibility."""
     mf = ModelFilterOutcomes()
@@ -373,6 +435,14 @@ def test_model_filter_mode_enum_values() -> None:
     assert ModelFilterMode.HARD_BLOCK.value == "hard_block"
     assert ModelFilterMode.SHADOW.value == "shadow"
     assert ModelFilterMode.THRESHOLD_OVERRIDE.value == "threshold_override"
+
+
+def test_model_filter_mode_active_alias_maps_to_hard_block() -> None:
+    """'active' alias maps to HARD_BLOCK for controlled validation phase."""
+    from trading.settings import RuntimeSettings
+
+    rt = RuntimeSettings(mode=RuntimeMode.DEMO, model_filter_mode="active")
+    assert rt.model_filter_mode == ModelFilterMode.HARD_BLOCK
 
 
 def test_orchestrator_model_filter_init_sets_mode_and_threshold(tmp_path: Path) -> None:

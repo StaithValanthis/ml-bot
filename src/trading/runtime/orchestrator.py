@@ -1034,10 +1034,11 @@ class RuntimeOrchestrator:
                     from trading.models.filter_predictor import score_for_filter
 
                     mf_mode = self._model_filter_mode
-                    if mf_mode == ModelFilterMode.THRESHOLD_OVERRIDE and self._model_filter_threshold is not None:
-                        model_filter_threshold = self._model_filter_threshold
-                    else:
-                        model_filter_threshold = 0.5
+                    model_filter_threshold = (
+                        self._model_filter_threshold
+                        if self._model_filter_threshold is not None
+                        else 0.5
+                    )
                     pred_result, allow = score_for_filter(
                         self._model_filter_model,
                         symbol=signal.symbol,
@@ -1895,9 +1896,9 @@ class RuntimeOrchestrator:
                 symbol=symbol,
                 candidate_type=candidate_type,
                 side=side,
-                allow=allow,
                 model_probability=model_probability,
                 threshold=threshold,
+                allow=allow,
             )
 
     def _init_model_filter(self) -> None:
@@ -1969,9 +1970,7 @@ class RuntimeOrchestrator:
         mf_threshold = self._settings.runtime.model_filter_threshold
         self._model_filter_mode = mf_mode
         self._model_filter_threshold = mf_threshold
-        effective_threshold = (
-            mf_threshold if (mf_mode == ModelFilterMode.THRESHOLD_OVERRIDE and mf_threshold is not None) else 0.5
-        )
+        effective_threshold = mf_threshold if mf_threshold is not None else 0.5
         self._strategy_order_outcomes.model_filter.threshold = effective_threshold
         self._strategy_order_outcomes.model_filter.mode = mf_mode.value
         self._logger.info(
@@ -2280,11 +2279,18 @@ class RuntimeOrchestrator:
         decisions = list(self._model_shadow_decisions)
         if decisions:
             probs = [float(d.get("model_probability", 0)) for d in decisions if "model_probability" in d]
+            active_decisions = [d for d in decisions if "allow" in d]
+            active_blocked = sum(1 for d in active_decisions if d.get("allow") is False)
+            active_allowed = sum(1 for d in active_decisions if d.get("allow") is True)
+            latest_active = active_decisions[-1] if active_decisions else None
             summary["model_shadow_decisions"] = {
                 "decisions": decisions,
                 "total_model_evaluations": len(decisions),
                 "shadow_would_block_count": sum(1 for d in decisions if d.get("shadow_would_block")),
                 "shadow_would_allow_count": sum(1 for d in decisions if not d.get("shadow_would_block")),
+                "active_blocked_count": active_blocked,
+                "active_allowed_count": active_allowed,
+                "latest_active_decision": latest_active,
                 "avg_probability": round(sum(probs) / len(probs), 6) if probs else None,
                 "min_probability": min(probs) if probs else None,
                 "max_probability": max(probs) if probs else None,
@@ -2476,6 +2482,13 @@ class RuntimeOrchestrator:
             lines.append(f"- Total model evaluations: {msd.get('total_model_evaluations', 0)}")
             lines.append(f"- Shadow would block: {msd.get('shadow_would_block_count', 0)}")
             lines.append(f"- Shadow would allow: {msd.get('shadow_would_allow_count', 0)}")
+            if (msd.get("active_blocked_count") or 0) > 0 or (msd.get("active_allowed_count") or 0) > 0:
+                lines.append(f"- Active blocked: {msd.get('active_blocked_count', 0)}")
+                lines.append(f"- Active allowed: {msd.get('active_allowed_count', 0)}")
+            if latest := msd.get("latest_active_decision"):
+                lines.append(f"- Latest active decision: {latest.get('symbol', '')} {latest.get('candidate_type', '')} "
+                    f"side={latest.get('side', '')} prob={latest.get('model_probability')} "
+                    f"threshold={latest.get('threshold')} allow={latest.get('allow')}")
             if msd.get("avg_probability") is not None:
                 lines.append(f"- Prob: avg={msd.get('avg_probability')} min={msd.get('min_probability')} max={msd.get('max_probability')}")
             lines.append("")
@@ -2572,26 +2585,25 @@ class RuntimeOrchestrator:
         if decisions := summary.get("model_shadow_decisions", {}).get("decisions"):
             _csv_path = report_dir / f"model_shadow_decisions_{ts}.csv"
             session_id = f"session_{ts}"
+            fieldnames = [
+                "session_id",
+                "timestamp",
+                "symbol",
+                "candidate_type",
+                "side",
+                "model_probability",
+                "threshold",
+                "shadow_would_block",
+                "allow",
+                "strategy_submitted",
+                "blocking_stage",
+            ]
             try:
                 with _csv_path.open("w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(
-                        f,
-                        fieldnames=[
-                            "session_id",
-                            "timestamp",
-                            "symbol",
-                            "candidate_type",
-                            "side",
-                            "model_probability",
-                            "threshold",
-                            "shadow_would_block",
-                            "strategy_submitted",
-                            "blocking_stage",
-                        ],
-                    )
+                    writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
                     writer.writeheader()
                     for d in decisions:
-                        writer.writerow({
+                        row = {
                             "session_id": session_id,
                             "timestamp": d.get("timestamp", ""),
                             "symbol": d.get("symbol", ""),
@@ -2600,9 +2612,11 @@ class RuntimeOrchestrator:
                             "model_probability": d.get("model_probability", ""),
                             "threshold": d.get("threshold", ""),
                             "shadow_would_block": d.get("shadow_would_block", False),
+                            "allow": d.get("allow") if "allow" in d else "",
                             "strategy_submitted": d.get("strategy_submitted", False),
                             "blocking_stage": d.get("blocking_stage", ""),
-                        })
+                        }
+                        writer.writerow(row)
                 csv_ok = True
                 csv_path = _csv_path
             except OSError as exc:

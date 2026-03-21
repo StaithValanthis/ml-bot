@@ -137,6 +137,14 @@ class RuntimeSettings(BaseModel):
             raise ValueError("model_filter_threshold must be between 0 and 1 when set")
         return value
 
+    @field_validator("model_filter_mode", mode="before")
+    @classmethod
+    def _validate_model_filter_mode(cls, value: Any) -> Any:
+        """Map 'active' alias to hard_block for model gating validation."""
+        if isinstance(value, str) and value.strip().lower() == "active":
+            return ModelFilterMode.HARD_BLOCK
+        return value
+
 
 class ExchangeSettings(BaseModel):
     provider: ExchangeType = ExchangeType.BYBIT
@@ -428,6 +436,8 @@ def load_settings() -> AppSettings:
         raw = mf_mode.strip().lower()
         if raw in ("hard_block", "shadow", "threshold_override"):
             runtime_cfg["model_filter_mode"] = raw
+        elif raw == "active":
+            runtime_cfg["model_filter_mode"] = "hard_block"
     if (mf_threshold := os.getenv("TRADING_MODEL_FILTER_THRESHOLD")) is not None:
         try:
             runtime_cfg["model_filter_threshold"] = float(mf_threshold.strip())

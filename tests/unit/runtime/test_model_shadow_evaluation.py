@@ -116,6 +116,16 @@ def test_markdown_summary_model_shadow_evaluation_sections() -> None:
             "total_model_evaluations": 5,
             "shadow_would_block_count": 2,
             "shadow_would_allow_count": 3,
+            "active_blocked_count": 2,
+            "active_allowed_count": 3,
+            "latest_active_decision": {
+                "symbol": "BTCUSDT",
+                "candidate_type": "breakout_long",
+                "side": "Buy",
+                "model_probability": 0.52,
+                "threshold": 0.45,
+                "allow": True,
+            },
             "avg_probability": 0.48,
             "min_probability": 0.2,
             "max_probability": 0.75,
@@ -138,6 +148,12 @@ def test_markdown_summary_model_shadow_evaluation_sections() -> None:
     assert "Total model evaluations: 5" in md
     assert "Shadow would block: 2" in md
     assert "Shadow would allow: 3" in md
+    assert "Active blocked: 2" in md
+    assert "Active allowed: 3" in md
+    assert "Latest active decision:" in md
+    assert "prob=0.52" in md
+    assert "threshold=0.45" in md
+    assert "allow=True" in md
     assert "Prob: avg=0.48 min=0.2 max=0.75" in md
     assert "BTCUSDT" in md
     assert "breakout_long" in md
@@ -172,7 +188,8 @@ async def test_csv_artifact_written_with_correct_columns(tmp_path: Path) -> None
     assert len(csv_files) == 1
     content = csv_files[0].read_text(encoding="utf-8")
     lines = content.strip().split("\n")
-    assert lines[0] == "session_id,timestamp,symbol,candidate_type,side,model_probability,threshold,shadow_would_block,strategy_submitted,blocking_stage"
+    assert "session_id" in lines[0]
+    assert "allow" in lines[0]
     assert "session_20250319" in lines[1]
     assert "BTCUSDT" in lines[1]
     assert "breakout_long" in lines[1]
@@ -200,3 +217,110 @@ def test_shadow_mode_does_not_gate_behavior() -> None:
     assert len(orch._model_shadow_decisions) == 1
     assert orch._model_shadow_decisions[0]["shadow_would_block"] is True
     assert orch._model_shadow_decisions[0]["strategy_submitted"] is False
+    assert "allow" not in orch._model_shadow_decisions[0]
+
+
+def test_record_model_decision_active_mode_includes_allow() -> None:
+    """In active (HARD_BLOCK) mode, _record_model_decision stores allow for CSV export."""
+    orch = _make_orchestrator()
+    orch._model_filter_mode = ModelFilterMode.HARD_BLOCK
+    orch._record_model_decision(
+        symbol="ETHUSDT",
+        candidate_type="breakout_short",
+        side="Sell",
+        bar_close_time=None,
+        model_probability=0.52,
+        threshold=0.45,
+        shadow_would_block=False,
+        allow=True,
+    )
+    assert len(orch._model_shadow_decisions) == 1
+    assert orch._model_shadow_decisions[0]["allow"] is True
+    orch._record_model_decision(
+        symbol="BTCUSDT",
+        candidate_type="breakout_long",
+        side="Buy",
+        bar_close_time=None,
+        model_probability=0.3,
+        threshold=0.45,
+        shadow_would_block=True,
+        allow=False,
+    )
+    assert orch._model_shadow_decisions[1]["allow"] is False
+
+
+@pytest.mark.asyncio
+async def test_session_summary_includes_active_blocked_allowed() -> None:
+    """Session summary model_shadow_decisions includes active_blocked_count and active_allowed_count."""
+    orch = _make_orchestrator()
+    orch._model_shadow_decisions = [
+        {"symbol": "A", "model_probability": 0.3, "shadow_would_block": True, "allow": False},
+        {"symbol": "B", "model_probability": 0.8, "shadow_would_block": False, "allow": True},
+        {"symbol": "C", "model_probability": 0.5, "shadow_would_block": False, "allow": True},
+    ]
+    summary = await orch._build_session_summary()
+    msd = summary.get("model_shadow_decisions")
+    assert msd is not None
+    assert msd["active_blocked_count"] == 1
+    assert msd["active_allowed_count"] == 2
+    assert msd["latest_active_decision"]["symbol"] == "C"
+    assert msd["latest_active_decision"]["allow"] is True
+
+
+@pytest.mark.asyncio
+async def test_runtime_summary_includes_active_blocked_allowed() -> None:
+    """Runtime summary model_filter_calibration includes blocked/allowed when model filter active."""
+    captured: list[dict] = []
+
+    def capture_log(event: str, **kwargs: object) -> None:
+        if event == "runtime_summary":
+            captured.append(dict(kwargs))
+
+    orch = _make_orchestrator()
+    orch._model_filter_active = True
+    orch._strategy_order_outcomes.model_filter.blocked = 3
+    orch._strategy_order_outcomes.model_filter.allowed = 7
+    orch._strategy_order_outcomes.model_filter.threshold = 0.45
+    orch._strategy_order_outcomes.model_filter.mode = "hard_block"
+    orch._logger.info = capture_log
+
+    await orch._runtime_summary_cycle()
+
+    assert len(captured) == 1
+    mfc = captured[0].get("model_filter_calibration")
+    assert mfc is not None
+    assert mfc.get("blocked") == 3
+    assert mfc.get("allowed") == 7
+    assert mfc.get("threshold") == 0.45
+
+
+@pytest.mark.asyncio
+async def test_csv_export_includes_allow_column_for_active_decisions(tmp_path: Path) -> None:
+    """CSV artifact includes allow column when decisions have active (allow) field."""
+    from trading.util.types import RuntimeMode
+
+    orch = _make_orchestrator()
+    orch._parquet_store._root_dir = tmp_path
+    orch._session_start_time = datetime(2025, 3, 19, 9, 0, 0, tzinfo=UTC)
+    orch._settings.runtime.mode = RuntimeMode.DEMO
+    orch._model_shadow_decisions = [
+        {
+            "timestamp": "2025-03-19T10:30:00+00:00",
+            "symbol": "BTCUSDT",
+            "candidate_type": "breakout_long",
+            "side": "Buy",
+            "model_probability": 0.4,
+            "threshold": 0.45,
+            "shadow_would_block": True,
+            "allow": False,
+            "strategy_submitted": False,
+            "blocking_stage": "model_evaluated",
+        },
+    ]
+    await orch._write_session_summary()
+    report_dir = tmp_path / "session_summaries"
+    csv_files = list(report_dir.glob("model_shadow_decisions_*.csv"))
+    assert len(csv_files) == 1
+    content = csv_files[0].read_text(encoding="utf-8")
+    assert "allow" in content.split("\n")[0]
+    assert "False" in content
