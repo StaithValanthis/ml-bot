@@ -71,7 +71,7 @@ def test_build_protective_limit_exit_returns_none_for_flat() -> None:
 @pytest.mark.asyncio
 async def test_place_protective_exit_after_fill_creates_and_tracks() -> None:
     """Entry fill triggers protective exit: plan created, intent registered, order submitted."""
-        from trading.marketdata.normalizers import NormalizedOrderUpdate
+    from trading.marketdata.normalizers import NormalizedOrderUpdate
     from trading.runtime.orchestrator import RuntimeOrchestrator
     from trading.settings import load_settings
     from trading.util.types import OrderSide, OrderStatus
@@ -130,8 +130,6 @@ async def test_place_protective_exit_after_fill_creates_and_tracks() -> None:
             avg_price=Decimal("50100"),
             updated_at=datetime.now(UTC),
         )
-
-        from trading.util.types import OrderType, TimeInForce
 
         event = NormalizedOrderUpdate(
             order_id="ord-1",
