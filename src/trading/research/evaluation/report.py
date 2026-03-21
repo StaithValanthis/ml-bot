@@ -29,6 +29,7 @@ def write_eval_reports(result: OfflineEvalResult, output_dir: Path) -> dict[str,
         "n_folds": len(result.fold_results),
         "aggregated_threshold_metrics": result.aggregated_threshold_metrics,
         "shadow_vs_baseline": result.shadow_vs_baseline,
+        "retention_recommendations": result.retention_recommendations,
         "error": result.error,
     }
     json_path = output_dir / f"eval_summary_{rid}.json"
@@ -140,15 +141,44 @@ def _build_markdown_report(result: OfflineEvalResult) -> str:
             f"| {m.get('threshold')} | {m.get('precision')} | {m.get('recall')} | {m.get('f1')} | "
             f"{m.get('retained_count')} | {m.get('filtered_count')} | {m.get('retain_ratio')} |"
         )
+    if result.retention_recommendations:
+        lines.extend([
+            "",
+            "## Retention-Based Threshold Recommendations",
+            "",
+            "| profile | target_retain | threshold | retained | filtered | retain_ratio | positive_rate | uplift | fn_risk | precision | recall | f1 |",
+            "|---------|---------------|-----------|----------|----------|--------------|---------------|-------|---------|-----------|--------|-----|",
+        ])
+        for profile, rec in result.retention_recommendations.items():
+            lines.append(
+                f"| {rec.get('profile')} | {rec.get('target_retain_pct')} | {rec.get('recommended_threshold')} | "
+                f"{rec.get('retained_count')} | {rec.get('filtered_count')} | {rec.get('retain_ratio')} | "
+                f"{rec.get('positive_rate_retained')} | {rec.get('uplift_vs_baseline')} | "
+                f"{rec.get('false_negative_risk')} | {rec.get('precision')} | {rec.get('recall')} | {rec.get('f1')} |"
+            )
+        lines.append("")
+
     lines.extend([
         "",
-        "## Promotion Readiness",
+        "## Promotion Recommendation",
+        "",
+    ])
+    sb = result.shadow_vs_baseline or {}
+    recs = result.retention_recommendations or {}
+    cons = recs.get("conservative", {})
+    bal = recs.get("balanced", {})
+    agg = recs.get("aggressive", {})
+    lines.append("- **Suggested threshold (shadow, ~75% retain):** " + str(agg.get("recommended_threshold", "N/A")))
+    lines.append("- **Suggested threshold (active-demo, ~50% retain):** " + str(bal.get("recommended_threshold", "N/A")))
+    lines.append("- **Suggested threshold (conservative, ~25% retain):** " + str(cons.get("recommended_threshold", "N/A")))
+    lines.extend([
         "",
         "This offline evaluation supports the decision to promote from SHADOW to ACTIVE gating:",
         "- Review threshold metrics: precision/recall/F1 at each threshold.",
         "- Check shadow-vs-baseline: does gating improve positive rate and reduce false positives?",
         "- Consider false negative risk: how many good trades would be filtered at each threshold?",
-        "- Select threshold that balances retention, quality uplift, and FN risk for your risk appetite.",
+        "- Compare runtime probability distribution (session summary) to offline predictions.",
+        "- **Verdict:** remain_shadow | active_demo_ready | not_predictive_enough (derive from runtime + offline).",
         "",
     ])
     return "\n".join(lines)

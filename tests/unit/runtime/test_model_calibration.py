@@ -9,9 +9,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from trading.runtime.model_calibration import (
+    build_log_scale_buckets,
     build_model_calibration_summary,
     build_probability_buckets,
+    build_promotion_recommendation,
+    build_runtime_calibration_stats,
     build_threshold_sweep,
+    compute_retention_thresholds,
 )
 
 
@@ -145,6 +149,12 @@ async def test_session_summary_includes_model_calibration() -> None:
     assert cal["threshold_sweep"]
     assert cal["probability_buckets"]
     assert "outcome_linkage_note" in cal
+    assert "runtime_calibration" in cal
+    assert cal["runtime_calibration"]["probability_distribution"]["max"] == 0.6
+    pr = summary.get("promotion_recommendation")
+    assert pr is not None
+    assert pr["observed_max_probability"] == 0.6
+    assert "verdict" in pr
 
 
 def test_markdown_includes_calibration_and_threshold_readiness() -> None:
@@ -181,10 +191,16 @@ def test_markdown_includes_calibration_and_threshold_readiness() -> None:
                 {"threshold": 0.3, "would_block_count": 1, "would_allow_count": 9, "block_rate": 0.1},
                 {"threshold": 0.5, "would_block_count": 4, "would_allow_count": 6, "block_rate": 0.4},
             ],
+            "runtime_calibration": {
+                "probability_distribution": {"min": 0.2, "max": 0.8, "mean": 0.5, "median": 0.5, "p50": 0.5, "p95": 0.75, "p99": 0.79},
+                "current_threshold_above_observed_max": False,
+                "retention_thresholds": {"threshold_keep_75pct": 0.25, "threshold_keep_50pct": 0.5},
+            },
         },
     }
     md = orch._build_markdown_summary(summary)
     assert "## Model Calibration Review" in md
+    assert "## Runtime Probability Distribution" in md
     assert "## Threshold Readiness" in md
     assert "Evaluations: 10" in md
     assert "Block rate: 0.4" in md
@@ -228,6 +244,7 @@ async def test_calibration_json_artifact_written(tmp_path: Path) -> None:
     assert "total_model_evaluations" in data
     assert "threshold_sweep" in data
     assert "probability_buckets" in data
+    assert "runtime_calibration" in data
     assert data["total_model_evaluations"] == 2
     assert len(data["threshold_sweep"]) == 5
 
@@ -240,3 +257,148 @@ def test_calibration_no_control_flow_change() -> None:
     result = build_model_calibration_summary(decisions, threshold_configured=0.5)
     assert result is not None
     assert "total_model_evaluations" in result
+
+
+
+
+def test_compute_retention_thresholds() -> None:
+    """Retention thresholds derived from empirical percentiles."""
+    probs = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95]
+    rec = compute_retention_thresholds(probs)
+    assert rec["threshold_keep_90pct"] <= rec["threshold_keep_75pct"]
+    assert rec["threshold_keep_75pct"] <= rec["threshold_keep_50pct"]
+    assert rec["threshold_keep_50pct"] <= rec["threshold_keep_25pct"]
+    assert rec["threshold_keep_25pct"] <= rec["threshold_keep_10pct"]
+    assert 0.05 <= rec["threshold_keep_90pct"] <= 0.25
+    assert 0.4 <= rec["threshold_keep_50pct"] <= 0.6
+
+
+def test_build_log_scale_buckets() -> None:
+    """Log-scale buckets count by magnitude."""
+    probs = [1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 0.01, 0.05, 0.2]
+    buckets = build_log_scale_buckets(probs)
+    assert len(buckets) == 7
+    lt_1e6 = next(b for b in buckets if b["bucket"] == "lt_1e_6")
+    assert lt_1e6["count"] == 1
+    gte_1e1 = next(b for b in buckets if b["bucket"] == "gte_1e_1")
+    assert gte_1e1["count"] == 1
+
+
+def test_build_runtime_calibration_stats() -> None:
+    """Runtime calibration includes distribution, percentiles, retention thresholds."""
+    probs = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    stats = build_runtime_calibration_stats(probs, current_threshold=0.45)
+    assert stats["total_shadow_evaluations"] == 9
+    dist = stats["probability_distribution"]
+    assert dist["min"] == 0.1
+    assert dist["max"] == 0.9
+    assert dist["p50"] == pytest.approx(0.5, abs=0.01)
+    assert dist["p95"] >= 0.8
+    assert stats["retention_thresholds"]["threshold_keep_50pct"] == pytest.approx(0.5, abs=0.05)
+    assert stats["current_threshold_above_observed_max"] is False
+
+
+def test_build_runtime_calibration_stats_threshold_above_max() -> None:
+    """Flag when current threshold is above observed max probability."""
+    probs = [1e-7, 2e-7, 3e-7]
+    stats = build_runtime_calibration_stats(probs, current_threshold=0.45)
+    assert stats["current_threshold_above_observed_max"] is True
+    assert stats["probability_distribution"]["max"] == 3e-7
+
+
+def test_build_runtime_calibration_stats_empty() -> None:
+    """Empty probs yields empty stats."""
+    stats = build_runtime_calibration_stats([])
+    assert stats["total_shadow_evaluations"] == 0
+    assert stats["probability_distribution"]["min"] is None
+    assert stats["current_threshold_above_observed_max"] is None
+
+
+def test_build_runtime_calibration_stats_nearly_identical() -> None:
+    """Nearly identical probs yields not_predictive_enough via promotion recommendation."""
+    probs = [0.5, 0.50001, 0.49999]
+    stats = build_runtime_calibration_stats(probs, current_threshold=0.45)
+    rec = build_promotion_recommendation(
+        current_threshold=0.45,
+        observed_max=stats["probability_distribution"]["max"],
+        observed_p95=stats["probability_distribution"]["p95"],
+        observed_p99=stats["probability_distribution"]["p99"],
+        observed_min=stats["probability_distribution"]["min"],
+        observed_mean=stats["probability_distribution"]["mean"],
+        retention_thresholds=stats["retention_thresholds"],
+    )
+    assert rec["verdict"] == "not_predictive_enough"
+
+
+def test_build_promotion_recommendation() -> None:
+    """Promotion recommendation includes verdict and suggested thresholds."""
+    rec = build_promotion_recommendation(
+        current_threshold=0.45,
+        observed_max=0.52,
+        observed_p95=0.48,
+        observed_p99=0.51,
+        retention_thresholds={
+            "threshold_keep_75pct": 0.25,
+            "threshold_keep_50pct": 0.45,
+        },
+    )
+    assert rec["current_runtime_threshold"] == 0.45
+    assert rec["observed_max_probability"] == 0.52
+    assert rec["current_threshold_realistic"] is True
+    assert rec["suggested_threshold_shadow"] == 0.25
+    assert rec["suggested_threshold_active_demo"] == 0.45
+    assert rec["verdict"] in ("remain_shadow", "active_demo_ready", "not_predictive_enough")
+
+
+@pytest.mark.asyncio
+async def test_session_summary_no_decisions_no_promotion() -> None:
+    """When no model decisions, promotion_recommendation is absent."""
+    from trading.runtime.orchestrator import RuntimeOrchestrator
+    from trading.settings import load_settings
+
+    mock_rest = MagicMock()
+    mock_ws_public = MagicMock()
+    mock_ws_private = MagicMock()
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient", return_value=mock_rest),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient", return_value=mock_ws_public),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient", return_value=mock_ws_private),
+    ):
+        orch = RuntimeOrchestrator(load_settings())
+    orch._model_shadow_decisions = []
+    summary = await orch._build_session_summary()
+    assert "promotion_recommendation" not in summary
+
+
+def test_markdown_includes_promotion_recommendation() -> None:
+    """Markdown includes Promotion Recommendation section when present."""
+    from trading.runtime.orchestrator import RuntimeOrchestrator
+    from trading.settings import load_settings
+
+    mock_rest = MagicMock()
+    mock_ws_public = MagicMock()
+    mock_ws_private = MagicMock()
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient", return_value=mock_rest),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient", return_value=mock_ws_public),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient", return_value=mock_ws_private),
+    ):
+        orch = RuntimeOrchestrator(load_settings())
+    summary = {
+        "model_calibration": {"total_model_evaluations": 5},
+        "promotion_recommendation": {
+            "current_runtime_threshold": 0.45,
+            "observed_max_probability": 0.52,
+            "observed_p95": 0.48,
+            "observed_p99": 0.51,
+            "current_threshold_realistic": True,
+            "suggested_threshold_shadow": 0.25,
+            "suggested_threshold_active_demo": 0.45,
+            "verdict": "remain_shadow",
+        },
+    }
+    md = orch._build_markdown_summary(summary)
+    assert "## Promotion Recommendation" in md
+    assert "Current runtime threshold: 0.45" in md
+    assert "Observed max probability: 0.52" in md
+    assert "Verdict: remain_shadow" in md

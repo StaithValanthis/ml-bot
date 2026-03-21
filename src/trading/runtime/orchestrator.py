@@ -55,7 +55,10 @@ from trading.runtime.drill import (
     generate_drill_order_link_id,
     validate_drill,
 )
-from trading.runtime.model_calibration import build_model_calibration_summary
+from trading.runtime.model_calibration import (
+    build_model_calibration_summary,
+    build_promotion_recommendation,
+)
 from trading.runtime.strategy_orders import ModelFilterOutcomes, StrategyOrderOutcomes
 from trading.runtime.warmup import preload_warmup_klines, WarmupResult
 from trading.storage.postgres import PostgresJournalStore
@@ -2121,6 +2124,19 @@ class RuntimeOrchestrator:
                 "prob_max": mf.prob_max,
                 "prob_latest": mf.prob_latest,
             }
+            decisions = list(self._model_shadow_decisions)
+            probs = [float(d.get("model_probability", 0)) for d in decisions if "model_probability" in d]
+            if probs:
+                from trading.runtime.model_calibration import build_runtime_calibration_stats
+                rc = build_runtime_calibration_stats(probs, current_threshold=mf.threshold)
+                model_filter_calibration["shadow_calibration"] = {
+                    "total_evaluations": rc["total_shadow_evaluations"],
+                    "prob_max": rc["probability_distribution"]["max"],
+                    "prob_p95": rc["probability_distribution"]["p95"],
+                    "prob_p99": rc["probability_distribution"]["p99"],
+                    "threshold_above_observed_max": rc["current_threshold_above_observed_max"],
+                    "retention_thresholds": rc["retention_thresholds"],
+                }
         blocking_stage = self._infer_strategy_blocking_stage(c)
         candidate_readiness = dict(self._last_candidate_readiness)
         log_payload: dict[str, object] = {
@@ -2297,12 +2313,24 @@ class RuntimeOrchestrator:
             }
             so = self._strategy_order_outcomes
             threshold_cfg = self._strategy_order_outcomes.model_filter.threshold
-            summary["model_calibration"] = build_model_calibration_summary(
+            cal = build_model_calibration_summary(
                 decisions,
                 threshold_configured=threshold_cfg,
                 session_submitted=so.intents,
                 session_filled=so.filled,
             )
+            summary["model_calibration"] = cal
+            if rc := cal.get("runtime_calibration"):
+                dist = rc.get("probability_distribution", {})
+                summary["promotion_recommendation"] = build_promotion_recommendation(
+                    current_threshold=threshold_cfg,
+                    observed_max=dist.get("max"),
+                    observed_p95=dist.get("p95"),
+                    observed_p99=dist.get("p99"),
+                    observed_min=dist.get("min"),
+                    observed_mean=dist.get("mean"),
+                    retention_thresholds=rc.get("retention_thresholds"),
+                )
         return summary
 
     def _build_markdown_summary(self, summary: dict[str, object]) -> str:
@@ -2514,6 +2542,23 @@ class RuntimeOrchestrator:
                 lines.append("- Probability buckets (sample_count | shadow_block | shadow_allow):")
                 for b in buckets:
                     lines.append(f"  - {b.get('probability_bucket', '')}: n={b.get('sample_count', 0)} block={b.get('shadow_block_count', 0)} allow={b.get('shadow_allow_count', 0)}")
+            if rc := cal.get("runtime_calibration"):
+                lines.append("")
+                lines.append("## Runtime Probability Distribution")
+                dist = rc.get("probability_distribution", {})
+                lines.append(f"- Min: {dist.get('min')} | Max: {dist.get('max')} | Mean: {dist.get('mean')} | Median: {dist.get('median')}")
+                lines.append(f"- Percentiles: p50={dist.get('p50')} p75={dist.get('p75')} p90={dist.get('p90')} p95={dist.get('p95')} p99={dist.get('p99')}")
+                lines.append(f"- Current threshold above observed max: {rc.get('current_threshold_above_observed_max')}")
+                if ret := rc.get("retention_thresholds"):
+                    lines.append("- Candidate retention thresholds (empirical):")
+                    for k, v in ret.items():
+                        if v is not None:
+                            lines.append(f"  - {k}: {v}")
+                if log_buckets := rc.get("probability_buckets_log"):
+                    lines.append("- Log-scale probability buckets:")
+                    for b in log_buckets:
+                        if b.get("count", 0) > 0:
+                            lines.append(f"  - {b.get('bucket', '')}: count={b.get('count', 0)}")
             lines.append("")
             lines.append("## Threshold Readiness")
             for row in cal.get("threshold_sweep", []):
@@ -2522,6 +2567,18 @@ class RuntimeOrchestrator:
                 wa = row.get("would_allow_count", 0)
                 br = row.get("block_rate", 0)
                 lines.append(f"- thresh={t}: would_block={wb} would_allow={wa} block_rate={br}")
+            lines.append("")
+        if pr := summary.get("promotion_recommendation"):
+            lines.append("## Promotion Recommendation")
+            lines.append(f"- Current runtime threshold: {pr.get('current_runtime_threshold')}")
+            lines.append(f"- Observed max probability: {pr.get('observed_max_probability')}")
+            lines.append(f"- Observed p95: {pr.get('observed_p95')} | p99: {pr.get('observed_p99')}")
+            lines.append(f"- Current threshold realistic (<= observed max): {pr.get('current_threshold_realistic')}")
+            if sug := pr.get("suggested_threshold_shadow"):
+                lines.append(f"- Suggested next threshold (shadow, ~75% retain): {sug}")
+            if sug := pr.get("suggested_threshold_active_demo"):
+                lines.append(f"- Suggested next threshold (active-demo, ~50% retain): {sug}")
+            lines.append(f"- **Verdict: {pr.get('verdict', 'remain_shadow')}**")
             lines.append("")
         if summary.get("abort_reasons"):
             lines.append("## Abort Reasons")

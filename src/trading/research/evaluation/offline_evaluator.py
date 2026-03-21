@@ -27,6 +27,7 @@ from trading.research.datasets.export import DecisionExportRecord
 from trading.research.evaluation.purged_cv import PurgedCVConfig, PurgedWalkForwardSplitter
 from trading.research.evaluation.threshold_analysis import (
     ThresholdMetrics,
+    compute_retention_based_recommendations,
     compute_threshold_grid,
     shadow_vs_baseline_report,
 )
@@ -226,6 +227,7 @@ class OfflineEvalResult:
     fold_results: list[FoldResult]
     aggregated_threshold_metrics: list[dict]
     shadow_vs_baseline: dict
+    retention_recommendations: dict = field(default_factory=dict)
     error: str | None = None
 
 
@@ -256,6 +258,7 @@ def run_offline_evaluation(
             fold_results=[],
             aggregated_threshold_metrics=[],
             shadow_vs_baseline={},
+            retention_recommendations={},
             error=f"dataset_path not found: {dataset_path}",
         )
     load_result = load_model_artifact(model_path)
@@ -270,6 +273,7 @@ def run_offline_evaluation(
             fold_results=[],
             aggregated_threshold_metrics=[],
             shadow_vs_baseline={},
+            retention_recommendations={},
             error=f"model load failed: {load_result.error}",
         )
     model = load_result.model
@@ -293,6 +297,7 @@ def run_offline_evaluation(
             fold_results=[],
             aggregated_threshold_metrics=[],
             shadow_vs_baseline={},
+            retention_recommendations={},
             error=str(e),
         )
     if not rows:
@@ -306,6 +311,7 @@ def run_offline_evaluation(
             fold_results=[],
             aggregated_threshold_metrics=[],
             shadow_vs_baseline={},
+            retention_recommendations={},
             error="no rows prepared from dataset",
         )
     rows_sorted = sorted(rows, key=lambda r: r.ts_utc)
@@ -329,6 +335,7 @@ def run_offline_evaluation(
             fold_results=[],
             aggregated_threshold_metrics=[],
             shadow_vs_baseline={},
+            retention_recommendations={},
             error="no folds produced (insufficient data or config)",
         )
     cv_config_dict = {
@@ -382,6 +389,9 @@ def run_offline_evaluation(
     prof_use = all_profitable if all_profitable and all(p >= 0 for p in all_profitable) else None
     aggregated = compute_threshold_grid(all_probs, all_labels, threshold_grid, prof_use)
     shadow_report = shadow_vs_baseline_report(all_probs, all_labels, threshold_grid, prof_use)
+    retention_recs = compute_retention_based_recommendations(
+        all_probs, all_labels, profitable_fill=prof_use
+    )
     return OfflineEvalResult(
         success=True,
         run_id=run_id,
@@ -398,6 +408,7 @@ def run_offline_evaluation(
             "baseline_win_rate": shadow_report.baseline_win_rate,
             "per_threshold": shadow_report.per_threshold,
         },
+        retention_recommendations=retention_recs,
     )
 
 

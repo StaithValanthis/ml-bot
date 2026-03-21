@@ -9,6 +9,7 @@ from trading.research.evaluation.purged_cv import (
 from trading.research.evaluation.threshold_analysis import (
     ShadowVsBaselineReport,
     ThresholdMetrics,
+    compute_retention_based_recommendations,
     compute_threshold_grid,
     shadow_vs_baseline_report,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "purged_splits",
     "ShadowVsBaselineReport",
     "ThresholdMetrics",
+    "compute_retention_based_recommendations",
     "compute_threshold_grid",
     "shadow_vs_baseline_report",
 ]

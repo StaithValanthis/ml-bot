@@ -16,6 +16,7 @@ from trading.research.evaluation.purged_cv import (
 )
 from trading.research.evaluation.threshold_analysis import (
     ThresholdMetrics,
+    compute_retention_based_recommendations,
     compute_threshold_grid,
     shadow_vs_baseline_report,
 )
@@ -95,6 +96,32 @@ def test_compute_threshold_grid_profitable_fill() -> None:
     grid = compute_threshold_grid(probs, labels, (0.5,), profitable_fill=profitable)
     assert len(grid) == 1
     assert grid[0].win_rate_retained == 0.5
+
+
+def test_compute_retention_based_recommendations() -> None:
+    """Retention-based recommendations produce conservative/balanced/aggressive thresholds."""
+    probs = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    labels = [0, 0, 0, 0, 1, 1, 1, 1, 1]
+    recs = compute_retention_based_recommendations(probs, labels)
+    assert "conservative" in recs
+    assert "balanced" in recs
+    assert "aggressive" in recs
+    bal = recs["balanced"]
+    assert bal["target_retain_pct"] == 0.5
+    assert "recommended_threshold" in bal
+    assert "retained_count" in bal
+    assert "filtered_count" in bal
+    assert "retain_ratio" in bal
+    assert "precision" in bal
+    assert "recall" in bal
+    assert "f1" in bal
+    assert "false_negative_risk" in bal
+
+
+def test_compute_retention_based_recommendations_empty() -> None:
+    """Empty probs yields empty recommendations."""
+    recs = compute_retention_based_recommendations([], [])
+    assert recs == {}
 
 
 def test_shadow_vs_baseline_report() -> None:
@@ -180,7 +207,10 @@ def test_report_generation(tmp_path: Path) -> None:
     assert "threshold_csv" in written or "json" in written
     assert (output_dir / f"eval_report_{result.run_id}.md").exists()
     md = (output_dir / f"eval_report_{result.run_id}.md").read_text()
-    assert "Promotion Readiness" in md
+    assert "Promotion Recommendation" in md
+    assert "Retention-Based" in md or "retention" in md.lower()
+    assert result.retention_recommendations
+    assert "conservative" in result.retention_recommendations
 
 
 def test_load_json_decision_export(tmp_path: Path) -> None:

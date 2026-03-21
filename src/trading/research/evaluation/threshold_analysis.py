@@ -161,3 +161,95 @@ def shadow_vs_baseline_report(
         baseline_win_rate=win_baseline,
         per_threshold=per_thresh,
     )
+
+
+def _percentile(sorted_arr: list[float], p: float) -> float | None:
+    """Linear interpolation percentile. p in 0-100."""
+    if not sorted_arr:
+        return None
+    n = len(sorted_arr)
+    idx = p / 100.0 * (n - 1) if n > 1 else 0
+    lo = int(idx)
+    hi = min(lo + 1, n - 1)
+    frac = idx - lo
+    return sorted_arr[lo] * (1 - frac) + sorted_arr[hi] * frac
+
+
+@dataclass(slots=True)
+class RetentionRecommendation:
+    """Single retention-based threshold recommendation."""
+
+    profile: str
+    target_retain_pct: float
+    recommended_threshold: float
+    retained_count: int
+    filtered_count: int
+    retain_ratio: float
+    positive_rate_retained: float | None
+    uplift_vs_baseline: float | None
+    false_negative_risk: float
+    precision: float
+    recall: float
+    f1: float
+
+
+def compute_retention_based_recommendations(
+    probs: list[float],
+    labels: list[int],
+    *,
+    conservative_retain: float = 0.25,
+    balanced_retain: float = 0.50,
+    aggressive_retain: float = 0.75,
+    profitable_fill: list[int] | None = None,
+) -> dict[str, dict]:
+    """
+    Compute threshold recommendations by target retention ratio.
+    conservative ~25%, balanced ~50%, aggressive ~75%.
+    Returns dict with keys conservative, balanced, aggressive.
+    """
+    n = len(probs)
+    if n != len(labels) or n == 0:
+        return {}
+    sorted_p = sorted(probs)
+    baseline_positive = sum(labels)
+    baseline_positive_rate = baseline_positive / n if n else 0.0
+    targets = [
+        ("conservative", conservative_retain),
+        ("balanced", balanced_retain),
+        ("aggressive", aggressive_retain),
+    ]
+    result: dict[str, dict] = {}
+    for profile, target_retain in targets:
+        block_pct = (1 - target_retain) * 100
+        thresh = _percentile(sorted_p, block_pct)
+        if thresh is None:
+            continue
+        retained_idx = [i for i in range(n) if probs[i] >= thresh]
+        filtered_idx = [i for i in range(n) if probs[i] < thresh]
+        retained_count = len(retained_idx)
+        filtered_count = len(filtered_idx)
+        retain_ratio = retained_count / n if n else 0.0
+        tp = sum(1 for i in retained_idx if labels[i] == 1)
+        fp = sum(1 for i in retained_idx if labels[i] == 0)
+        fn = sum(1 for i in filtered_idx if labels[i] == 1)
+        prec, rec, f1 = _precision_recall_f1(tp, fp, fn)
+        positive_rate_retained = tp / retained_count if retained_count else None
+        fn_risk = fn / (fn + tp) if (fn + tp) > 0 else 0.0
+        uplift = None
+        if positive_rate_retained is not None and baseline_positive_rate > 0:
+            uplift = (positive_rate_retained - baseline_positive_rate) / baseline_positive_rate
+        result[profile] = {
+            "profile": profile,
+            "target_retain_pct": target_retain,
+            "recommended_threshold": round(thresh, 8),
+            "retained_count": retained_count,
+            "filtered_count": filtered_count,
+            "retain_ratio": round(retain_ratio, 4),
+            "positive_rate_retained": round(positive_rate_retained, 6) if positive_rate_retained is not None else None,
+            "uplift_vs_baseline": round(uplift, 4) if uplift is not None else None,
+            "false_negative_risk": round(fn_risk, 4),
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+        }
+    return result
