@@ -37,11 +37,30 @@ class ExecutionEngine:
         qty: Decimal,
         reference_price: Decimal,
         now: datetime,
+        force_marketable: bool = False,
     ) -> OrderIntent | None:
         if signal.action not in {SignalAction.ENTER_LONG, SignalAction.ENTER_SHORT}:
             return None
         if signal.side is None or qty <= 0:
             return None
+        if force_marketable:
+            return OrderIntent(
+                symbol=signal.symbol,
+                side=signal.side,
+                qty=qty,
+                order_type=OrderType.MARKET,
+                time_in_force=TimeInForce.IOC,
+                reduce_only=False,
+                price=None,
+                order_link_id=generate_order_link_id(strategy_id=self._strategy_id, symbol=signal.symbol),
+                purpose=IntentPurpose.ENTRY,
+                created_at=now,
+                metadata={
+                    "signal_action": signal.action.value,
+                    "reason": signal.reason,
+                    "demo_force_marketable": True,
+                },
+            )
         price = self._entry_price(side=signal.side, reference=reference_price)
         return OrderIntent(
             symbol=signal.symbol,

@@ -749,7 +749,14 @@ class RuntimeOrchestrator:
                             )
                     elif prev and not prev.metadata.get("drill"):
                         so = self._strategy_order_outcomes
-                        if new_status == "PartiallyFilled" and link_id not in so._seen_partially_filled:
+                        if new_status == "New" and link_id not in so._seen_new:
+                            so._seen_new.add(link_id)
+                            self._logger.info(
+                                "strategy_order_new",
+                                order_link_id=link_id,
+                                symbol=event.symbol or "",
+                            )
+                        elif new_status == "PartiallyFilled" and link_id not in so._seen_partially_filled:
                             so._seen_partially_filled.add(link_id)
                             so.partially_filled += 1
                             self._logger.info(
@@ -1095,11 +1102,16 @@ class RuntimeOrchestrator:
                     )
                     continue
 
+                force_marketable = (
+                    self._settings.runtime.mode == RuntimeMode.DEMO
+                    and self._settings.runtime.demo_force_marketable_entries
+                )
                 intent = self._execution_engine.build_entry_intent(
                     signal=signal,
                     qty=qty,
                     reference_price=signal.reference_price,
                     now=utc_now(),
+                    force_marketable=force_marketable,
                 )
                 if intent is None:
                     continue
@@ -1947,6 +1959,7 @@ class RuntimeOrchestrator:
             log_payload["orphan_position_details"] = list(self._orphan_position_details)
         if self._settings.runtime.mode == RuntimeMode.DEMO:
             log_payload["demo_more_opportunities_enabled"] = self._settings.runtime.demo_more_opportunities_enabled
+            log_payload["demo_force_marketable_entries"] = self._settings.runtime.demo_force_marketable_entries
         if model_filter_calibration is not None:
             log_payload["model_filter_calibration"] = model_filter_calibration
         self._logger.info("runtime_summary", **log_payload)
@@ -2005,6 +2018,7 @@ class RuntimeOrchestrator:
         }
         if self._settings.runtime.mode == RuntimeMode.DEMO:
             summary["demo_more_opportunities_enabled"] = self._settings.runtime.demo_more_opportunities_enabled
+            summary["demo_force_marketable_entries"] = self._settings.runtime.demo_force_marketable_entries
         if self._health.snapshot().private_stream_error is not None:
             summary["private_stream_error"] = self._health.snapshot().private_stream_error
         if self._drill_outcome.enabled:
@@ -2098,9 +2112,14 @@ class RuntimeOrchestrator:
             f"- Blocking stage: {summary.get('blocking_stage', 'unknown')}",
             "",
         ]
-        if summary.get("mode") == "demo" and summary.get("demo_more_opportunities_enabled"):
+        if summary.get("mode") == "demo" and (
+            summary.get("demo_more_opportunities_enabled") or summary.get("demo_force_marketable_entries")
+        ):
             lines.append("## Demo Profile")
-            lines.append("- More opportunities: enabled")
+            if summary.get("demo_more_opportunities_enabled"):
+                lines.append("- More opportunities: enabled")
+            if summary.get("demo_force_marketable_entries"):
+                lines.append("- Force marketable entries: enabled (MARKET/IOC for validation)")
             lines.append("")
         if warmup := summary.get("warmup_results"):
             lines.append("## Warmup Preload")

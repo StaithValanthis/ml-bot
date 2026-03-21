@@ -34,6 +34,7 @@ class StrategyOrderOutcomes:
     rejected: int = 0
     partially_filled: int = 0
     model_filter: ModelFilterOutcomes = field(default_factory=ModelFilterOutcomes)
+    _seen_new: set[str] = field(default_factory=set)
     _seen_partially_filled: set[str] = field(default_factory=set)
     _seen_filled: set[str] = field(default_factory=set)
     _seen_cancelled: set[str] = field(default_factory=set)

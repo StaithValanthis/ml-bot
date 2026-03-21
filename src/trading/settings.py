@@ -103,6 +103,7 @@ class RuntimeSettings(BaseModel):
     demo_candidate_overrides: DemoCandidateOverrides | None = None
     demo_more_opportunities_enabled: bool = False
     demo_sizing_min_notional_usdt: Decimal | None = None
+    demo_force_marketable_entries: bool = False
     model_filter_enabled: bool = False
     model_filter_mode: ModelFilterMode = ModelFilterMode.HARD_BLOCK
     model_filter_threshold: float | None = None
@@ -417,6 +418,9 @@ def load_settings() -> AppSettings:
             runtime_cfg["demo_sizing_min_notional_usdt"] = Decimal(demo_min_notional.strip())
         except Exception:
             pass
+
+    if (force_marketable := os.getenv("TRADING_DEMO_FORCE_MARKETABLE_ENTRIES")) is not None:
+        runtime_cfg["demo_force_marketable_entries"] = force_marketable.lower() in ("true", "1", "yes")
 
     if (model_filter := os.getenv("TRADING_MODEL_FILTER_ENABLED")) is not None:
         runtime_cfg["model_filter_enabled"] = model_filter.lower() in ("true", "1", "yes")
