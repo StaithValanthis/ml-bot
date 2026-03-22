@@ -1751,6 +1751,42 @@ class RuntimeOrchestrator:
             or resolved_missing_count == len(missing_on_exchange_issues)
         )
         positions_ok = report_positions.ok
+
+        only_syncable_order_issues = all(
+            i.issue_type in ("missing_locally", "qty_mismatch") for i in report_orders.issues
+        ) if report_orders.issues else False
+        recoverable_via_missing_locally_sync = (
+            only_syncable_order_issues and positions_ok
+        )
+
+        for issue in report_orders.issues:
+            if issue.issue_type == "missing_locally":
+                self._logger.info(
+                    "reconcile_missing_locally_detected",
+                    symbol=issue.symbol or "",
+                    order_link_id=issue.order_link_id or "",
+                    order_id=issue.order_id or "",
+                    reduce_only=issue.reduce_only,
+                    qty=float(issue.qty) if issue.qty is not None else None,
+                )
+                await self._ledger.record(
+                    "reconcile_missing_locally_synced",
+                    {
+                        "symbol": issue.symbol or "",
+                        "order_link_id": issue.order_link_id or "",
+                        "order_id": issue.order_id or "",
+                        "reduce_only": issue.reduce_only,
+                        "qty": str(issue.qty) if issue.qty is not None else None,
+                        "note": "reconciler_upserted_in_same_cycle",
+                    },
+                )
+                self._logger.info(
+                    "reconcile_missing_locally_synced",
+                    symbol=issue.symbol or "",
+                    order_link_id=issue.order_link_id or "",
+                    reduce_only=issue.reduce_only,
+                )
+
         recoverable_via_missing_resolution = (
             only_missing_on_exchange and all_missing_resolved and positions_ok
         )
@@ -1776,6 +1812,47 @@ class RuntimeOrchestrator:
                     "order_issues": 0,
                     "position_issues": 0,
                     "missing_on_exchange_resolved": resolved_missing_count,
+                },
+            )
+        elif recoverable_via_missing_locally_sync:
+            self._consecutive_reconcile_mismatches = 0
+            if self._orphan_position_blocked:
+                self._orphan_position_blocked = False
+                self._metrics.inc("orphan_position_block_cleared_count")
+                self._orphan_position_details = []
+                self._logger.info("orphan_position_block_cleared", note="position_flat_or_protected")
+            missing_locally_issues = [i for i in report_orders.issues if i.issue_type == "missing_locally"]
+            all_missing_locally_reduce_only = all(
+                i.reduce_only is True for i in missing_locally_issues
+            )
+            if all_missing_locally_reduce_only and self._startup_state_blocked:
+                self._startup_state_blocked = False
+                self._metrics.inc("startup_state_block_cleared_count")
+                self._startup_state_details = []
+                self._logger.info(
+                    "startup_state_block_cleared",
+                    note="missing_locally_synced_local_state_converged",
+                )
+                self._logger.info(
+                    "startup_state_block_cleared_after_missing_locally_sync",
+                    symbols=list({i.symbol or "" for i in report_orders.issues if i.symbol}),
+                    order_link_ids=[i.order_link_id for i in report_orders.issues if i.order_link_id],
+                    startup_block_cleared=True,
+                )
+            elif not all_missing_locally_reduce_only and missing_locally_issues:
+                self._logger.info(
+                    "missing_locally_synced_startup_block_kept",
+                    reason="non_reduce_only_or_unknown",
+                    symbols=[i.symbol or "" for i in missing_locally_issues],
+                    reduce_only_flags=[i.reduce_only for i in missing_locally_issues],
+                )
+            await self._ledger.record(
+                "reconcile_ok",
+                {
+                    "order_issues": 0,
+                    "position_issues": 0,
+                    "missing_locally_synced": len(missing_locally_issues),
+                    "qty_mismatch_synced": len([i for i in report_orders.issues if i.issue_type == "qty_mismatch"]),
                 },
             )
         elif not report_orders.ok or not report_positions.ok:

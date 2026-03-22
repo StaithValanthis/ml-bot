@@ -17,6 +17,8 @@ class ReconciliationIssue:
     order_id: str | None = None
     position_size: Decimal | None = None
     position_side: str | None = None
+    reduce_only: bool | None = None
+    qty: Decimal | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -86,6 +88,8 @@ class Reconciler:
                         details=f"qty mismatch link_id={link_id} local={local.qty} remote={remote.qty}",
                         order_link_id=link_id,
                         order_id=remote.order_id,
+                        reduce_only=remote.reduce_only,
+                        qty=remote.qty,
                     )
                 )
             await self._order_manager.upsert_from_exchange_snapshot(
@@ -109,6 +113,8 @@ class Reconciler:
                         details=f"Exchange open order not tracked locally: link_id={link_id}",
                         order_link_id=link_id,
                         order_id=remote.order_id,
+                        reduce_only=remote.reduce_only,
+                        qty=remote.qty,
                     )
                 )
                 await self._order_manager.upsert_from_exchange_snapshot(
