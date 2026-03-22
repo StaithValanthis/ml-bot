@@ -69,6 +69,53 @@ async def test_ack_exchange_order_updates_order_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mark_closed_missing_on_exchange_resolves_local_order() -> None:
+    """Local open order + mark_closed_missing_on_exchange => no longer in get_open_orders."""
+    mgr = OrderManager()
+    intent = _intent(order_link_id="link-1")
+    await mgr.register_intent(intent)
+    await mgr.ack_exchange_order(
+        order_link_id="link-1",
+        order_id="ord-123",
+        updated_at=datetime.now(UTC),
+    )
+    open_before = await mgr.get_open_orders(None)
+    assert len(open_before) == 1
+    assert open_before[0].order_link_id == "link-1"
+    assert open_before[0].status == OrderStatus.NEW
+
+    ok = await mgr.mark_closed_missing_on_exchange(order_link_id="link-1")
+    assert ok is True
+
+    open_after = await mgr.get_open_orders(None)
+    assert len(open_after) == 0
+
+    by_link = await mgr.get_by_link_id("link-1")
+    assert by_link is not None
+    assert by_link.status == OrderStatus.CANCELLED
+    assert by_link.metadata.get("reconcile_terminal_reason") == "closed_missing_on_exchange"
+
+
+@pytest.mark.asyncio
+async def test_mark_closed_missing_on_exchange_idempotent_already_terminal() -> None:
+    """mark_closed_missing_on_exchange returns False for already terminal order."""
+    mgr = OrderManager()
+    intent = _intent(order_link_id="link-1")
+    await mgr.register_intent(intent)
+    await mgr.ack_exchange_order(
+        order_link_id="link-1",
+        order_id="ord-123",
+        updated_at=datetime.now(UTC),
+    )
+    order = await mgr.get_by_link_id("link-1")
+    assert order is not None
+    order.status = OrderStatus.CANCELLED
+
+    ok = await mgr.mark_closed_missing_on_exchange(order_link_id="link-1")
+    assert ok is False
+
+
+@pytest.mark.asyncio
 async def test_apply_order_update_updates_status_and_filled() -> None:
     mgr = OrderManager()
     intent = _intent(order_link_id="link-1")

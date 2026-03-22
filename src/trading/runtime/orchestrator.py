@@ -1679,7 +1679,82 @@ class RuntimeOrchestrator:
                 self._logger.warning("reconcile_failed", error=str(exc))
             return
 
-        if not report_orders.ok or not report_positions.ok:
+        missing_on_exchange_issues = [
+            i for i in report_orders.issues if i.issue_type == "missing_on_exchange"
+        ]
+        resolved_missing_count = 0
+        for issue in missing_on_exchange_issues:
+            link_id = issue.order_link_id or ""
+            self._metrics.inc("missing_on_exchange_detected_count")
+            order = await self._order_manager.get_by_link_id(link_id)
+            prev_status = order.status.value if order else "unknown"
+            if await self._order_manager.mark_closed_missing_on_exchange(
+                order_link_id=link_id, updated_at=utc_now()
+            ):
+                resolved_missing_count += 1
+                self._metrics.inc("missing_on_exchange_resolved_count")
+                payload_resolved: dict[str, object] = {
+                    "order_link_id": link_id,
+                    "order_id": issue.order_id or "",
+                    "symbol": issue.symbol or "",
+                    "previous_local_status": prev_status,
+                    "new_local_status": "Cancelled",
+                    "reason": "closed_missing_on_exchange",
+                }
+                await self._ledger.record(
+                    "reconcile_missing_on_exchange_resolved",
+                    payload_resolved,
+                )
+                self._logger.info(
+                    "local_order_closed_missing_on_exchange",
+                    order_link_id=link_id,
+                    order_id=issue.order_id or "",
+                    symbol=issue.symbol or "",
+                    previous_local_status=prev_status,
+                    new_local_status="Cancelled",
+                    reason="closed_missing_on_exchange",
+                )
+                self._logger.info(
+                    "reconcile_missing_on_exchange_resolved",
+                    **payload_resolved,
+                )
+
+        only_missing_on_exchange = all(
+            i.issue_type == "missing_on_exchange" for i in report_orders.issues
+        )
+        all_missing_resolved = (
+            len(missing_on_exchange_issues) == 0
+            or resolved_missing_count == len(missing_on_exchange_issues)
+        )
+        positions_ok = report_positions.ok
+        recoverable_via_missing_resolution = (
+            only_missing_on_exchange and all_missing_resolved and positions_ok
+        )
+
+        if recoverable_via_missing_resolution:
+            self._consecutive_reconcile_mismatches = 0
+            if self._orphan_position_blocked:
+                self._orphan_position_blocked = False
+                self._metrics.inc("orphan_position_block_cleared_count")
+                self._orphan_position_details = []
+                self._logger.info("orphan_position_block_cleared", note="position_flat_or_protected")
+            if self._startup_state_blocked:
+                self._startup_state_blocked = False
+                self._metrics.inc("startup_state_block_cleared_count")
+                self._startup_state_details = []
+                self._logger.info(
+                    "startup_state_block_cleared",
+                    note="missing_on_exchange_resolved_exchange_clean",
+                )
+            await self._ledger.record(
+                "reconcile_ok",
+                {
+                    "order_issues": 0,
+                    "position_issues": 0,
+                    "missing_on_exchange_resolved": resolved_missing_count,
+                },
+            )
+        elif not report_orders.ok or not report_positions.ok:
             self._metrics.inc("reconcile_mismatch_cycles")
             self._consecutive_reconcile_mismatches += 1
             if not self._startup_state_blocked:
@@ -2283,6 +2358,8 @@ class RuntimeOrchestrator:
             "order_state_transitions_total": int(metrics.counters.get("order_state_transitions_total", 0)),
             "reconcile_mismatch_cycles": int(metrics.counters.get("reconcile_mismatch_cycles", 0)),
             "reconcile_issues_total": int(metrics.counters.get("reconcile_issues_total", 0)),
+            "missing_on_exchange_detected_count": int(metrics.counters.get("missing_on_exchange_detected_count", 0)),
+            "missing_on_exchange_resolved_count": int(metrics.counters.get("missing_on_exchange_resolved_count", 0)),
             "staleness_incidents_total": int(metrics.counters.get("staleness_incidents_total", 0)),
             "circuit_breaker_trips_total": int(metrics.counters.get("circuit_breaker_trips_total", 0)),
             "strategy_flow": {
@@ -2439,6 +2516,7 @@ class RuntimeOrchestrator:
             f"- Acks: {summary.get('order_acks_total', 0)}",
             f"- State transitions: {summary.get('order_state_transitions_total', 0)}",
             f"- Reconcile mismatch cycles: {summary.get('reconcile_mismatch_cycles', 0)}",
+            f"- Missing on exchange detected: {summary.get('missing_on_exchange_detected_count', 0)} resolved: {summary.get('missing_on_exchange_resolved_count', 0)}",
             f"- Reconcile issues: {summary.get('reconcile_issues_total', 0)}",
             f"- Blocking stage: {summary.get('blocking_stage', 'unknown')}",
             "",

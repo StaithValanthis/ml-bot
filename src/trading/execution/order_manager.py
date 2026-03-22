@@ -92,6 +92,32 @@ class OrderManager:
                 order.order_id = order_id
                 self._by_order_id[order_id] = order
 
+    async def mark_closed_missing_on_exchange(
+        self, *, order_link_id: str, updated_at: datetime | None = None
+    ) -> bool:
+        """
+        Mark a locally tracked open order as terminal because it is no longer on exchange.
+
+        Local state convergence only. Does not cancel on exchange.
+        Status set to CANCELLED (terminal); metadata stores reconcile_terminal_reason.
+        Returns True if order was updated, False if not found or already terminal.
+        """
+        from datetime import datetime, timezone
+
+        when = updated_at or datetime.now(timezone.utc)
+        async with self._lock:
+            order = self._by_link_id.get(order_link_id)
+            if order is None:
+                return False
+            if order.status not in {OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED}:
+                return False
+            order.status = OrderStatus.CANCELLED
+            order.updated_at = when
+            meta = dict(order.metadata)
+            meta["reconcile_terminal_reason"] = "closed_missing_on_exchange"
+            order.metadata = meta
+            return True
+
     async def get_open_orders(self, symbol: str | None = None) -> list[ManagedOrder]:
         async with self._lock:
             results = [
