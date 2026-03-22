@@ -45,6 +45,7 @@ trading-bot = "trading.main:main"
 trading-backtest = "trading.backtest.run:main"
 trading-offline-train = "trading.research.training.run_offline:main"
 trading-eval = "trading.research.evaluation.cli:main"
+trading-promote-eval = "trading.runtime.promotion_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/trading"]
