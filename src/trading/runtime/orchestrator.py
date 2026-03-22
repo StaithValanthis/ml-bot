@@ -1171,19 +1171,26 @@ class RuntimeOrchestrator:
                     )
                     continue
 
-                block_result = self._should_block_new_entry(signal.symbol, open_orders)
-                if block_result is not None:
-                    blocked, reason, payload = block_result
-                    if blocked:
-                        if reason == "existing_position":
-                            self._metrics.inc("position_add_blocked_count")
-                            self._logger.info("entry_blocked_existing_position", **payload)
-                        elif reason == "existing_working_entry":
-                            self._metrics.inc("working_entry_blocked_count")
-                            self._logger.info("entry_blocked_existing_working_entry", **payload)
-                        elif reason == "max_concurrent_entries":
-                            self._logger.info("entry_blocked_max_concurrent_entries", **payload)
-                        continue
+                open_orders_fresh = await self._order_manager.get_open_orders(None)
+                blocked, block_reason, guard_payload = self._should_block_new_entry(
+                    signal.symbol, open_orders_fresh
+                )
+                diag = {
+                    **guard_payload,
+                    "blocked": blocked,
+                    "block_reason": block_reason,
+                }
+                self._logger.debug("entry_guard_evaluated", **diag)
+                if blocked:
+                    if block_reason == "existing_position":
+                        self._metrics.inc("position_add_blocked_count")
+                        self._logger.info("entry_blocked_existing_position", **guard_payload)
+                    elif block_reason == "existing_working_entry":
+                        self._metrics.inc("working_entry_blocked_count")
+                        self._logger.info("entry_blocked_existing_working_entry", **guard_payload)
+                    elif block_reason == "max_concurrent_entries":
+                        self._logger.info("entry_blocked_max_concurrent_entries", **guard_payload)
+                    continue
 
                 force_marketable = (
                     self._settings.runtime.mode == RuntimeMode.DEMO
@@ -2125,6 +2132,8 @@ class RuntimeOrchestrator:
         persistence_postgres = self._postgres_store._dsn is not None
         persistence_parquet = True
         place_orders = self._can_place_exchange_orders()
+        allow_adds = self._settings.runtime.allow_position_adds
+        max_entries = self._settings.runtime.max_concurrent_entries_per_symbol
         self._logger.info(
             "runtime_capabilities",
             private_stream=private_stream,
@@ -2133,6 +2142,9 @@ class RuntimeOrchestrator:
             place_exchange_orders=place_orders,
             dry_run=self._settings.runtime.dry_run,
             safe_mode=self._settings.risk.safe_mode,
+            entry_guard_enabled=True,
+            allow_position_adds=allow_adds,
+            max_concurrent_entries_per_symbol=max_entries,
         )
 
     def _log_durable_sinks(self) -> None:
@@ -2196,11 +2208,11 @@ class RuntimeOrchestrator:
 
     def _should_block_new_entry(
         self, symbol: str, open_orders: list
-    ) -> tuple[bool, str, dict[str, object]] | None:
+    ) -> tuple[bool, str | None, dict[str, object]]:
         """
         Entry creation guard: block new entries when symbol already has exposure or working entry.
 
-        Returns (blocked, reason, log_payload) if block, None if allow.
+        Returns (blocked, block_reason, diagnostic_payload) for every evaluation.
         """
         allow_adds = self._settings.runtime.allow_position_adds
         max_entries = self._settings.runtime.max_concurrent_entries_per_symbol
@@ -2237,7 +2249,7 @@ class RuntimeOrchestrator:
                     "existing_working_entry",
                     {**base_payload, "reason": "working_entry_order_exists"},
                 )
-            return None
+            return (False, None, base_payload)
 
         if open_entry_count >= max_entries:
             return (
@@ -2245,7 +2257,7 @@ class RuntimeOrchestrator:
                 "max_concurrent_entries",
                 {**base_payload, "reason": f"max_concurrent_entries_per_symbol={max_entries}"},
             )
-        return None
+        return (False, None, base_payload)
 
     def _infer_strategy_blocking_stage(self, m: dict[str, float]) -> str:
         """Infer which stage is blocking decisions for operator visibility."""
@@ -2285,6 +2297,7 @@ class RuntimeOrchestrator:
         equity = float(self._portfolio.equity_usdt)
         decisions = metrics_snap.counters.get("decisions_total", 0)
         c = metrics_snap.counters
+        open_orders_summary = await self._order_manager.get_open_orders(None)
         strategy_flow = {
             "bars_confirmed": int(c.get("strategy_bars_confirmed", 0)),
             "candidates": int(c.get("strategy_candidates_total", 0)),
@@ -2396,6 +2409,28 @@ class RuntimeOrchestrator:
         if pos_add_blocked > 0 or working_entry_blocked > 0:
             log_payload["position_add_blocked_count"] = pos_add_blocked
             log_payload["working_entry_blocked_count"] = working_entry_blocked
+        allow_adds = self._settings.runtime.allow_position_adds
+        max_entries = self._settings.runtime.max_concurrent_entries_per_symbol
+        log_payload["entry_guard"] = {
+            "allow_position_adds": allow_adds,
+            "max_concurrent_entries_per_symbol": max_entries,
+            "entry_guard_enabled": True,
+        }
+        by_symbol: dict[str, dict[str, object]] = {}
+        for sym in self._settings.trading.symbols:
+            sym_orders = [o for o in open_orders_summary if o.symbol == sym and not o.metadata.get("drill")]
+            entry_ct = sum(1 for o in sym_orders if not o.reduce_only)
+            exit_ct = sum(1 for o in sym_orders if o.reduce_only)
+            pos = self._portfolio.position_for(sym)
+            qty = float(pos.qty) if pos and pos.qty else 0.0
+            side = str(pos.side) if pos and pos.side else "Flat"
+            by_symbol[sym] = {
+                "open_entry_count": entry_ct,
+                "open_reduce_only_count": exit_ct,
+                "position_size": qty,
+                "position_side": side,
+            }
+        log_payload["entry_guard_by_symbol"] = by_symbol
         self._logger.info("runtime_summary", **log_payload)
 
     async def _build_session_summary(self) -> dict[str, object]:
@@ -2409,6 +2444,20 @@ class RuntimeOrchestrator:
         strategy_resting_opens = sum(
             1 for o in open_orders if not o.metadata.get("drill") and o.order_link_id != drill_link
         )
+        entry_guard_by_symbol: dict[str, dict[str, object]] = {}
+        for sym in self._settings.trading.symbols:
+            sym_orders = [o for o in open_orders if o.symbol == sym and not o.metadata.get("drill")]
+            entry_ct = sum(1 for o in sym_orders if not o.reduce_only)
+            exit_ct = sum(1 for o in sym_orders if o.reduce_only)
+            pos = self._portfolio.position_for(sym)
+            qty = float(pos.qty) if pos and pos.qty else 0.0
+            side = str(pos.side) if pos and pos.side else "Flat"
+            entry_guard_by_symbol[sym] = {
+                "open_entry_count": entry_ct,
+                "open_reduce_only_count": exit_ct,
+                "position_size": qty,
+                "position_side": side,
+            }
         summary: dict[str, object] = {
             "session_start": start.isoformat(),
             "session_end": end.isoformat(),
@@ -2434,6 +2483,12 @@ class RuntimeOrchestrator:
             "missing_on_exchange_resolved_count": int(metrics.counters.get("missing_on_exchange_resolved_count", 0)),
             "position_add_blocked_count": int(metrics.counters.get("position_add_blocked_count", 0)),
             "working_entry_blocked_count": int(metrics.counters.get("working_entry_blocked_count", 0)),
+            "entry_guard": {
+                "allow_position_adds": self._settings.runtime.allow_position_adds,
+                "max_concurrent_entries_per_symbol": self._settings.runtime.max_concurrent_entries_per_symbol,
+                "entry_guard_enabled": True,
+            },
+            "entry_guard_by_symbol": entry_guard_by_symbol,
             "staleness_incidents_total": int(metrics.counters.get("staleness_incidents_total", 0)),
             "circuit_breaker_trips_total": int(metrics.counters.get("circuit_breaker_trips_total", 0)),
             "strategy_flow": {

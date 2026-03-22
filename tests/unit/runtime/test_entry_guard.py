@@ -99,8 +99,10 @@ def test_allows_entry_when_flat_and_no_working_entry() -> None:
     orch._settings.runtime.allow_position_adds = False
     orch._settings.runtime.max_concurrent_entries_per_symbol = 1
 
-    result = orch._should_block_new_entry("BTCUSDT", [])
-    assert result is None
+    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", [])
+    assert blocked is False
+    assert block_reason is None
+    assert payload["symbol"] == "BTCUSDT"
 
 
 def test_allows_only_one_concurrent_entry_by_default() -> None:
@@ -158,8 +160,10 @@ def test_allow_position_adds_true_allows_when_under_limit() -> None:
     orch._settings.runtime.max_concurrent_entries_per_symbol = 2
 
     open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=False)]
-    result = orch._should_block_new_entry("BTCUSDT", open_orders)
-    assert result is None
+    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", open_orders)
+    assert blocked is False
+    assert block_reason is None
+    assert payload["open_entry_order_count"] == 1
 
 
 def test_drill_orders_excluded_from_guard() -> None:
@@ -168,8 +172,10 @@ def test_drill_orders_excluded_from_guard() -> None:
     orch._settings.runtime.allow_position_adds = False
 
     open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=False, drill=True)]
-    result = orch._should_block_new_entry("BTCUSDT", open_orders)
-    assert result is None
+    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", open_orders)
+    assert blocked is False
+    assert block_reason is None
+    assert payload["open_entry_order_count"] == 0
 
 
 def test_reduce_only_presence_blocks_when_allow_adds_false() -> None:
@@ -186,6 +192,40 @@ def test_reduce_only_presence_blocks_when_allow_adds_false() -> None:
     assert payload["open_reduce_only_order_count"] == 1
 
 
+def test_defaults_without_env_vars_block_repeated_adds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no TRADING_ALLOW_POSITION_ADDS or TRADING_MAX_CONCURRENT_ENTRIES_PER_SYMBOL, defaults are conservative."""
+    monkeypatch.delenv("TRADING_ALLOW_POSITION_ADDS", raising=False)
+    monkeypatch.delenv("TRADING_MAX_CONCURRENT_ENTRIES_PER_SYMBOL", raising=False)
+    settings = load_settings()
+    assert settings.runtime.allow_position_adds is False
+    assert settings.runtime.max_concurrent_entries_per_symbol == 1
+
+
+def test_guard_diagnostic_payload_has_required_fields() -> None:
+    """Guard payload includes symbol, allow_position_adds, open_entry_count, blocked, block_reason."""
+    orch = _make_orchestrator()
+    orch._settings.runtime.allow_position_adds = False
+    orch._settings.runtime.max_concurrent_entries_per_symbol = 1
+
+    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", [])
+    assert "symbol" in payload
+    assert payload["symbol"] == "BTCUSDT"
+    assert "allow_position_adds" in payload
+    assert "max_concurrent_entries_per_symbol" in payload
+    assert "current_position_size" in payload
+    assert "current_position_side" in payload
+    assert "open_entry_order_count" in payload
+    assert "open_reduce_only_order_count" in payload
+    assert blocked is False
+    assert block_reason is None
+
+    open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=False)]
+    blocked2, block_reason2, payload2 = orch._should_block_new_entry("BTCUSDT", open_orders)
+    assert blocked2 is True
+    assert block_reason2 == "existing_working_entry"
+    assert payload2["open_entry_order_count"] == 1
+
+
 @pytest.mark.asyncio
 async def test_session_summary_includes_entry_guard_counts() -> None:
     """Session summary includes position_add_blocked_count and working_entry_blocked_count when non-zero."""
@@ -196,3 +236,25 @@ async def test_session_summary_includes_entry_guard_counts() -> None:
     summary = await orch._build_session_summary()
     assert summary.get("position_add_blocked_count") == 3
     assert summary.get("working_entry_blocked_count") == 2
+
+
+@pytest.mark.asyncio
+async def test_session_summary_includes_entry_guard_config_and_by_symbol() -> None:
+    """Session summary includes entry_guard and entry_guard_by_symbol for visibility."""
+    orch = _make_orchestrator()
+
+    summary = await orch._build_session_summary()
+    entry_guard = summary.get("entry_guard")
+    assert entry_guard is not None
+    assert "allow_position_adds" in entry_guard
+    assert "max_concurrent_entries_per_symbol" in entry_guard
+    assert entry_guard.get("entry_guard_enabled") is True
+    by_symbol = summary.get("entry_guard_by_symbol")
+    assert by_symbol is not None
+    for sym in orch._settings.trading.symbols:
+        assert sym in by_symbol
+        sym_info = by_symbol[sym]
+        assert "open_entry_count" in sym_info
+        assert "open_reduce_only_count" in sym_info
+        assert "position_size" in sym_info
+        assert "position_side" in sym_info
