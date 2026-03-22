@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -300,3 +302,69 @@ def test_run_promotion_evaluation_writes_files(tmp_path: Path) -> None:
     assert md_path.exists()
     assert json_path.read_text()
     assert "promotion_verdict" in assessment
+
+
+def test_cli_valid_directory_writes_json_and_markdown(tmp_path: Path) -> None:
+    """CLI with valid --dir discovers reports, writes JSON and markdown."""
+    inp_dir = tmp_path / "summaries"
+    inp_dir.mkdir()
+    (inp_dir / "soak_report_session_20250319_100000.json").write_text(
+        '{"session_metadata":{"session_id":"s1","duration_seconds":4000},'
+        '"health_verdict":{"verdict":"PASS"},'
+        '"execution_summary":{"strategy_order_filled_count":2,"protective_exit_order_ack_received_count":2,'
+        '"protective_exit_placement_failed_count":0},"safety_summary":{},'
+        '"model_evaluation_summary":{"total_model_evaluations":15}}'
+    )
+    out_dir = tmp_path / "promotion"
+    result = subprocess.run(
+        [sys.executable, "-m", "trading.runtime.promotion_cli", "--dir", str(inp_dir), "--output-dir", str(out_dir)],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parents[3],
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert "Loaded 1 soak report" in result.stdout
+    assert "Verdict:" in result.stdout
+    assert "Wrote promotion report:" in result.stdout
+    assert out_dir.exists()
+    jsons = list(out_dir.glob("promotion_readiness_*.json"))
+    mds = list(out_dir.glob("promotion_readiness_*.md"))
+    assert len(jsons) == 1
+    assert len(mds) == 1
+    assert "promotion_verdict" in jsons[0].read_text()
+
+
+def test_cli_empty_directory_exits_nonzero(tmp_path: Path) -> None:
+    """CLI with empty directory exits non-zero."""
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    out_dir = tmp_path / "promotion"
+    result = subprocess.run(
+        [sys.executable, "-m", "trading.runtime.promotion_cli", "--dir", str(empty_dir), "--output-dir", str(out_dir)],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parents[3],
+    )
+    assert result.returncode != 0
+    assert "No soak report" in result.stderr
+
+
+def test_cli_creates_output_directory_if_missing(tmp_path: Path) -> None:
+    """CLI creates output directory when it does not exist."""
+    inp_dir = tmp_path / "summaries"
+    inp_dir.mkdir()
+    (inp_dir / "soak_report_session_20250319.json").write_text(
+        '{"session_metadata":{},"health_verdict":{"verdict":"PASS"},"execution_summary":{},'
+        '"safety_summary":{},"model_evaluation_summary":{}}'
+    )
+    out_dir = tmp_path / "new" / "nested" / "promotion"
+    assert not out_dir.exists()
+    result = subprocess.run(
+        [sys.executable, "-m", "trading.runtime.promotion_cli", "--dir", str(inp_dir), "--output-dir", str(out_dir)],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parents[3],
+    )
+    assert result.returncode == 0
+    assert out_dir.exists()
+    assert list(out_dir.glob("promotion_readiness_*.json"))
