@@ -238,6 +238,44 @@ def test_compute_verdict_not_ready_no_reports() -> None:
     assert "no_valid_soak_reports" in reasons
 
 
+def test_promotion_report_includes_dominant_reconcile_fields() -> None:
+    """Promotion assessment includes dominant_reconcile_issue_type and top_3 buckets when present."""
+    reports = [
+        _minimal_soak_report(duration_seconds=2500, filled=2, pe_ack=2, total_model_evaluations=15),
+        _minimal_soak_report(duration_seconds=2500, filled=2, pe_ack=2, total_model_evaluations=15),
+        _minimal_soak_report(duration_seconds=2500, filled=2, pe_ack=2, total_model_evaluations=15),
+    ]
+    for r in reports:
+        r["reconcile_diagnostics"] = {
+            "by_issue_type": {"missing_on_exchange": 3},
+            "by_symbol": {"BTCUSDT": 3},
+            "by_reason_bucket": {"missing_on_exchange": 3},
+        }
+        r["startup_state_diagnostics"] = {
+            "block_reason": "dirty_at_startup",
+            "cleared": True,
+            "blocked_count": 1,
+            "cleared_count": 1,
+            "uncleared_at_session_end": False,
+        }
+    assessment = build_promotion_assessment(reports, minimum_passing_sessions=3, minimum_total_duration_seconds=7200, minimum_total_fills=3, minimum_model_evaluations=10)
+    rsd = assessment.get("reconcile_and_startup_diagnostics") or {}
+    assert "dominant_reconcile_issue_type" in rsd
+    assert "dominant_reconcile_symbol" in rsd
+    assert "top_3_reconcile_issue_buckets" in rsd
+    assert rsd.get("dominant_reconcile_issue_type") == "missing_on_exchange"
+    assert rsd.get("startup_block_clear_rate") == 1.0
+
+
+def test_promotion_handles_empty_reconcile_diagnostics() -> None:
+    """Promotion assessment handles sessions with no reconcile_diagnostics."""
+    reports = [_minimal_soak_report(duration_seconds=8000, filled=5, pe_ack=5, total_model_evaluations=20)]
+    assessment = build_promotion_assessment(reports, minimum_passing_sessions=1, minimum_total_duration_seconds=1, minimum_total_fills=1, minimum_model_evaluations=1)
+    rsd = assessment.get("reconcile_and_startup_diagnostics") or {}
+    assert rsd.get("dominant_reconcile_issue_type") is None
+    assert rsd.get("sessions_with_uncleared_startup_state") == 0
+
+
 def test_run_promotion_evaluation_writes_files(tmp_path: Path) -> None:
     """run_promotion_evaluation writes JSON and markdown."""
     inp = tmp_path / "soak_report_test.json"

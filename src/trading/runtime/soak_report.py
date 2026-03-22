@@ -200,6 +200,8 @@ def build_soak_report(
             "last_orphan_position_details": summary.get("orphan_position_details") or None,
             "last_startup_state_details": summary.get("startup_state_details") or None,
         },
+        "reconcile_diagnostics": summary.get("reconcile_diagnostics"),
+        "startup_state_diagnostics": summary.get("startup_state_diagnostics"),
         "candidate_summary": {
             "final_blocking_stage": summary.get("blocking_stage") or "unknown",
             "blocking_stage_count": _blocking_stage_count(summary, flow),
@@ -396,6 +398,24 @@ def build_soak_markdown(report: dict[str, Any]) -> str:
         else:
             lines.append(f"- {k}: {v}")
     lines.append("")
+
+    if rd := report.get("reconcile_diagnostics"):
+        lines.append("## Reconcile Diagnostics")
+        lines.append(f"- Total occurrences: {rd.get('total_occurrences', 0)}")
+        lines.append(f"- Top issue type: {rd.get('top_issue_type') or '—'}")
+        lines.append(f"- Top symbol: {rd.get('top_symbol') or '—'}")
+        for b in rd.get("top_3_reason_buckets") or []:
+            lines.append(f"- {b.get('reason_bucket', '')}: {b.get('count', 0)}")
+        lines.append("")
+
+    if ssd := report.get("startup_state_diagnostics"):
+        lines.append("## Startup State Diagnostics")
+        lines.append(f"- Block reason: {ssd.get('block_reason') or '—'}")
+        lines.append(f"- Cleared: {ssd.get('cleared', False)}")
+        lines.append(f"- Uncleared at session end: {ssd.get('uncleared_at_session_end', False)}")
+        if ssd.get("final_unresolved_details"):
+            lines.append("- Final unresolved: (see JSON)")
+        lines.append("")
 
     verdict_block = report.get("health_verdict") or {}
     verdict = verdict_block.get("verdict", VERDICT_PASS)

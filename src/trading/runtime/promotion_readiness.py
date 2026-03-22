@@ -185,6 +185,44 @@ def aggregate_soak_reports(
         if _g(safety, "position_add_blocked_count", 0) > 0 or _g(safety, "working_entry_blocked_count", 0) > 0:
             repeated_position_add_attempts_present = True
 
+    sessions_with_uncleared_startup = 0
+    sessions_with_reconcile_abort = 0
+    sessions_with_startup_block = 0
+    sessions_with_startup_cleared = 0
+    reconcile_by_type: dict[str, int] = {}
+    reconcile_by_symbol: dict[str, int] = {}
+    reconcile_by_bucket: dict[str, int] = {}
+
+    for r in reports:
+        ssd = r.get("startup_state_diagnostics") or {}
+        if _g_bool(ssd, "uncleared_at_session_end"):
+            sessions_with_uncleared_startup += 1
+        if _g(ssd, "blocked_count", 0) > 0:
+            sessions_with_startup_block += 1
+        if _g(ssd, "cleared_count", 0) > 0 or _g_bool(ssd, "cleared"):
+            sessions_with_startup_cleared += 1
+        if "repeated_reconcile_mismatch" in (r.get("session_metadata") or {}).get("abort_reasons", []):
+            sessions_with_reconcile_abort += 1
+        rd = r.get("reconcile_diagnostics") or {}
+        for it, cnt in (rd.get("by_issue_type") or {}).items():
+            reconcile_by_type[it] = reconcile_by_type.get(it, 0) + cnt
+        for sym, cnt in (rd.get("by_symbol") or {}).items():
+            reconcile_by_symbol[sym] = reconcile_by_symbol.get(sym, 0) + cnt
+        for bkt, cnt in (rd.get("by_reason_bucket") or {}).items():
+            reconcile_by_bucket[bkt] = reconcile_by_bucket.get(bkt, 0) + cnt
+
+    def _top_key(d: dict[str, int]) -> str | None:
+        return max(d, key=d.get) if d else None
+
+    top_3_buckets = [
+        {"reason_bucket": k, "count": v}
+        for k, v in sorted(reconcile_by_bucket.items(), key=lambda x: -x[1])[:3]
+    ]
+    startup_block_clear_rate = (
+        round(sessions_with_startup_cleared / sessions_with_startup_block, 3)
+        if sessions_with_startup_block > 0 else None
+    )
+
     threshold_consistency = len(set(thresholds)) <= 1 if thresholds else True
 
     average_duration_seconds = total_duration_seconds / len(durations) if durations else None
@@ -230,6 +268,14 @@ def aggregate_soak_reports(
             "orphan_block_unresolved": orphan_block_unresolved,
             "repeated_reconcile_issue_present": repeated_reconcile_issue_present,
             "repeated_position_add_attempts_present": repeated_position_add_attempts_present,
+        },
+        "reconcile_and_startup_diagnostics": {
+            "dominant_reconcile_issue_type": _top_key(reconcile_by_type),
+            "dominant_reconcile_symbol": _top_key(reconcile_by_symbol),
+            "startup_block_clear_rate": startup_block_clear_rate,
+            "sessions_with_uncleared_startup_state": sessions_with_uncleared_startup,
+            "sessions_with_reconcile_abort": sessions_with_reconcile_abort,
+            "top_3_reconcile_issue_buckets": top_3_buckets,
         },
         "session_ids": [r.get("session_metadata", {}).get("session_id", "unknown") for r in reports],
     }
@@ -346,6 +392,7 @@ def build_promotion_assessment(
         assessment["execution_health"] = aggregated.get("execution_health", {})
         assessment["model_activity"] = aggregated.get("model_activity", {})
         assessment["safety_checks"] = aggregated.get("safety_checks", {})
+        assessment["reconcile_and_startup_diagnostics"] = aggregated.get("reconcile_and_startup_diagnostics", {})
         assessment["session_ids"] = aggregated.get("session_ids", [])
 
     return assessment
@@ -408,6 +455,19 @@ def build_promotion_markdown(assessment: dict[str, Any]) -> str:
     else:
         lines.append("- (no data)")
     lines.append("")
+
+    rsd = assessment.get("reconcile_and_startup_diagnostics") or {}
+    if rsd:
+        lines.append("## Reconcile & Startup Diagnostics")
+        lines.append("")
+        lines.append(f"- Dominant reconcile issue type: {rsd.get('dominant_reconcile_issue_type') or '—'}")
+        lines.append(f"- Dominant reconcile symbol: {rsd.get('dominant_reconcile_symbol') or '—'}")
+        lines.append(f"- Startup block clear rate: {rsd.get('startup_block_clear_rate') or '—'}")
+        lines.append(f"- Sessions with uncleared startup state: {rsd.get('sessions_with_uncleared_startup_state', 0)}")
+        lines.append(f"- Sessions with reconcile abort: {rsd.get('sessions_with_reconcile_abort', 0)}")
+        for b in rsd.get("top_3_reconcile_issue_buckets") or []:
+            lines.append(f"- {b.get('reason_bucket', '')}: {b.get('count', 0)}")
+        lines.append("")
 
     lines.append("## Final Recommendation")
     lines.append("")

@@ -169,6 +169,30 @@ def test_soak_report_verdict_fail_protective_exit_placement_failed() -> None:
     assert "protective_exit_failures_present" in (verdict_block.get("failures") or [])
 
 
+def test_soak_report_includes_reconcile_and_startup_diagnostics() -> None:
+    """Soak report includes reconcile_diagnostics and startup_state_diagnostics when present."""
+    summary = _minimal_session_summary(submitted=1, strategy_filled=0)
+    summary["reconcile_diagnostics"] = {
+        "total_occurrences": 5,
+        "top_issue_type": "missing_on_exchange",
+        "top_symbol": "BTCUSDT",
+        "top_3_reason_buckets": [{"reason_bucket": "missing_on_exchange", "count": 5}],
+    }
+    summary["startup_state_diagnostics"] = {
+        "block_reason": "dirty_at_startup",
+        "cleared": True,
+        "uncleared_at_session_end": False,
+    }
+    report = build_soak_report(summary, None)
+    assert report.get("reconcile_diagnostics") is not None
+    assert report["reconcile_diagnostics"]["top_issue_type"] == "missing_on_exchange"
+    assert report.get("startup_state_diagnostics") is not None
+    assert report["startup_state_diagnostics"]["block_reason"] == "dirty_at_startup"
+    md = build_soak_markdown(report)
+    assert "## Reconcile Diagnostics" in md
+    assert "## Startup State Diagnostics" in md
+
+
 def test_soak_report_json_structure() -> None:
     """Report has required top-level keys."""
     summary = _minimal_session_summary(submitted=1, strategy_filled=0)

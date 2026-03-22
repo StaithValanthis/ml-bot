@@ -177,6 +177,8 @@ class RuntimeOrchestrator:
         self._orphan_position_details: list[dict[str, object]] = []
         self._startup_state_blocked: bool = False
         self._startup_state_details: list[dict[str, object]] = []
+        self._startup_block_reason: str | None = None
+        self._reconcile_mismatch_accumulator: list[dict[str, object]] = []
         self._model_shadow_decisions: list[dict[str, object]] = []
         self._model_shadow_decisions_max: int = 100
         self._warmup_results: list[WarmupResult] = []
@@ -1644,7 +1646,7 @@ class RuntimeOrchestrator:
             reduce_only_count = sum(1 for o in sym_orders if o.reduce_only)
             non_reduce_only_count = len(sym_orders) - reduce_only_count
             order_count = len(sym_orders)
-            sym_dirty = non_flat or order_count > 0
+            sym_dirty = non_flat or (non_reduce_only_count > 0)
             if sym_dirty:
                 dirty = True
                 d: dict[str, object] = {
@@ -1667,6 +1669,7 @@ class RuntimeOrchestrator:
                 self._metrics.inc("startup_state_blocked_count")
             self._startup_state_blocked = True
             self._startup_state_details = details
+            self._startup_block_reason = "dirty_at_startup"
             self._logger.warning(
                 "startup_state_blocked",
                 details_count=len(details),
@@ -1778,11 +1781,20 @@ class RuntimeOrchestrator:
         elif not report_orders.ok or not report_positions.ok:
             self._metrics.inc("reconcile_mismatch_cycles")
             self._consecutive_reconcile_mismatches += 1
+            now_ts = utc_now().isoformat()
+            for issue in report_orders.issues + report_positions.issues:
+                self._reconcile_mismatch_accumulator.append({
+                    "issue_type": issue.issue_type,
+                    "symbol": issue.symbol,
+                    "details": issue.details,
+                    "occurred_at": now_ts,
+                })
             if not self._startup_state_blocked:
                 self._metrics.inc("startup_state_blocked_count")
             self._startup_state_blocked = True
             orphan_issues = [i for i in report_positions.issues if i.issue_type == "missing_reduce_only_exit"]
             if orphan_issues:
+                self._startup_block_reason = "reconcile_missing_reduce_only_exit"
                 self._startup_state_details = [
                     {
                         "symbol": i.symbol or "unknown",
@@ -1791,6 +1803,18 @@ class RuntimeOrchestrator:
                         "reason": "reconcile_missing_reduce_only_exit",
                     }
                     for i in orphan_issues
+                ]
+            elif report_orders.issues:
+                self._startup_block_reason = "reconcile_order_mismatch"
+                issue_types = {}
+                for i in report_orders.issues:
+                    issue_types[i.issue_type] = issue_types.get(i.issue_type, 0) + 1
+                self._startup_state_details = [
+                    {
+                        "reason": "reconcile_order_mismatch",
+                        "issue_types": issue_types,
+                        "affected_symbols": list({i.symbol or "_unknown_" for i in report_orders.issues}),
+                    }
                 ]
             if orphan_issues:
                 if not self._orphan_position_blocked:
@@ -1854,6 +1878,12 @@ class RuntimeOrchestrator:
                 affected_order_link_ids=affected_link_ids if affected_link_ids else None,
                 affected_order_ids=affected_order_ids if affected_order_ids else None,
             )
+            from trading.runtime.reconcile_diagnostics import bucket_details
+            by_bucket: dict[str, int] = {}
+            for i in order_issues + position_issues:
+                b = bucket_details(i.details)
+                by_bucket[b] = by_bucket.get(b, 0) + 1
+            self._logger.info("reconcile_issue_bucketed", by_reason_bucket=by_bucket)
             recovery_note = (
                 "local_synced_from_exchange_for_missing_locally_qty_mismatch; "
                 "no_auto_cancel_for_missing_on_exchange; no_auto_place_implemented"
@@ -2554,6 +2584,21 @@ class RuntimeOrchestrator:
         if self._startup_state_blocked:
             summary["startup_state_blocked"] = True
             summary["startup_state_details"] = list(self._startup_state_details)
+        startup_blocked_count = int(metrics.counters.get("startup_state_blocked_count", 0))
+        startup_cleared_count = int(metrics.counters.get("startup_state_block_cleared_count", 0))
+        if startup_blocked_count > 0 or self._startup_state_blocked:
+            summary["startup_state_diagnostics"] = {
+                "block_reason": self._startup_block_reason,
+                "cleared": startup_cleared_count > 0 or not self._startup_state_blocked,
+                "blocked_count": startup_blocked_count,
+                "cleared_count": startup_cleared_count,
+                "uncleared_at_session_end": self._startup_state_blocked,
+                "final_unresolved_details": list(self._startup_state_details) if self._startup_state_blocked else None,
+            }
+        if self._reconcile_mismatch_accumulator:
+            from trading.runtime.reconcile_diagnostics import aggregate_reconcile_issues, build_reconcile_diagnostics_summary
+            agg = aggregate_reconcile_issues(self._reconcile_mismatch_accumulator)
+            summary["reconcile_diagnostics"] = build_reconcile_diagnostics_summary(agg)
         if self._startup_auth_disabled:
             summary["startup_auth_disabled"] = True
         summary["strategy_order_outcomes"] = {
@@ -2884,6 +2929,13 @@ class RuntimeOrchestrator:
         if self._settings.runtime.mode not in {RuntimeMode.PAPER, RuntimeMode.DEMO}:
             return
         summary = await self._build_session_summary()
+        if summary.get("startup_state_blocked"):
+            diag = summary.get("startup_state_diagnostics") or {}
+            self._logger.warning(
+                "startup_state_uncleared_at_session_end",
+                block_reason=diag.get("block_reason"),
+                final_unresolved_details=diag.get("final_unresolved_details"),
+            )
         root = Path(self._parquet_store._root_dir)
         root.mkdir(parents=True, exist_ok=True)
         start = self._session_start_time or utc_now()
