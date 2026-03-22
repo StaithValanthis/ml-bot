@@ -194,6 +194,8 @@ def build_soak_report(
             "reconcile_mismatch_detected_count": reconcile_cycles,
             "missing_on_exchange_detected_count": int(counters.get("missing_on_exchange_detected_count", 0)),
             "missing_on_exchange_resolved_count": int(counters.get("missing_on_exchange_resolved_count", 0)),
+            "position_add_blocked_count": int(counters.get("position_add_blocked_count", 0)),
+            "working_entry_blocked_count": int(counters.get("working_entry_blocked_count", 0)),
             "repeated_reconcile_mismatch_triggered": "repeated_reconcile_mismatch" in abort_reasons,
             "last_orphan_position_details": summary.get("orphan_position_details") or None,
             "last_startup_state_details": summary.get("startup_state_details") or None,

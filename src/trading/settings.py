@@ -109,6 +109,15 @@ class RuntimeSettings(BaseModel):
     model_filter_mode: ModelFilterMode = ModelFilterMode.HARD_BLOCK
     model_filter_threshold: float | None = None
     model_artifact_path: Path | None = None
+    allow_position_adds: bool = False
+    max_concurrent_entries_per_symbol: int = 1
+
+    @field_validator("max_concurrent_entries_per_symbol")
+    @classmethod
+    def _validate_max_concurrent_entries(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("max_concurrent_entries_per_symbol must be >= 1")
+        return value
 
     @field_validator("timezone")
     @classmethod
@@ -450,6 +459,14 @@ def load_settings() -> AppSettings:
     if (model_path := os.getenv("TRADING_MODEL_ARTIFACT_PATH")) is not None:
         p = Path(model_path.strip())
         runtime_cfg["model_artifact_path"] = p if p else None
+
+    if (allow_adds := os.getenv("TRADING_ALLOW_POSITION_ADDS")) is not None:
+        runtime_cfg["allow_position_adds"] = allow_adds.lower() in ("true", "1", "yes")
+    if (max_entries := os.getenv("TRADING_MAX_CONCURRENT_ENTRIES_PER_SYMBOL")) is not None:
+        try:
+            runtime_cfg["max_concurrent_entries_per_symbol"] = int(max_entries.strip())
+        except ValueError:
+            pass
 
     if env.log_level is not None:
         data.setdefault("logging", {})["level"] = env.log_level

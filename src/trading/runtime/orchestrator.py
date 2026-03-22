@@ -1171,6 +1171,20 @@ class RuntimeOrchestrator:
                     )
                     continue
 
+                block_result = self._should_block_new_entry(signal.symbol, open_orders)
+                if block_result is not None:
+                    blocked, reason, payload = block_result
+                    if blocked:
+                        if reason == "existing_position":
+                            self._metrics.inc("position_add_blocked_count")
+                            self._logger.info("entry_blocked_existing_position", **payload)
+                        elif reason == "existing_working_entry":
+                            self._metrics.inc("working_entry_blocked_count")
+                            self._logger.info("entry_blocked_existing_working_entry", **payload)
+                        elif reason == "max_concurrent_entries":
+                            self._logger.info("entry_blocked_max_concurrent_entries", **payload)
+                        continue
+
                 force_marketable = (
                     self._settings.runtime.mode == RuntimeMode.DEMO
                     and self._settings.runtime.demo_force_marketable_entries
@@ -2180,6 +2194,59 @@ class RuntimeOrchestrator:
             dry_run=dry_run,
         )
 
+    def _should_block_new_entry(
+        self, symbol: str, open_orders: list
+    ) -> tuple[bool, str, dict[str, object]] | None:
+        """
+        Entry creation guard: block new entries when symbol already has exposure or working entry.
+
+        Returns (blocked, reason, log_payload) if block, None if allow.
+        """
+        allow_adds = self._settings.runtime.allow_position_adds
+        max_entries = self._settings.runtime.max_concurrent_entries_per_symbol
+        sym_orders = [o for o in open_orders if o.symbol == symbol and not o.metadata.get("drill")]
+        entry_orders = [o for o in sym_orders if not o.reduce_only]
+        exit_orders = [o for o in sym_orders if o.reduce_only]
+        open_entry_count = len(entry_orders)
+        open_exit_count = len(exit_orders)
+
+        pos = self._portfolio.position_for(symbol)
+        current_position_size = float(pos.qty) if pos and pos.qty else 0.0
+        current_position_side = str(pos.side) if pos and pos.side else "Flat"
+
+        base_payload: dict[str, object] = {
+            "symbol": symbol,
+            "current_position_size": current_position_size,
+            "current_position_side": current_position_side,
+            "open_entry_order_count": open_entry_count,
+            "open_reduce_only_order_count": open_exit_count,
+            "allow_position_adds": allow_adds,
+            "max_concurrent_entries_per_symbol": max_entries,
+        }
+
+        if not allow_adds:
+            if current_position_size != 0 or open_exit_count > 0:
+                return (
+                    True,
+                    "existing_position",
+                    {**base_payload, "reason": "non_flat_position_or_managed_exit"},
+                )
+            if open_entry_count > 0:
+                return (
+                    True,
+                    "existing_working_entry",
+                    {**base_payload, "reason": "working_entry_order_exists"},
+                )
+            return None
+
+        if open_entry_count >= max_entries:
+            return (
+                True,
+                "max_concurrent_entries",
+                {**base_payload, "reason": f"max_concurrent_entries_per_symbol={max_entries}"},
+            )
+        return None
+
     def _infer_strategy_blocking_stage(self, m: dict[str, float]) -> str:
         """Infer which stage is blocking decisions for operator visibility."""
         if self._startup_state_blocked:
@@ -2324,6 +2391,11 @@ class RuntimeOrchestrator:
             log_payload["demo_force_marketable_entries"] = self._settings.runtime.demo_force_marketable_entries
         if model_filter_calibration is not None:
             log_payload["model_filter_calibration"] = model_filter_calibration
+        pos_add_blocked = int(c.get("position_add_blocked_count", 0))
+        working_entry_blocked = int(c.get("working_entry_blocked_count", 0))
+        if pos_add_blocked > 0 or working_entry_blocked > 0:
+            log_payload["position_add_blocked_count"] = pos_add_blocked
+            log_payload["working_entry_blocked_count"] = working_entry_blocked
         self._logger.info("runtime_summary", **log_payload)
 
     async def _build_session_summary(self) -> dict[str, object]:
@@ -2360,6 +2432,8 @@ class RuntimeOrchestrator:
             "reconcile_issues_total": int(metrics.counters.get("reconcile_issues_total", 0)),
             "missing_on_exchange_detected_count": int(metrics.counters.get("missing_on_exchange_detected_count", 0)),
             "missing_on_exchange_resolved_count": int(metrics.counters.get("missing_on_exchange_resolved_count", 0)),
+            "position_add_blocked_count": int(metrics.counters.get("position_add_blocked_count", 0)),
+            "working_entry_blocked_count": int(metrics.counters.get("working_entry_blocked_count", 0)),
             "staleness_incidents_total": int(metrics.counters.get("staleness_incidents_total", 0)),
             "circuit_breaker_trips_total": int(metrics.counters.get("circuit_breaker_trips_total", 0)),
             "strategy_flow": {
@@ -2517,6 +2591,7 @@ class RuntimeOrchestrator:
             f"- State transitions: {summary.get('order_state_transitions_total', 0)}",
             f"- Reconcile mismatch cycles: {summary.get('reconcile_mismatch_cycles', 0)}",
             f"- Missing on exchange detected: {summary.get('missing_on_exchange_detected_count', 0)} resolved: {summary.get('missing_on_exchange_resolved_count', 0)}",
+            f"- Entry guards: position_add_blocked={summary.get('position_add_blocked_count', 0)} working_entry_blocked={summary.get('working_entry_blocked_count', 0)}",
             f"- Reconcile issues: {summary.get('reconcile_issues_total', 0)}",
             f"- Blocking stage: {summary.get('blocking_stage', 'unknown')}",
             "",
