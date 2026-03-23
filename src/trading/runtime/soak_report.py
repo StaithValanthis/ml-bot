@@ -199,6 +199,24 @@ def build_soak_report(
             "repeated_reconcile_mismatch_triggered": "repeated_reconcile_mismatch" in abort_reasons,
             "last_orphan_position_details": summary.get("orphan_position_details") or None,
             "last_startup_state_details": summary.get("startup_state_details") or None,
+            "entry_guard_block_reasons_by_type": (summary.get("entry_guard_block_reasons") or {}).get("by_type", {}),
+            "entry_guard_symbol_block_breakdown": (summary.get("entry_guard_block_reasons") or {}).get("by_symbol", {}),
+            "entry_guard_reentry_allowed_flat_stale_exit_count": int(
+                summary.get("entry_guard_reentry_allowed_flat_stale_exit_count")
+                or counters.get("entry_guard_reentry_allowed_flat_stale_exit_count", 0)
+                or 0
+            ),
+        },
+        "entry_guard_summary": {
+            "position_add_blocked_count": int(counters.get("position_add_blocked_count", 0)),
+            "working_entry_blocked_count": int(counters.get("working_entry_blocked_count", 0)),
+            "total_model_allowed_but_entry_guard_blocked": (
+                model_allowed
+                if (model_filter_reached > 0 and submitted == 0 and model_allowed > 0)
+                else None
+            ),
+            "block_reasons_by_type": (summary.get("entry_guard_block_reasons") or {}).get("by_type", {}),
+            "symbol_block_breakdown": (summary.get("entry_guard_block_reasons") or {}).get("by_symbol", {}),
         },
         "reconcile_diagnostics": summary.get("reconcile_diagnostics"),
         "startup_state_diagnostics": summary.get("startup_state_diagnostics"),

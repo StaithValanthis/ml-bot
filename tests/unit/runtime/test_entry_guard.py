@@ -118,17 +118,18 @@ def test_allows_only_one_concurrent_entry_by_default() -> None:
     assert reason in ("existing_working_entry", "existing_position")
 
 
-def test_respects_allow_position_adds_false() -> None:
-    """When allow_position_adds=False, any position or working entry blocks."""
+def test_flat_with_stale_reduce_only_allows_entry() -> None:
+    """When position is flat, stale local reduce-only does NOT block (avoids permanent block)."""
     orch = _make_orchestrator()
     orch._settings.runtime.allow_position_adds = False
+    orch._portfolio.positions = {}
 
     open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=True)]
-    result = orch._should_block_new_entry("BTCUSDT", open_orders)
-    assert result is not None
-    blocked, reason, _ = result
-    assert blocked is True
-    assert reason == "existing_position"
+    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", open_orders)
+    assert blocked is False
+    assert block_reason is None
+    assert payload["current_position_size"] == 0.0
+    assert payload["open_reduce_only_order_count"] == 1
 
 
 def test_respects_allow_position_adds_true_plus_max_concurrent() -> None:
@@ -178,17 +179,27 @@ def test_drill_orders_excluded_from_guard() -> None:
     assert payload["open_entry_order_count"] == 0
 
 
-def test_reduce_only_presence_blocks_when_allow_adds_false() -> None:
-    """Reduce-only exit order presence blocks (managed position) when allow_position_adds=False."""
+def test_non_flat_position_with_reduce_only_still_blocks() -> None:
+    """Real non-flat position still blocks even when reduce-only exists (managed exit)."""
     orch = _make_orchestrator()
     orch._settings.runtime.allow_position_adds = False
+    from trading.risk.portfolio_state import PositionRiskView
+
+    orch._portfolio.positions["BTCUSDT"] = PositionRiskView(
+        symbol="BTCUSDT",
+        side=PositionSide.LONG,
+        qty=Decimal("0.01"),
+        entry_price=Decimal("60000"),
+        mark_price=Decimal("60100"),
+        leverage=Decimal("1"),
+        liquidation_price=None,
+    )
 
     open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=True)]
-    result = orch._should_block_new_entry("BTCUSDT", open_orders)
-    assert result is not None
-    blocked, reason, payload = result
+    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", open_orders)
     assert blocked is True
-    assert reason == "existing_position"
+    assert block_reason == "existing_position"
+    assert payload["current_position_size"] == 0.01
     assert payload["open_reduce_only_order_count"] == 1
 
 
@@ -258,3 +269,36 @@ async def test_session_summary_includes_entry_guard_config_and_by_symbol() -> No
         assert "open_reduce_only_count" in sym_info
         assert "position_size" in sym_info
         assert "position_side" in sym_info
+
+
+def test_guard_payload_has_local_tracked_order_count() -> None:
+    """Guard payload includes local_tracked_order_count for diagnostics."""
+    orch = _make_orchestrator()
+    orch._settings.runtime.allow_position_adds = False
+
+    _, _, payload = orch._should_block_new_entry("BTCUSDT", [])
+    assert "local_tracked_order_count" in payload
+    assert payload["local_tracked_order_count"] == 0
+
+    open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=True)]
+    _, _, payload2 = orch._should_block_new_entry("BTCUSDT", open_orders)
+    assert payload2["local_tracked_order_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_session_summary_includes_entry_guard_block_reasons() -> None:
+    """Session summary includes entry_guard_block_reasons aggregation for soak diagnostics."""
+    orch = _make_orchestrator()
+    orch._entry_guard_block_reasons = [
+        {"symbol": "BTCUSDT", "block_reason": "existing_position", "block_reason_bucket": "existing_position"},
+        {"symbol": "BTCUSDT", "block_reason": "existing_position", "block_reason_bucket": "existing_position"},
+        {"symbol": "ETHUSDT", "block_reason": "existing_working_entry", "block_reason_bucket": "existing_working_entry"},
+    ]
+
+    summary = await orch._build_session_summary()
+    block_reasons = summary.get("entry_guard_block_reasons")
+    assert block_reasons is not None
+    assert block_reasons.get("by_type", {}).get("existing_position") == 2
+    assert block_reasons.get("by_type", {}).get("existing_working_entry") == 1
+    assert block_reasons.get("by_symbol", {}).get("BTCUSDT", {}).get("existing_position") == 2
+    assert block_reasons.get("by_symbol", {}).get("ETHUSDT", {}).get("existing_working_entry") == 1

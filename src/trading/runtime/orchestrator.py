@@ -179,6 +179,7 @@ class RuntimeOrchestrator:
         self._startup_state_details: list[dict[str, object]] = []
         self._startup_block_reason: str | None = None
         self._reconcile_mismatch_accumulator: list[dict[str, object]] = []
+        self._entry_guard_block_reasons: list[dict[str, object]] = []
         self._model_shadow_decisions: list[dict[str, object]] = []
         self._model_shadow_decisions_max: int = 100
         self._warmup_results: list[WarmupResult] = []
@@ -1184,14 +1185,38 @@ class RuntimeOrchestrator:
                 }
                 self._logger.debug("entry_guard_evaluated", **diag)
                 if blocked:
+                    block_bucket = guard_payload.get("block_reason_bucket", block_reason or "unknown")
+                    self._entry_guard_block_reasons.append({
+                        "symbol": signal.symbol,
+                        "block_reason": block_reason,
+                        "block_reason_bucket": block_bucket,
+                        "current_position_size": guard_payload.get("current_position_size"),
+                        "open_entry_count": guard_payload.get("open_entry_order_count"),
+                        "open_reduce_only_count": guard_payload.get("open_reduce_only_order_count"),
+                    })
                     if block_reason == "existing_position":
                         self._metrics.inc("position_add_blocked_count")
-                        self._logger.info("entry_blocked_existing_position", **guard_payload)
+                        self._metrics.inc("entry_guard_block_non_flat_count")
+                        self._logger.info(
+                            "entry_blocked_existing_position",
+                            **guard_payload,
+                            block_reason_bucket=block_bucket,
+                        )
                     elif block_reason == "existing_working_entry":
                         self._metrics.inc("working_entry_blocked_count")
-                        self._logger.info("entry_blocked_existing_working_entry", **guard_payload)
+                        self._metrics.inc("entry_guard_block_working_entry_count")
+                        self._logger.info(
+                            "entry_blocked_existing_working_entry",
+                            **guard_payload,
+                            block_reason_bucket=block_bucket,
+                        )
                     elif block_reason == "max_concurrent_entries":
-                        self._logger.info("entry_blocked_max_concurrent_entries", **guard_payload)
+                        self._metrics.inc("entry_guard_block_max_concurrent_count")
+                        self._logger.info(
+                            "entry_blocked_max_concurrent_entries",
+                            **guard_payload,
+                            block_reason_bucket=block_bucket,
+                        )
                     continue
 
                 force_marketable = (
@@ -2319,6 +2344,10 @@ class RuntimeOrchestrator:
         """
         Entry creation guard: block new entries when symbol already has exposure or working entry.
 
+        When position is flat, stale local reduce-only orders (e.g. filled/cancelled but not yet
+        synced) do NOT block: portfolio is authoritative from exchange refresh, so flat + any
+        tracked reduce-only implies those orders are inert and re-entry is allowed.
+
         Returns (blocked, block_reason, diagnostic_payload) for every evaluation.
         """
         allow_adds = self._settings.runtime.allow_position_adds
@@ -2339,32 +2368,48 @@ class RuntimeOrchestrator:
             "current_position_side": current_position_side,
             "open_entry_order_count": open_entry_count,
             "open_reduce_only_order_count": open_exit_count,
+            "local_tracked_order_count": len(sym_orders),
             "allow_position_adds": allow_adds,
             "max_concurrent_entries_per_symbol": max_entries,
         }
 
         if not allow_adds:
-            if current_position_size != 0 or open_exit_count > 0:
-                return (
-                    True,
-                    "existing_position",
-                    {**base_payload, "reason": "non_flat_position_or_managed_exit"},
+            if current_position_size != 0:
+                block_payload = {**base_payload, "reason": "non_flat_position", "block_reason_bucket": "existing_position"}
+                return (True, "existing_position", block_payload)
+            if open_exit_count > 0 and current_position_size == 0:
+                self._logger.info(
+                    "entry_guard_allows_reentry_after_flatten",
+                    symbol=symbol,
+                    position_size=current_position_size,
+                    position_side=current_position_side,
+                    open_reduce_only_count=open_exit_count,
+                    block_reason_bucket="flat_with_stale_exit_allowed",
                 )
+                self._metrics.inc("entry_guard_reentry_allowed_flat_stale_exit_count")
             if open_entry_count > 0:
-                return (
-                    True,
-                    "existing_working_entry",
-                    {**base_payload, "reason": "working_entry_order_exists"},
-                )
+                block_payload = {**base_payload, "reason": "working_entry_order_exists", "block_reason_bucket": "existing_working_entry"}
+                return (True, "existing_working_entry", block_payload)
             return (False, None, base_payload)
 
         if open_entry_count >= max_entries:
-            return (
-                True,
-                "max_concurrent_entries",
-                {**base_payload, "reason": f"max_concurrent_entries_per_symbol={max_entries}"},
-            )
+            block_payload = {**base_payload, "reason": f"max_concurrent_entries_per_symbol={max_entries}", "block_reason_bucket": "max_concurrent_entries"}
+            return (True, "max_concurrent_entries", block_payload)
         return (False, None, base_payload)
+
+    def _aggregate_entry_guard_block_reasons(self) -> dict[str, int]:
+        """Aggregate block reasons from session accumulator for soak diagnostics."""
+        by_type: dict[str, int] = {}
+        by_symbol: dict[str, dict[str, int]] = {}
+        for r in self._entry_guard_block_reasons:
+            bucket = str(r.get("block_reason_bucket", r.get("block_reason", "unknown")))
+            by_type[bucket] = by_type.get(bucket, 0) + 1
+            sym = str(r.get("symbol", ""))
+            if sym:
+                if sym not in by_symbol:
+                    by_symbol[sym] = {}
+                by_symbol[sym][bucket] = by_symbol[sym].get(bucket, 0) + 1
+        return {"by_type": by_type, "by_symbol": by_symbol}
 
     def _infer_strategy_blocking_stage(self, m: dict[str, float]) -> str:
         """Infer which stage is blocking decisions for operator visibility."""
@@ -2596,6 +2641,8 @@ class RuntimeOrchestrator:
                 "entry_guard_enabled": True,
             },
             "entry_guard_by_symbol": entry_guard_by_symbol,
+            "entry_guard_block_reasons": self._aggregate_entry_guard_block_reasons(),
+            "entry_guard_reentry_allowed_flat_stale_exit_count": int(metrics.counters.get("entry_guard_reentry_allowed_flat_stale_exit_count", 0)),
             "staleness_incidents_total": int(metrics.counters.get("staleness_incidents_total", 0)),
             "circuit_breaker_trips_total": int(metrics.counters.get("circuit_breaker_trips_total", 0)),
             "strategy_flow": {
