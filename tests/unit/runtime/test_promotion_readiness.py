@@ -29,15 +29,19 @@ def _minimal_soak_report(
     abort_reasons: list[str] | None = None,
     filled: int = 1,
     pe_ack: int = 1,
+    pe_submitted: int | None = None,
     pe_failed: int = 0,
     duration_seconds: float = 3600.0,
     total_model_evaluations: int = 20,
     model_allowed: int = 10,
     submitted: int = 5,
+    session_id: str | None = None,
 ) -> dict:
+    pe_sub = pe_submitted if pe_submitted is not None else filled
+    sid = session_id or "session_20250319_100000"
     return {
         "session_metadata": {
-            "session_id": "session_20250319_100000",
+            "session_id": sid,
             "mode": "demo",
             "symbols": ["BTCUSDT"],
             "started_at": "2025-03-19T10:00:00+00:00",
@@ -58,6 +62,7 @@ def _minimal_soak_report(
             "strategy_order_submitted_count": submitted,
             "strategy_order_filled_count": filled,
             "entry_fill_received_count": filled,
+            "protective_exit_order_submitted_count": pe_sub,
             "protective_exit_order_ack_received_count": pe_ack,
             "protective_exit_placement_failed_count": pe_failed,
         },
@@ -92,9 +97,9 @@ def test_not_ready_when_single_fail_soak_exists() -> None:
 
 
 def test_not_ready_when_fill_gt_protective_exit_ack() -> None:
-    """NOT_READY when fills > protective_exit ack."""
+    """NOT_READY when fills > protective_exit submitted (hard failure)."""
     reports = [
-        _minimal_soak_report(filled=3, pe_ack=2, verdict="PASS_WITH_WARNINGS"),
+        _minimal_soak_report(filled=3, pe_ack=2, pe_submitted=2, verdict="PASS_WITH_WARNINGS"),
     ]
     assessment = build_promotion_assessment(reports)
     verdict_block = assessment.get("promotion_verdict") or {}
@@ -116,8 +121,8 @@ def test_not_ready_when_protective_exit_placement_failed() -> None:
 def test_continue_demo_soak_when_sample_size_too_small() -> None:
     """CONTINUE_DEMO_SOAK when no hard failures but passing sessions < minimum."""
     reports = [
-        _minimal_soak_report(duration_seconds=1000, total_model_evaluations=5, filled=1),
-        _minimal_soak_report(duration_seconds=1000, total_model_evaluations=5, filled=1),
+        _minimal_soak_report(duration_seconds=1000, total_model_evaluations=5, filled=1, session_id="session_a"),
+        _minimal_soak_report(duration_seconds=1000, total_model_evaluations=5, filled=1, session_id="session_b"),
     ]
     assessment = build_promotion_assessment(
         reports,
@@ -368,3 +373,107 @@ def test_cli_creates_output_directory_if_missing(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert out_dir.exists()
     assert list(out_dir.glob("promotion_readiness_*.json"))
+
+
+def test_unresolved_startup_state_not_emitted_when_clear_rate_one_and_uncleared_zero() -> None:
+    """unresolved_startup_state must not be present when startup_block_clear_rate==1.0 and sessions_with_uncleared_startup_state==0."""
+    reports = [
+        _minimal_soak_report(duration_seconds=4000, filled=2, pe_ack=2, session_id="s1"),
+        _minimal_soak_report(duration_seconds=4000, filled=2, pe_ack=2, session_id="s2"),
+    ]
+    for r in reports:
+        r["startup_state_diagnostics"] = {
+            "block_reason": "dirty_at_startup",
+            "cleared": True,
+            "blocked_count": 1,
+            "cleared_count": 1,
+            "uncleared_at_session_end": False,
+        }
+    assessment = build_promotion_assessment(
+        reports,
+        minimum_passing_sessions=2,
+        minimum_total_duration_seconds=1000,
+        minimum_total_fills=2,
+        minimum_model_evaluations=1,
+    )
+    verdict_block = assessment.get("promotion_verdict") or {}
+    reasons = verdict_block.get("reasons") or []
+    rsd = assessment.get("reconcile_and_startup_diagnostics") or {}
+    safety = assessment.get("safety_checks") or {}
+    attr = assessment.get("reason_attribution") or {}
+    assert rsd.get("startup_block_clear_rate") == 1.0
+    assert rsd.get("sessions_with_uncleared_startup_state") == 0
+    assert "unresolved_startup_state" not in reasons
+    assert safety.get("startup_state_not_clearing") is False
+    assert attr.get("sessions_causing_unresolved_startup_state") == []
+
+
+def test_per_reason_session_attribution_in_json() -> None:
+    """Per-reason session attribution appears in JSON assessment."""
+    reports = [
+        _minimal_soak_report(verdict="FAIL", session_id="fail_session"),
+        _minimal_soak_report(filled=3, pe_submitted=2, pe_ack=2, session_id="fill_gap_session"),
+    ]
+    assessment = build_promotion_assessment(reports)
+    attr = assessment.get("reason_attribution") or {}
+    assert "sessions_causing_any_fail_soak_report" in attr
+    assert "fail_session" in attr["sessions_causing_any_fail_soak_report"]
+    assert "sessions_causing_fills_without_protective_exit_ack" in attr
+    assert "fill_gap_session" in attr["sessions_causing_fills_without_protective_exit_ack"]
+    reasons_by_session = assessment.get("reasons_by_session") or {}
+    assert "fail_session" in reasons_by_session
+    assert "any fail soak report" in reasons_by_session["fail_session"]
+    assert "fill_gap_session" in reasons_by_session
+    assert "fills without protective exit ack" in reasons_by_session["fill_gap_session"]
+
+
+def test_fill_ack_gap_attribution_in_json() -> None:
+    """Fill/ack gap attribution and session breakdown appear correctly."""
+    reports = [
+        _minimal_soak_report(filled=5, pe_ack=4, pe_submitted=5, session_id="gap_session"),
+    ]
+    assessment = build_promotion_assessment(reports)
+    pe_attr = assessment.get("protective_exit_attribution") or {}
+    assert "sessions_with_fill_ack_gap" in pe_attr
+    assert "gap_session" in pe_attr["sessions_with_fill_ack_gap"]
+    assert "session_breakdown" in pe_attr
+    breakdown = pe_attr["session_breakdown"]
+    assert len(breakdown) == 1
+    row = breakdown[0]
+    assert row["session_id"] == "gap_session"
+    assert row["total_fills"] == 5
+    assert row["protective_exit_submitted"] == 5
+    assert row["protective_exit_ack"] == 4
+    assert "protective_exit_failures" in row
+    assert "protective_exit_ack_pending_count" in row
+    assert "filled_entries_without_exit_ack" in row
+    assert "fill_ack_gap_by_session" in pe_attr
+    gap_rows = pe_attr["fill_ack_gap_by_session"]
+    assert len(gap_rows) == 1
+    assert gap_rows[0]["session_id"] == "gap_session"
+    assert gap_rows[0]["total_fills"] == 5
+    assert gap_rows[0]["protective_exit_ack"] == 4
+
+
+def test_markdown_includes_reasons_by_session() -> None:
+    """Markdown includes 'Reasons by Session' section for failing sessions."""
+    reports = [
+        _minimal_soak_report(verdict="FAIL", session_id="bad_session"),
+    ]
+    assessment = build_promotion_assessment(reports)
+    md = build_promotion_markdown(assessment)
+    assert "## Reasons by Session" in md
+    assert "### bad_session" in md
+
+
+def test_markdown_includes_fill_ack_gap_and_startup_sections() -> None:
+    """Markdown includes 'Sessions with Fill/Ack Gap' and 'Sessions with Startup Issues' when present."""
+    reports = [
+        _minimal_soak_report(filled=3, pe_ack=2, pe_submitted=3, session_id="gap_sess"),
+    ]
+    reports[0]["startup_state_diagnostics"] = {"uncleared_at_session_end": True}
+    assessment = build_promotion_assessment(reports)
+    md = build_promotion_markdown(assessment)
+    assert "## Sessions with Fill/Ack Gap" in md
+    assert "gap_sess" in md
+    assert "## Sessions with Startup Issues" in md

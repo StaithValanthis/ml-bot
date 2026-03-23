@@ -122,6 +122,14 @@ def aggregate_soak_reports(
     repeated_reconcile_issue_present = False
     repeated_position_add_attempts_present = False
 
+    sessions_causing_any_fail_soak_report: list[str] = []
+    sessions_causing_fills_without_protective_exit_ack: list[str] = []
+    sessions_causing_session_aborted: list[str] = []
+    sessions_causing_repeated_reconcile_mismatch_abort: list[str] = []
+    sessions_causing_unresolved_startup_state: list[str] = []
+    sessions_with_fill_ack_gap: list[str] = []
+    session_protective_exit_breakdown: list[dict[str, Any]] = []
+
     for r in reports:
         meta = r.get("session_metadata") or {}
         exec_s = r.get("execution_summary") or {}
@@ -129,6 +137,7 @@ def aggregate_soak_reports(
         model_s = r.get("model_evaluation_summary") or {}
         verdict_block = r.get("health_verdict") or {}
         verdict = verdict_block.get("verdict", "")
+        session_id = meta.get("session_id", "unknown")
 
         if verdict == "PASS":
             pass_count += 1
@@ -136,6 +145,7 @@ def aggregate_soak_reports(
             pass_with_warnings_count += 1
         elif verdict == "FAIL":
             fail_count += 1
+            sessions_causing_any_fail_soak_report.append(session_id)
 
         dur = meta.get("duration_seconds")
         if dur is not None and isinstance(dur, (int, float)):
@@ -170,14 +180,34 @@ def aggregate_soak_reports(
 
         sf = _g(exec_s, "strategy_order_filled_count")
         pe_submitted = _g(exec_s, "protective_exit_order_submitted_count")
+        pe_ack = _g(exec_s, "protective_exit_order_ack_received_count")
+        pe_failed_sess = _g(exec_s, "protective_exit_placement_failed_count")
+        pe_pending = _g(exec_s, "protective_exit_ack_pending_count", max(0, pe_submitted - pe_ack))
+        fills_without_ack = _g(exec_s, "filled_entries_without_exit_ack", max(0, sf - pe_ack))
+
         if sf > pe_submitted:
             fills_without_protective_exit_ack = True
+            sessions_causing_fills_without_protective_exit_ack.append(session_id)
+        if sf > pe_ack:
+            sessions_with_fill_ack_gap.append(session_id)
+
+        session_protective_exit_breakdown.append({
+            "session_id": session_id,
+            "total_fills": sf,
+            "protective_exit_submitted": pe_submitted,
+            "protective_exit_ack": pe_ack,
+            "protective_exit_failures": pe_failed_sess,
+            "protective_exit_ack_pending_count": pe_pending,
+            "filled_entries_without_exit_ack": fills_without_ack,
+        })
+
         if _g_bool(safety, "repeated_reconcile_mismatch_triggered"):
             repeated_reconcile_issue_present = True
         if not _g_bool(meta, "session_ended_cleanly", True) or (meta.get("abort_reasons") or []):
             session_abort_present = True
-        if _g(safety, "startup_state_blocked_count", 0) > 0 and _g(safety, "startup_state_block_cleared_count", 0) == 0:
-            startup_state_not_clearing = True
+            sessions_causing_session_aborted.append(session_id)
+        if "repeated_reconcile_mismatch" in (meta.get("abort_reasons") or []):
+            sessions_causing_repeated_reconcile_mismatch_abort.append(session_id)
         ob = _g(safety, "orphan_position_blocked_count", 0)
         oc = _g(safety, "orphan_position_block_cleared_count", 0)
         if ob > 0:
@@ -196,9 +226,12 @@ def aggregate_soak_reports(
     reconcile_by_bucket: dict[str, int] = {}
 
     for r in reports:
+        meta = r.get("session_metadata") or {}
+        session_id = meta.get("session_id", "unknown")
         ssd = r.get("startup_state_diagnostics") or {}
         if _g_bool(ssd, "uncleared_at_session_end"):
             sessions_with_uncleared_startup += 1
+            sessions_causing_unresolved_startup_state.append(session_id)
         if _g(ssd, "blocked_count", 0) > 0:
             sessions_with_startup_block += 1
         if _g(ssd, "cleared_count", 0) > 0 or _g_bool(ssd, "cleared"):
@@ -224,6 +257,13 @@ def aggregate_soak_reports(
         round(sessions_with_startup_cleared / sessions_with_startup_block, 3)
         if sessions_with_startup_block > 0 else None
     )
+    startup_state_not_clearing = sessions_with_uncleared_startup > 0
+
+    fill_ack_gap_ids = set(sessions_with_fill_ack_gap)
+    fill_ack_gap_by_session = [
+        b for b in session_protective_exit_breakdown
+        if b.get("session_id") in fill_ack_gap_ids
+    ]
 
     threshold_consistency = len(set(thresholds)) <= 1 if thresholds else True
 
@@ -280,7 +320,33 @@ def aggregate_soak_reports(
             "top_3_reconcile_issue_buckets": top_3_buckets,
         },
         "session_ids": [r.get("session_metadata", {}).get("session_id", "unknown") for r in reports],
+        "reason_attribution": {
+            "sessions_causing_any_fail_soak_report": sessions_causing_any_fail_soak_report,
+            "sessions_causing_fills_without_protective_exit_ack": sessions_causing_fills_without_protective_exit_ack,
+            "sessions_causing_session_aborted": sessions_causing_session_aborted,
+            "sessions_causing_repeated_reconcile_mismatch_abort": sessions_causing_repeated_reconcile_mismatch_abort,
+            "sessions_causing_unresolved_startup_state": sessions_causing_unresolved_startup_state,
+        },
+        "protective_exit_attribution": {
+            "sessions_with_fill_ack_gap": sessions_with_fill_ack_gap,
+            "session_breakdown": session_protective_exit_breakdown,
+            "fill_ack_gap_by_session": fill_ack_gap_by_session,
+        },
     }
+
+
+def _build_reasons_by_session(aggregated: dict[str, Any]) -> dict[str, list[str]]:
+    """Build per-session list of reasons for NOT_READY verdict."""
+    attr = aggregated.get("reason_attribution") or {}
+    by_session: dict[str, list[str]] = {}
+    for reason_key, session_ids in attr.items():
+        reason_label = reason_key.replace("sessions_causing_", "").replace("_", " ")
+        for sid in session_ids:
+            if sid not in by_session:
+                by_session[sid] = []
+            if reason_label not in by_session[sid]:
+                by_session[sid].append(reason_label)
+    return by_session
 
 
 def compute_promotion_verdict(
@@ -317,13 +383,15 @@ def compute_promotion_verdict(
         reasons.append("any_fail_soak_report")
     if total_pe_failures > 0:
         reasons.append("protective_exit_placement_failed_count_gt_zero")
-    if total_entry_fill > total_pe_ack:
+    if _g_bool(safety, "fills_without_protective_exit_ack"):
         reasons.append("fills_without_protective_exit_ack")
     if _g_bool(safety, "session_abort_present"):
         reasons.append("session_aborted")
     if _g_bool(safety, "repeated_reconcile_issue_present"):
         reasons.append("repeated_reconcile_mismatch_abort_present")
-    if _g_bool(safety, "startup_state_not_clearing"):
+    rsd = aggregated.get("reconcile_and_startup_diagnostics") or {}
+    sessions_uncleared = _g(rsd, "sessions_with_uncleared_startup_state")
+    if sessions_uncleared > 0:
         reasons.append("unresolved_startup_state")
     if _g_bool(safety, "orphan_block_unresolved"):
         reasons.append("unresolved_orphan_block")
@@ -396,6 +464,9 @@ def build_promotion_assessment(
         assessment["safety_checks"] = aggregated.get("safety_checks", {})
         assessment["reconcile_and_startup_diagnostics"] = aggregated.get("reconcile_and_startup_diagnostics", {})
         assessment["session_ids"] = aggregated.get("session_ids", [])
+        assessment["reason_attribution"] = aggregated.get("reason_attribution", {})
+        assessment["protective_exit_attribution"] = aggregated.get("protective_exit_attribution", {})
+        assessment["reasons_by_session"] = _build_reasons_by_session(aggregated)
 
     return assessment
 
@@ -469,6 +540,35 @@ def build_promotion_markdown(assessment: dict[str, Any]) -> str:
         lines.append(f"- Sessions with reconcile abort: {rsd.get('sessions_with_reconcile_abort', 0)}")
         for b in rsd.get("top_3_reconcile_issue_buckets") or []:
             lines.append(f"- {b.get('reason_bucket', '')}: {b.get('count', 0)}")
+        lines.append("")
+
+    reasons_by_session = assessment.get("reasons_by_session") or {}
+    if reasons_by_session:
+        lines.append("## Reasons by Session")
+        lines.append("")
+        for session_id, session_reasons in sorted(reasons_by_session.items()):
+            lines.append(f"### {session_id}")
+            for r in session_reasons:
+                lines.append(f"- {r}")
+            lines.append("")
+        lines.append("")
+
+    pe_attr = assessment.get("protective_exit_attribution") or {}
+    fill_ack_gap = pe_attr.get("sessions_with_fill_ack_gap") or []
+    if fill_ack_gap:
+        lines.append("## Sessions with Fill/Ack Gap")
+        lines.append("")
+        lines.append(f"Sessions where fills > protective exit acks: {', '.join(fill_ack_gap)}")
+        for row in pe_attr.get("fill_ack_gap_by_session") or []:
+            lines.append(f"- **{row.get('session_id', '')}**: fills={row.get('total_fills')}, pe_submitted={row.get('protective_exit_submitted')}, pe_ack={row.get('protective_exit_ack')}, pending={row.get('protective_exit_ack_pending_count')}, filled_without_ack={row.get('filled_entries_without_exit_ack')}")
+        lines.append("")
+
+    attr = assessment.get("reason_attribution") or {}
+    startup_sessions = attr.get("sessions_causing_unresolved_startup_state") or []
+    if startup_sessions:
+        lines.append("## Sessions with Startup Issues")
+        lines.append("")
+        lines.append(f"Sessions with uncleared startup state at end: {', '.join(startup_sessions)}")
         lines.append("")
 
     lines.append("## Final Recommendation")
