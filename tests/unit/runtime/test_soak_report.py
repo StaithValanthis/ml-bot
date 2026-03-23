@@ -88,6 +88,7 @@ def test_soak_report_verdict_pass() -> None:
         counters={
             "entry_fill_received_count": 1,
             "protective_exit_plan_created_count": 1,
+            "protective_exit_order_submitted_count": 1,
             "protective_exit_order_ack_received_count": 1,
             "protective_exit_placement_failed_count": 0,
         },
@@ -119,8 +120,8 @@ def test_soak_report_verdict_pass_with_warnings() -> None:
     assert "no_candidates_seen" in (verdict_block.get("warnings") or [])
 
 
-def test_soak_report_verdict_fail_fill_without_protective_exit_ack() -> None:
-    """Fill without protective exit ack yields FAIL."""
+def test_soak_report_verdict_fail_fill_without_protective_exit_submit() -> None:
+    """Fill without protective exit submitted (hard failure) yields FAIL."""
     summary = _minimal_session_summary(
         session_ended_cleanly=True,
         strategy_filled=2,
@@ -132,6 +133,7 @@ def test_soak_report_verdict_fail_fill_without_protective_exit_ack() -> None:
         counters={
             "entry_fill_received_count": 2,
             "protective_exit_plan_created_count": 2,
+            "protective_exit_order_submitted_count": 1,
             "protective_exit_order_ack_received_count": 1,
             "protective_exit_placement_failed_count": 0,
         },
@@ -142,6 +144,34 @@ def test_soak_report_verdict_fail_fill_without_protective_exit_ack() -> None:
     verdict_block = report.get("health_verdict") or {}
     assert verdict_block.get("verdict") == VERDICT_FAIL
     assert "fills_without_protective_exit_ack" in (verdict_block.get("failures") or [])
+
+
+def test_soak_report_verdict_pass_ack_pending_at_session_end() -> None:
+    """Fill + submitted protective exit + ack pending at session end does NOT fail."""
+    summary = _minimal_session_summary(
+        session_ended_cleanly=True,
+        strategy_filled=44,
+        submitted=44,
+        model_filter_reached=71,
+        model_allowed=71,
+    )
+    metrics = MetricsSnapshot(
+        counters={
+            "entry_fill_received_count": 44,
+            "protective_exit_plan_created_count": 44,
+            "protective_exit_order_submitted_count": 44,
+            "protective_exit_order_ack_received_count": 43,
+            "protective_exit_placement_failed_count": 0,
+        },
+        gauges={},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    verdict_block = report.get("health_verdict") or {}
+    assert "fills_without_protective_exit_ack" not in (verdict_block.get("failures") or [])
+    exec_s = report.get("execution_summary") or {}
+    assert exec_s.get("protective_exit_ack_pending_count") == 1
+    assert exec_s.get("filled_entries_without_exit_ack") == 1
 
 
 def test_soak_report_verdict_fail_protective_exit_placement_failed() -> None:

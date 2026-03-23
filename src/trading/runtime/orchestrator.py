@@ -4,6 +4,7 @@ import asyncio
 import csv
 import json
 import os
+import traceback
 from collections import defaultdict, deque
 from datetime import date, datetime
 from pathlib import Path
@@ -466,13 +467,36 @@ class RuntimeOrchestrator:
                     self._session_ended_cleanly = False
                     reason = f"task_failed:{task.get_name()}"
                     self._abort_reasons.append(reason)
+                    if task.get_name() == "runtime-decision":
+                        self._metrics.inc("runtime_decision_failures_count")
                     if task.get_name() == "runtime-ws-private":
                         self._health.set_private_stream_error(str(exc))
+                    exc_type = type(exc).__name__
+                    exc_msg = str(exc)
+                    tb_summary = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-1200:]
                     self._logger.exception(
                         "runtime_task_failed",
                         task=task.get_name(),
-                        error=str(exc),
+                        error=exc_msg,
                         abort_reason=reason,
+                    )
+                    await self._ledger.record(
+                        "runtime_decision_task_failed",
+                        {
+                            "task": task.get_name(),
+                            "exception_type": exc_type,
+                            "exception_message": exc_msg,
+                            "abort_reason": reason,
+                            "traceback_summary": tb_summary,
+                        },
+                    )
+                    self._logger.info(
+                        "runtime_decision_task_failed",
+                        task=task.get_name(),
+                        exception_type=exc_type,
+                        exception_message=exc_msg,
+                        abort_reason=reason,
+                        traceback_summary=tb_summary[:500],
                     )
                     self._stop_event.set()
                     return

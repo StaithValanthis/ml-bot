@@ -168,7 +168,9 @@ def aggregate_soak_reports(
             prob_sum += p_latest
             prob_count += 1
 
-        if _g(exec_s, "strategy_order_filled_count") > _g(exec_s, "protective_exit_order_ack_received_count"):
+        sf = _g(exec_s, "strategy_order_filled_count")
+        pe_submitted = _g(exec_s, "protective_exit_order_submitted_count")
+        if sf > pe_submitted:
             fills_without_protective_exit_ack = True
         if _g_bool(safety, "repeated_reconcile_mismatch_triggered"):
             repeated_reconcile_issue_present = True
