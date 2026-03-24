@@ -186,6 +186,9 @@ class RuntimeOrchestrator:
         self._protective_exit_skip_reasons: dict[str, int] = {}
         self._protective_exit_done_link_ids: set[str] = set()
         self._protective_exit_fill_outcomes: list[dict[str, object]] = []
+        self._runtime_decision_failure_reasons: dict[str, int] = {}
+        self._recent_runtime_decision_failures: list[dict[str, object]] = []
+        self._last_runtime_decision_context: dict[str, object] = {}
         self._warmup_results: list[WarmupResult] = []
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
@@ -477,11 +480,27 @@ class RuntimeOrchestrator:
                     exc_type = type(exc).__name__
                     exc_msg = str(exc)
                     tb_summary = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-1200:]
+                    decision_ctx = dict(self._last_runtime_decision_context)
+                    if task.get_name() == "runtime-decision":
+                        self._runtime_decision_failure_reasons[exc_type] = self._runtime_decision_failure_reasons.get(exc_type, 0) + 1
+                        failure = {
+                            "task": task.get_name(),
+                            "exception_type": exc_type,
+                            "exception_message": exc_msg,
+                            "abort_reason": reason,
+                            "traceback_summary": tb_summary,
+                            "decision_context": decision_ctx,
+                            "timestamp": utc_now().isoformat(),
+                        }
+                        self._recent_runtime_decision_failures.append(failure)
+                        while len(self._recent_runtime_decision_failures) > 50:
+                            self._recent_runtime_decision_failures.pop(0)
                     self._logger.exception(
                         "runtime_task_failed",
                         task=task.get_name(),
                         error=exc_msg,
                         abort_reason=reason,
+                        decision_context=decision_ctx,
                     )
                     await self._ledger.record(
                         "runtime_decision_task_failed",
@@ -491,6 +510,7 @@ class RuntimeOrchestrator:
                             "exception_message": exc_msg,
                             "abort_reason": reason,
                             "traceback_summary": tb_summary,
+                            "decision_context": decision_ctx,
                         },
                     )
                     self._logger.info(
@@ -499,6 +519,7 @@ class RuntimeOrchestrator:
                         exception_type=exc_type,
                         exception_message=exc_msg,
                         abort_reason=reason,
+                        decision_context=decision_ctx,
                         traceback_summary=tb_summary[:500],
                     )
                     self._stop_event.set()
@@ -1011,6 +1032,17 @@ class RuntimeOrchestrator:
                 if signal.side is None or signal.reference_price is None:
                     self._metrics.inc("strategy_signal_rejected")
                     continue
+                model_allowed_by_filter = False
+                self._last_runtime_decision_context = {
+                    "symbol": signal.symbol,
+                    "candidate_type": candidate.candidate_type.value,
+                    "action": signal.action.value,
+                    "side": signal.side.value if signal.side else None,
+                    "reference_price": str(signal.reference_price),
+                    "confidence": str(signal.confidence),
+                    "regime_state": getattr(regime, "state", None),
+                    "regime_volatility_bps": str(getattr(regime, "volatility_bps", "")),
+                }
                 await self._ledger.record(
                     "decision",
                     {
@@ -1178,6 +1210,7 @@ class RuntimeOrchestrator:
                         )
                         continue
                     else:
+                        model_allowed_by_filter = True
                         mf.allowed += 1
                         self._logger.info(
                             "model_filter_allowed",
@@ -1213,6 +1246,8 @@ class RuntimeOrchestrator:
                 self._logger.debug("entry_guard_evaluated", **diag)
                 if blocked:
                     block_bucket = guard_payload.get("block_reason_bucket", block_reason or "unknown")
+                    if model_allowed_by_filter:
+                        self._metrics.inc("model_allowed_but_blocked_by_guard_count")
                     self._entry_guard_block_reasons.append({
                         "symbol": signal.symbol,
                         "block_reason": block_reason,
@@ -1220,6 +1255,11 @@ class RuntimeOrchestrator:
                         "current_position_size": guard_payload.get("current_position_size"),
                         "open_entry_count": guard_payload.get("open_entry_order_count"),
                         "open_reduce_only_count": guard_payload.get("open_reduce_only_order_count"),
+                        "position_effectively_flat": guard_payload.get("position_effectively_flat"),
+                        "effective_flat_threshold_qty": guard_payload.get("effective_flat_threshold_qty"),
+                        "exchange_position_size": guard_payload.get("exchange_position_size"),
+                        "exchange_position_side": guard_payload.get("exchange_position_side"),
+                        "exchange_open_order_count": guard_payload.get("exchange_open_order_count"),
                     })
                     if block_reason == "existing_position":
                         self._metrics.inc("position_add_blocked_count")
@@ -2418,25 +2458,36 @@ class RuntimeOrchestrator:
         open_exit_count = len(exit_orders)
 
         pos = self._portfolio.position_for(symbol)
-        current_position_size = float(pos.qty) if pos and pos.qty else 0.0
+        pos_qty = Decimal(pos.qty) if pos and pos.qty is not None else Decimal("0")
+        symbol_spec = self._symbol_specs.get(symbol)
+        flat_threshold_qty = Decimal("0")
+        if symbol_spec is not None and getattr(symbol_spec, "qty_step", None) is not None:
+            flat_threshold_qty = Decimal(symbol_spec.qty_step) / Decimal("2")
+        position_effectively_flat = abs(pos_qty) <= flat_threshold_qty
+        current_position_size = float(pos_qty)
         current_position_side = str(pos.side) if pos and pos.side else "Flat"
 
         base_payload: dict[str, object] = {
             "symbol": symbol,
             "current_position_size": current_position_size,
             "current_position_side": current_position_side,
+            "position_effectively_flat": position_effectively_flat,
+            "effective_flat_threshold_qty": float(flat_threshold_qty),
+            "exchange_position_size": current_position_size,
+            "exchange_position_side": current_position_side,
             "open_entry_order_count": open_entry_count,
             "open_reduce_only_order_count": open_exit_count,
             "local_tracked_order_count": len(sym_orders),
+            "exchange_open_order_count": len(sym_orders),
             "allow_position_adds": allow_adds,
             "max_concurrent_entries_per_symbol": max_entries,
         }
 
         if not allow_adds:
-            if current_position_size != 0:
+            if not position_effectively_flat:
                 block_payload = {**base_payload, "reason": "non_flat_position", "block_reason_bucket": "existing_position"}
                 return (True, "existing_position", block_payload)
-            if open_exit_count > 0 and current_position_size == 0:
+            if open_exit_count > 0 and position_effectively_flat:
                 self._logger.info(
                     "entry_guard_allows_reentry_after_flatten",
                     symbol=symbol,
@@ -2468,7 +2519,8 @@ class RuntimeOrchestrator:
                 if sym not in by_symbol:
                     by_symbol[sym] = {}
                 by_symbol[sym][bucket] = by_symbol[sym].get(bucket, 0) + 1
-        return {"by_type": by_type, "by_symbol": by_symbol}
+        recent_context = list(self._entry_guard_block_reasons[-25:])
+        return {"by_type": by_type, "by_symbol": by_symbol, "recent_context": recent_context}
 
     def _infer_strategy_blocking_stage(self, m: dict[str, float]) -> str:
         """Infer which stage is blocking decisions for operator visibility."""
@@ -2701,6 +2753,7 @@ class RuntimeOrchestrator:
             },
             "entry_guard_by_symbol": entry_guard_by_symbol,
             "entry_guard_block_reasons": self._aggregate_entry_guard_block_reasons(),
+            "model_allowed_but_blocked_by_guard_count": int(metrics.counters.get("model_allowed_but_blocked_by_guard_count", 0)),
             "entry_guard_reentry_allowed_flat_stale_exit_count": int(metrics.counters.get("entry_guard_reentry_allowed_flat_stale_exit_count", 0)),
             "staleness_incidents_total": int(metrics.counters.get("staleness_incidents_total", 0)),
             "circuit_breaker_trips_total": int(metrics.counters.get("circuit_breaker_trips_total", 0)),
@@ -2753,6 +2806,10 @@ class RuntimeOrchestrator:
                 summary["drill_outcome"] = "pending"
         if self._abort_reasons:
             summary["abort_reasons"] = self._abort_reasons
+        if self._runtime_decision_failure_reasons:
+            summary["runtime_decision_failure_reasons"] = dict(self._runtime_decision_failure_reasons)
+        if self._recent_runtime_decision_failures:
+            summary["recent_runtime_decision_failures"] = list(self._recent_runtime_decision_failures[-20:])
         if self._last_sizing_rejection is not None:
             summary["last_sizing_rejection"] = dict(self._last_sizing_rejection)
         if self._last_sizing_floor_applied is not None:

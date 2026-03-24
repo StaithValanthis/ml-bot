@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -201,3 +203,38 @@ async def test_session_summary_includes_last_risk_rejection_when_set() -> None:
     assert lrr["reason"] == "max_total_notional_exceeded"
     md = orch._build_markdown_summary(summary)
     assert "## Last Risk Rejection" in md
+
+
+@pytest.mark.asyncio
+async def test_runtime_decision_failure_is_recorded_in_summary() -> None:
+    """Runtime decision task failures include exception and decision context in session summary."""
+    settings = load_settings()
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient", MagicMock()),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient", MagicMock()),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient", MagicMock()),
+    ):
+        orch = RuntimeOrchestrator(settings)
+        orch._ledger.record = AsyncMock()
+        orch._last_runtime_decision_context = {
+            "symbol": "BTCUSDT",
+            "candidate_type": "breakout_long",
+            "action": "enter_long",
+        }
+
+        async def _boom() -> None:
+            raise ValueError("decision crashed")
+
+        decision_task = asyncio.create_task(_boom(), name="runtime-decision")
+        await asyncio.sleep(0)
+        orch._tasks = [decision_task]
+        await orch._task_supervisor()
+
+        summary = await orch._build_session_summary()
+
+    reasons = summary.get("runtime_decision_failure_reasons") or {}
+    recent = summary.get("recent_runtime_decision_failures") or []
+    assert reasons.get("ValueError") == 1
+    assert len(recent) == 1
+    assert recent[0].get("exception_message") == "decision crashed"
+    assert (recent[0].get("decision_context") or {}).get("symbol") == "BTCUSDT"

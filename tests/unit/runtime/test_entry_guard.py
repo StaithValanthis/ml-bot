@@ -203,6 +203,29 @@ def test_non_flat_position_with_reduce_only_still_blocks() -> None:
     assert payload["open_reduce_only_order_count"] == 1
 
 
+def test_effectively_flat_dust_position_does_not_block_existing_position() -> None:
+    """Dust positions below qty-step threshold are treated as flat for guard checks."""
+    orch = _make_orchestrator()
+    orch._settings.runtime.allow_position_adds = False
+    from trading.risk.portfolio_state import PositionRiskView
+
+    orch._portfolio.positions["BTCUSDT"] = PositionRiskView(
+        symbol="BTCUSDT",
+        side=PositionSide.LONG,
+        qty=Decimal("0.0004"),
+        entry_price=Decimal("60000"),
+        mark_price=Decimal("60100"),
+        leverage=Decimal("1"),
+        liquidation_price=None,
+    )
+
+    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", [])
+    assert blocked is False
+    assert block_reason is None
+    assert payload["position_effectively_flat"] is True
+    assert payload["effective_flat_threshold_qty"] == 0.0005
+
+
 def test_defaults_without_env_vars_block_repeated_adds(monkeypatch: pytest.MonkeyPatch) -> None:
     """With no TRADING_ALLOW_POSITION_ADDS or TRADING_MAX_CONCURRENT_ENTRIES_PER_SYMBOL, defaults are conservative."""
     monkeypatch.delenv("TRADING_ALLOW_POSITION_ADDS", raising=False)
@@ -302,3 +325,4 @@ async def test_session_summary_includes_entry_guard_block_reasons() -> None:
     assert block_reasons.get("by_type", {}).get("existing_working_entry") == 1
     assert block_reasons.get("by_symbol", {}).get("BTCUSDT", {}).get("existing_position") == 2
     assert block_reasons.get("by_symbol", {}).get("ETHUSDT", {}).get("existing_working_entry") == 1
+    assert len(block_reasons.get("recent_context", [])) == 3
