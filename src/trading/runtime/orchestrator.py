@@ -183,6 +183,8 @@ class RuntimeOrchestrator:
         self._entry_guard_block_reasons: list[dict[str, object]] = []
         self._model_shadow_decisions: list[dict[str, object]] = []
         self._model_shadow_decisions_max: int = 100
+        self._protective_exit_skip_reasons: dict[str, int] = {}
+        self._protective_exit_done_link_ids: set[str] = set()
         self._warmup_results: list[WarmupResult] = []
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
@@ -1433,6 +1435,7 @@ class RuntimeOrchestrator:
             order_after = await self._order_manager.get_by_link_id(exit_intent.order_link_id)
             if order_after and order_after.order_id:
                 self._metrics.inc("protective_exit_order_ack_received_count")
+                self._protective_exit_done_link_ids.add(link_id)
                 await self._ledger.record(
                     "protective_exit_order_ack_received",
                     {"order_link_id": exit_intent.order_link_id, "order_id": order_after.order_id, "symbol": symbol},
@@ -1511,14 +1514,16 @@ class RuntimeOrchestrator:
                     reduce_only=intent.reduce_only,
                 )
             )
+            # Local ManagedOrder is keyed by the submitted client order_link_id; ack must use the same key.
+            ack_link = intent.order_link_id
             await self._order_manager.ack_exchange_order(
-                order_link_id=ack.order_link_id,
+                order_link_id=ack_link,
                 order_id=ack.order_id,
                 updated_at=utc_now(),
             )
             await self._ledger.record(
                 "order_ack",
-                {"order_link_id": ack.order_link_id, "order_id": ack.order_id},
+                {"order_link_id": ack_link, "order_id": ack.order_id},
             )
             if is_drill and self._drill_outcome.order_link_id == ack.order_link_id:
                 self._drill_outcome.ack_received = True
@@ -2814,6 +2819,13 @@ class RuntimeOrchestrator:
                     observed_mean=dist.get("mean"),
                     retention_thresholds=rc.get("retention_thresholds"),
                 )
+        pe_sub = int(metrics.counters.get("protective_exit_order_submitted_count", 0))
+        fills_metric = int(metrics.counters.get("entry_fill_received_count", 0))
+        summary["protective_exit_diagnostics"] = {
+            "fills_with_exit_submission": pe_sub,
+            "fills_without_exit_submission": max(0, fills_metric - pe_sub),
+            "protective_exit_skip_reasons_by_type": dict(self._protective_exit_skip_reasons),
+        }
         return summary
 
     def _build_markdown_summary(self, summary: dict[str, object]) -> str:
