@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from trading.execution.order_intent import OrderIntent
+from trading.execution.order_intent import IntentPurpose, OrderIntent
 from trading.util.types import OrderStatus
 
 
@@ -38,6 +38,9 @@ class OrderManager:
             existing = self._by_link_id.get(intent.order_link_id)
             if existing is not None:
                 return existing
+            meta = dict(intent.metadata)
+            if intent.purpose == IntentPurpose.ENTRY:
+                meta.setdefault("entry_side", intent.side.value)
             managed = ManagedOrder(
                 order_id=None,
                 order_link_id=intent.order_link_id,
@@ -49,7 +52,7 @@ class OrderManager:
                 reduce_only=intent.reduce_only,
                 created_at=intent.created_at,
                 updated_at=intent.created_at,
-                metadata=intent.metadata,
+                metadata=meta,
             )
             self._by_link_id[intent.order_link_id] = managed
             return managed

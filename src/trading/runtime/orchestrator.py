@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import csv
 import json
 import os
-import traceback
 from collections import defaultdict, deque
 from datetime import date, datetime
 from pathlib import Path
@@ -21,7 +19,8 @@ from trading.exchange.bybit_ws_private import BybitWsPrivateClient
 from trading.exchange.bybit_ws_public import BybitWsPublicClient
 from trading.exchange.schemas import PlaceOrderRequest
 from trading.execution.execution_engine import ExecutionEngine
-from trading.execution.order_manager import OrderManager
+from trading.execution.order_intent import IntentPurpose, OrderIntent
+from trading.execution.order_manager import ManagedOrder, OrderManager
 from trading.execution.reconciler import Reconciler
 from trading.journal.ledger import RuntimeLedger
 from trading.journal.pnl import PnLTracker
@@ -34,19 +33,16 @@ from trading.monitoring.health import HealthState
 from trading.monitoring.metrics import MetricsRegistry
 from trading.risk.circuit_breaker import CircuitBreaker
 from trading.risk.portfolio_state import PortfolioState, PositionRiskView
-from trading.risk.risk_engine import PerSymbolLimit, RiskDecisionReport, RiskEngine, RiskEvaluationContext
+from trading.risk.risk_engine import PerSymbolLimit, RiskEngine
 from trading.risk.sizing import SizingInputs, VolatilityAwareSizer
 from trading.settings import AppSettings
-from trading.strategy.candidates import (
-    BreakoutTrendCandidateGenerator,
-    CandidateGeneratorConfig,
-)
-from trading.strategy.regime_filter import RegimeFilter, RegimeFilterReport
-from trading.strategy.signal_engine import SignalEngine
+from trading.strategy.candidates import BreakoutTrendCandidateGenerator
+from trading.strategy.regime_filter import RegimeFilter
+from trading.strategy.signal_engine import SignalAction, SignalEngine
 from trading.util.json_util import dumps_json_safe
 from trading.util.logging import get_logger
 from trading.util.time import utc_now
-from trading.util.types import MarketSymbol, ModelFilterMode, OHLCVBar, OrderSide, PositionSide, RuntimeMode
+from trading.util.types import MarketSymbol, OrderSide, PositionSide, RuntimeMode
 from trading.storage.parquet_store import ParquetArchiveStore
 from trading.runtime.drill import (
     DrillConfig,
@@ -56,34 +52,26 @@ from trading.runtime.drill import (
     generate_drill_order_link_id,
     validate_drill,
 )
-from trading.runtime.model_calibration import (
-    build_model_calibration_summary,
-    build_promotion_recommendation,
-)
-from trading.runtime.soak_report import (
-    build_soak_markdown,
-    build_soak_report,
-)
-from trading.runtime.strategy_orders import ModelFilterOutcomes, StrategyOrderOutcomes
-from trading.runtime.warmup import preload_warmup_klines, WarmupResult
 from trading.storage.postgres import PostgresJournalStore
 from trading.runtime.mode import is_live_execution_mode, is_streaming_mode
+from trading.runtime.strategy_orders import StrategyOrderOutcomes
 from trading.runtime.scheduler import run_periodic
+from trading.runtime.soak_report import build_soak_markdown, build_soak_report
 
 
 def _drill_post_ack_status(outcome: DrillOutcome) -> str:
     """Classify post-ack state for operator visibility."""
     if not outcome.ack_received:
         return "no_ack"
-    if outcome.final_status:
+    if outcome.completed and outcome.final_status:
         if outcome.final_status == "Filled":
             return "filled"
         if outcome.final_status == "Cancelled":
             return "cancelled"
         if outcome.final_status == "Rejected":
             return "rejected"
-        if outcome.final_status in ("New", "PartiallyFilled"):
-            return "resting_open"
+    if outcome.final_status in ("New", "PartiallyFilled"):
+        return "resting_open"
     return "ack_only_no_transition"
 
 
@@ -112,10 +100,8 @@ class RuntimeOrchestrator:
         self._startup_auth_disabled = False
         self._drill_outcome = DrillOutcome()
         self._strategy_order_outcomes = StrategyOrderOutcomes()
-        self._model_filter_model: object | None = None
-        self._model_filter_active: bool = False
-        self._model_filter_mode: ModelFilterMode = ModelFilterMode.HARD_BLOCK
-        self._model_filter_threshold: float | None = None
+        self._protective_exit_done_link_ids: set[str] = set()
+        self._protective_exit_skip_reasons: dict[str, int] = {}
 
         self._rest = BybitRestClient(settings.exchange)
         self._metrics = MetricsRegistry()
@@ -156,34 +142,13 @@ class RuntimeOrchestrator:
             circuit_breaker=self._circuit_breaker,
             per_symbol_limits=per_symbol,
         )
-        demo_min_notional = None
-        if (
-            self._settings.runtime.mode == RuntimeMode.DEMO
-            and self._settings.runtime.demo_sizing_min_notional_usdt is not None
-        ):
-            demo_min_notional = self._settings.runtime.demo_sizing_min_notional_usdt
-        self._sizer = VolatilityAwareSizer(demo_min_notional_floor_usdt=demo_min_notional)
-        self._candidate_generator = self._build_candidate_generator()
+        self._sizer = VolatilityAwareSizer()
+        self._candidate_generator = BreakoutTrendCandidateGenerator()
         self._regime_filter = RegimeFilter()
         self._signal_engine = SignalEngine()
         self._execution_engine = ExecutionEngine(strategy_id="v1alpha")
 
         self._bar_history: dict[str, dict[str, deque]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=800)))
-        self._last_candidate_readiness: dict[str, dict[str, object]] = {}
-        self._last_sizing_rejection: dict[str, object] | None = None
-        self._last_sizing_floor_applied: dict[str, object] | None = None
-        self._last_regime_rejection: dict[str, object] | None = None
-        self._last_risk_rejection: dict[str, object] | None = None
-        self._orphan_position_blocked: bool = False
-        self._orphan_position_details: list[dict[str, object]] = []
-        self._startup_state_blocked: bool = False
-        self._startup_state_details: list[dict[str, object]] = []
-        self._startup_block_reason: str | None = None
-        self._reconcile_mismatch_accumulator: list[dict[str, object]] = []
-        self._entry_guard_block_reasons: list[dict[str, object]] = []
-        self._model_shadow_decisions: list[dict[str, object]] = []
-        self._model_shadow_decisions_max: int = 100
-        self._warmup_results: list[WarmupResult] = []
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
             available_balance_usdt=Decimal("0"),
@@ -202,56 +167,210 @@ class RuntimeOrchestrator:
             message_handler=self._on_private_events,
             connection_state_handler=self._health.set_ws_private,
         )
+        self._seen_fill_exec_ids: set[str] = set()
 
-    def _build_candidate_generator(self) -> BreakoutTrendCandidateGenerator:
-        """Build candidate generator; apply DEMO-only overrides when mode is DEMO."""
-        from dataclasses import replace
-
-        cfg = CandidateGeneratorConfig()
-        overrides = self._settings.runtime.demo_candidate_overrides
-        more_opportunities = (
-            self._settings.runtime.mode == RuntimeMode.DEMO
-            and self._settings.runtime.demo_more_opportunities_enabled
+    def _is_drill_order_link(self, link_id: str) -> bool:
+        return bool(
+            self._drill_outcome.enabled
+            and self._drill_outcome.order_link_id
+            and link_id == self._drill_outcome.order_link_id
         )
-        if (
-            self._settings.runtime.mode == RuntimeMode.DEMO
-            and overrides is not None
-            and any(
-                getattr(overrides, k) is not None
-                for k in ("min_breakout_bps", "min_trend_bps", "min_volume_multiplier")
+
+    def _record_protective_exit_skip(self, reason: str) -> None:
+        self._protective_exit_skip_reasons[reason] = self._protective_exit_skip_reasons.get(reason, 0) + 1
+
+    def _position_side_for_managed_entry(self, mo: ManagedOrder) -> PositionSide | None:
+        meta = mo.metadata or {}
+        sig = meta.get("signal_action")
+        if sig == SignalAction.ENTER_LONG.value:
+            return PositionSide.LONG
+        if sig == SignalAction.ENTER_SHORT.value:
+            return PositionSide.SHORT
+        es = meta.get("entry_side")
+        if isinstance(es, str) and es in ("Buy", "Sell"):
+            return _to_position_side(es)
+        return None
+
+    async def _submit_protective_exit_intent(self, intent: OrderIntent) -> bool:
+        """Submit reduce-only protective exit; increments protective_* metrics on success/failure."""
+        self._metrics.inc("order_submissions_total")
+        await self._ledger.record(
+            "protective_exit_submission_attempt",
+            {
+                "order_link_id": intent.order_link_id,
+                "symbol": intent.symbol,
+                "side": intent.side.value,
+                "qty": str(intent.qty),
+            },
+        )
+        self._logger.info(
+            "protective_exit_submission_attempt",
+            order_link_id=intent.order_link_id,
+            symbol=intent.symbol,
+            qty=str(intent.qty),
+        )
+        try:
+            ack = await self._rest.place_order(
+                PlaceOrderRequest(
+                    category=self._settings.trading.category,
+                    symbol=intent.symbol,
+                    side=intent.side,
+                    order_type=intent.order_type,
+                    qty=intent.qty,
+                    price=intent.price,
+                    time_in_force=intent.time_in_force,
+                    order_link_id=intent.order_link_id,
+                    reduce_only=intent.reduce_only,
+                )
             )
-            and not more_opportunities
-        ):
-            updates: dict[str, object] = {}
-            if overrides.min_breakout_bps is not None:
-                updates["min_breakout_bps"] = Decimal(str(overrides.min_breakout_bps))
-            if overrides.min_trend_bps is not None:
-                updates["min_trend_bps"] = Decimal(str(overrides.min_trend_bps))
-            if overrides.min_volume_multiplier is not None:
-                updates["min_volume_multiplier"] = Decimal(str(overrides.min_volume_multiplier))
-            cfg = replace(cfg, **updates)
+            await self._order_manager.ack_exchange_order(
+                order_link_id=ack.order_link_id,
+                order_id=ack.order_id,
+                updated_at=utc_now(),
+            )
+            await self._ledger.record(
+                "protective_exit_ack",
+                {"order_link_id": ack.order_link_id, "order_id": ack.order_id},
+            )
+            self._metrics.inc("order_acks_total")
+            self._metrics.inc("protective_exit_order_submitted_count")
+            self._metrics.inc("protective_exit_order_ack_received_count")
             self._logger.info(
-                "demo_candidate_overrides_applied",
-                min_breakout_bps=float(cfg.min_breakout_bps),
-                min_trend_bps=float(cfg.min_trend_bps),
-                min_volume_multiplier=float(cfg.min_volume_multiplier),
+                "protective_exit_order_ack_received",
+                order_link_id=ack.order_link_id,
+                order_id=ack.order_id,
             )
-        if more_opportunities:
-            profile = {
-                "min_breakout_bps": Decimal("1"),
-                "min_trend_bps": Decimal("2"),
-                "min_volume_multiplier": Decimal("1.0"),
-                "lookback_bars": 15,
-            }
-            cfg = replace(cfg, **profile)
-            self._logger.info(
-                "demo_more_opportunities_profile_applied",
-                min_breakout_bps=1,
-                min_trend_bps=2,
-                min_volume_multiplier=1.0,
-                lookback_bars=15,
+            return True
+        except BybitRestError as exc:
+            log_ctx: dict[str, object] = {"order_link_id": intent.order_link_id, "error": str(exc)}
+            if isinstance(exc, BybitAPIError):
+                log_ctx["ret_code"] = exc.ret_code
+                log_ctx["ret_msg"] = exc.ret_msg
+                log_ctx["operation"] = exc.operation
+                log_ctx["scope"] = exc.scope
+            self._logger.exception("protective_exit_placement_failed", **log_ctx)
+            self._metrics.inc("protective_exit_placement_failed_count")
+            was_tripped = self._circuit_breaker.is_tripped()
+            self._circuit_breaker.record_order_rejection()
+            now_tripped = self._circuit_breaker.is_tripped()
+            self._health.set_circuit_breaker(now_tripped)
+            if now_tripped and not was_tripped:
+                self._metrics.inc("circuit_breaker_trips_total")
+            self._alerts.emit(
+                AlertEvent(
+                    level=AlertLevel.WARNING,
+                    code="protective_exit_placement_failed",
+                    message="Protective exit placement failed.",
+                    context={"order_link_id": intent.order_link_id},
+                )
             )
-        return BreakoutTrendCandidateGenerator(config=cfg)
+            return False
+
+    async def _ensure_protective_exit_for_filled_entry(self, mo: ManagedOrder) -> None:
+        """
+        Exactly-once protective exit for a filled **entry** order (non-reduce-only).
+
+        Every invocation ends marked in _protective_exit_done_link_ids with one of:
+        submitted+acked metrics, or protective_exit_placement_failed_count, or an explicit skip reason.
+        """
+        lid = mo.order_link_id
+        if lid in self._protective_exit_done_link_ids:
+            self._logger.info("protective_exit_skipped_duplicate_fill", order_link_id=lid or None)
+            self._record_protective_exit_skip("duplicate_fill")
+            return
+        if mo.reduce_only:
+            self._logger.info("protective_exit_skipped_reduce_only_order", order_link_id=lid or None)
+            self._record_protective_exit_skip("reduce_only_order")
+            self._protective_exit_done_link_ids.add(lid)
+            return
+        if not lid:
+            self._logger.warning("protective_exit_skipped_invalid_fill_context", reason="missing_order_link_id")
+            self._record_protective_exit_skip("invalid_fill_context")
+            self._metrics.inc("protective_exit_placement_failed_count")
+            return
+        pos_side = self._position_side_for_managed_entry(mo)
+        if pos_side is None or pos_side == PositionSide.FLAT:
+            self._logger.warning(
+                "protective_exit_skipped_invalid_fill_context",
+                order_link_id=lid,
+                reason="cannot_infer_position_side",
+            )
+            self._record_protective_exit_skip("invalid_fill_context")
+            self._metrics.inc("protective_exit_placement_failed_count")
+            self._protective_exit_done_link_ids.add(lid)
+            return
+        spec = self._symbol_specs.get(mo.symbol)
+        if spec is None:
+            self._logger.warning(
+                "protective_exit_skipped_missing_order_state",
+                order_link_id=lid,
+                reason="unknown_symbol",
+            )
+            self._record_protective_exit_skip("missing_order_state")
+            self._metrics.inc("protective_exit_placement_failed_count")
+            self._protective_exit_done_link_ids.add(lid)
+            return
+        avg = mo.avg_price
+        if avg is None or avg <= 0:
+            self._logger.warning(
+                "protective_exit_skipped_invalid_fill_context",
+                order_link_id=lid,
+                reason="missing_avg_price",
+            )
+            self._record_protective_exit_skip("invalid_fill_context")
+            self._metrics.inc("protective_exit_placement_failed_count")
+            self._protective_exit_done_link_ids.add(lid)
+            return
+        qty = mo.filled_qty if mo.filled_qty and mo.filled_qty > 0 else mo.qty
+        if qty <= 0:
+            self._logger.warning(
+                "protective_exit_skipped_invalid_fill_context",
+                order_link_id=lid,
+                reason="non_positive_qty",
+            )
+            self._record_protective_exit_skip("invalid_fill_context")
+            self._metrics.inc("protective_exit_placement_failed_count")
+            self._protective_exit_done_link_ids.add(lid)
+            return
+
+        intent = self._execution_engine.build_protective_limit_exit(
+            symbol=mo.symbol,
+            side_to_close=pos_side,
+            qty=qty,
+            entry_avg_price=avg,
+            price_tick=spec.price_tick,
+            qty_step=spec.qty_step,
+            now=utc_now(),
+        )
+        if intent is None:
+            self._logger.warning(
+                "protective_exit_placement_failed",
+                order_link_id=lid,
+                reason="build_protective_intent_returned_none",
+            )
+            self._record_protective_exit_skip("build_failed")
+            self._metrics.inc("protective_exit_placement_failed_count")
+            self._protective_exit_done_link_ids.add(lid)
+            return
+
+        self._metrics.inc("protective_exit_plan_created_count")
+        await self._order_manager.register_intent(intent)
+        self._metrics.inc("protective_exit_tracking_registered_count")
+
+        if not self._can_place_exchange_orders():
+            self._logger.warning(
+                "protective_exit_skipped_placement_disabled",
+                order_link_id=lid,
+                mode=self._settings.runtime.mode.value,
+                dry_run=self._settings.runtime.dry_run,
+            )
+            self._record_protective_exit_skip("placement_disabled")
+            self._metrics.inc("protective_exit_placement_failed_count")
+            self._protective_exit_done_link_ids.add(lid)
+            return
+
+        await self._submit_protective_exit_intent(intent)
+        self._protective_exit_done_link_ids.add(lid)
 
     async def run(self) -> None:
         if not is_streaming_mode(self._settings.runtime.mode):
@@ -288,7 +407,6 @@ class RuntimeOrchestrator:
 
             if self._has_auth_credentials():
                 await self._refresh_portfolio_snapshot()
-                await self._inspect_startup_exchange_state()
                 self._tasks.append(
                     asyncio.create_task(
                         run_periodic(
@@ -314,37 +432,6 @@ class RuntimeOrchestrator:
             else:
                 self._startup_auth_disabled = True
                 self._logger.info("runtime_auth_features_disabled", reason="missing_api_credentials")
-
-            self._logger.info(
-                "warmup_starting",
-                symbols=self._settings.trading.symbols,
-                candle_tf=self._settings.trading.candle_timeframe,
-                regime_tf=self._settings.trading.regime_timeframe,
-            )
-            warmup_results = await preload_warmup_klines(
-                self._rest,
-                self._bar_history,
-                symbols=self._settings.trading.symbols,
-                category=self._settings.trading.category,
-                candle_timeframe=self._settings.trading.candle_timeframe,
-                regime_timeframe=self._settings.trading.regime_timeframe,
-                min_5m_bars=22,
-                min_1h_bars=24,
-            )
-            self._warmup_results = warmup_results
-
-            self._logger.info(
-                "warmup_executed",
-                symbols=self._settings.trading.symbols,
-                candle_timeframe=self._settings.trading.candle_timeframe,
-                regime_timeframe=self._settings.trading.regime_timeframe,
-                results=[{"symbol": r.symbol, "tf": r.timeframe, "bars": r.bars_loaded, "satisfied": r.satisfied} for r in warmup_results],
-            )
-            for sym in self._settings.trading.symbols:
-                counts: dict[str, int] = {}
-                for tf in [self._settings.trading.candle_timeframe, self._settings.trading.regime_timeframe]:
-                    counts[tf] = len(self._bar_history[sym][tf])
-                self._logger.info("warmup_post_snapshot", symbol=sym, bar_counts=counts)
 
             public_topics = _public_topics(
                 symbols=self._settings.trading.symbols,
@@ -397,16 +484,14 @@ class RuntimeOrchestrator:
                     mode=drill_cfg.mode,
                     message="Demo execution drill is enabled; will submit one test order.",
                 )
-            if (
-                self._settings.runtime.mode == RuntimeMode.DEMO
-                and not self._settings.runtime.dry_run
-                and self._can_place_exchange_orders()
-            ):
-                self._tasks.append(
-                    asyncio.create_task(self._demo_drill_cycle(), name="runtime-demo-drill"),
-                )
-
-            self._init_model_filter()
+                if (
+                    self._settings.runtime.mode == RuntimeMode.DEMO
+                    and not self._settings.runtime.dry_run
+                    and self._can_place_exchange_orders()
+                ):
+                    self._tasks.append(
+                        asyncio.create_task(self._demo_drill_cycle(), name="runtime-demo-drill"),
+                    )
 
             self._tasks.append(asyncio.create_task(self._task_supervisor(), name="runtime-supervisor"))
             self._logger.info("runtime_started")
@@ -467,36 +552,13 @@ class RuntimeOrchestrator:
                     self._session_ended_cleanly = False
                     reason = f"task_failed:{task.get_name()}"
                     self._abort_reasons.append(reason)
-                    if task.get_name() == "runtime-decision":
-                        self._metrics.inc("runtime_decision_failures_count")
                     if task.get_name() == "runtime-ws-private":
                         self._health.set_private_stream_error(str(exc))
-                    exc_type = type(exc).__name__
-                    exc_msg = str(exc)
-                    tb_summary = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-1200:]
                     self._logger.exception(
                         "runtime_task_failed",
                         task=task.get_name(),
-                        error=exc_msg,
+                        error=str(exc),
                         abort_reason=reason,
-                    )
-                    await self._ledger.record(
-                        "runtime_decision_task_failed",
-                        {
-                            "task": task.get_name(),
-                            "exception_type": exc_type,
-                            "exception_message": exc_msg,
-                            "abort_reason": reason,
-                            "traceback_summary": tb_summary,
-                        },
-                    )
-                    self._logger.info(
-                        "runtime_decision_task_failed",
-                        task=task.get_name(),
-                        exception_type=exc_type,
-                        exception_message=exc_msg,
-                        abort_reason=reason,
-                        traceback_summary=tb_summary[:500],
                     )
                     self._stop_event.set()
                     return
@@ -766,6 +828,20 @@ class RuntimeOrchestrator:
                         "qty": str(event.qty) if event.qty is not None else "",
                     },
                 )
+                if link_id and new_status:
+                    if not self._is_drill_order_link(link_id):
+                        self._strategy_order_outcomes.apply_order_status_transition(
+                            link_id, prev_status, new_status
+                        )
+                    transitioned_to_filled = new_status == "Filled" and (
+                        prev_status is None or prev_status != "Filled"
+                    )
+                    if transitioned_to_filled:
+                        mo2 = await self._order_manager.get_by_link_id(link_id)
+                        if mo2 is not None and not mo2.reduce_only:
+                            self._metrics.inc("entry_fill_received_count")
+                            self._metrics.inc("strategy_order_filled_count")
+                            await self._ensure_protective_exit_for_filled_entry(mo2)
                 if link_id and self._drill_outcome.order_link_id == link_id and new_status:
                     self._drill_outcome.final_status = new_status
                 if prev_status and prev_status != new_status:
@@ -789,65 +865,6 @@ class RuntimeOrchestrator:
                                 "drill_completed",
                                 {"order_link_id": link_id, "final_status": new_status},
                             )
-                    elif prev and not prev.metadata.get("drill"):
-                        so = self._strategy_order_outcomes
-                        if new_status == "New" and link_id not in so._seen_new:
-                            so._seen_new.add(link_id)
-                            self._logger.info(
-                                "strategy_order_new",
-                                order_link_id=link_id,
-                                symbol=event.symbol or "",
-                            )
-                        elif new_status == "PartiallyFilled" and link_id not in so._seen_partially_filled:
-                            so._seen_partially_filled.add(link_id)
-                            so.partially_filled += 1
-                            self._logger.info(
-                                "strategy_order_partially_filled",
-                                order_link_id=link_id,
-                                symbol=event.symbol or "",
-                            )
-                        elif new_status == "Filled" and link_id not in so._seen_filled:
-                            so._seen_filled.add(link_id)
-                            so.filled += 1
-                            self._logger.info(
-                                "strategy_order_filled",
-                                order_link_id=link_id,
-                                symbol=event.symbol or "",
-                            )
-                            self._metrics.inc("entry_fill_received_count")
-                            await self._ledger.record(
-                                "entry_fill_received",
-                                {
-                                    "order_link_id": link_id,
-                                    "symbol": event.symbol or "",
-                                    "filled_qty": str(event.qty) if event.qty is not None else "",
-                                    "avg_price": str(event.avg_price) if event.avg_price is not None else "",
-                                },
-                            )
-                            self._logger.info(
-                                "entry_fill_received",
-                                order_link_id=link_id,
-                                symbol=event.symbol or "",
-                                filled_qty=str(event.qty) if event.qty else "",
-                                avg_price=str(event.avg_price) if event.avg_price else "",
-                            )
-                            await self._place_protective_exit_after_fill(link_id=link_id, event=event, prev=prev)
-                        elif new_status == "Cancelled" and link_id not in so._seen_cancelled:
-                            so._seen_cancelled.add(link_id)
-                            so.cancelled += 1
-                            self._logger.info(
-                                "strategy_order_cancelled",
-                                order_link_id=link_id,
-                                symbol=event.symbol or "",
-                            )
-                        elif new_status == "Rejected" and link_id not in so._seen_rejected:
-                            so._seen_rejected.add(link_id)
-                            so.rejected += 1
-                            self._logger.info(
-                                "strategy_order_rejected",
-                                order_link_id=link_id,
-                                symbol=event.symbol or "",
-                            )
                     self._logger.info(
                         "order_state_transition",
                         order_link_id=event.order_link_id or "",
@@ -855,10 +872,20 @@ class RuntimeOrchestrator:
                         to_status=new_status,
                     )
             if isinstance(event, NormalizedExecution):
+                exec_id = event.exec_id or ""
+                if exec_id and exec_id in self._seen_fill_exec_ids:
+                    self._logger.info(
+                        "execution_duplicate_skipped",
+                        exec_id=exec_id,
+                        order_link_id=event.order_link_id or "",
+                    )
+                    continue
+                if exec_id:
+                    self._seen_fill_exec_ids.add(exec_id)
                 await self._ledger.record(
                     "fill",
                     {
-                        "exec_id": event.exec_id or "",
+                        "exec_id": exec_id,
                         "order_id": event.order_id or "",
                         "order_link_id": event.order_link_id or "",
                         "symbol": event.symbol or "",
@@ -872,141 +899,23 @@ class RuntimeOrchestrator:
     async def _decision_loop(self) -> None:
         while not self._stop_event.is_set():
             kline = await self._market_state.next_confirmed_kline()
-            self._logger.debug(
-                "decision_loop_kline_consumed",
-                symbol=kline.symbol,
-                interval=kline.interval,
-                confirmed=kline.confirmed,
-            )
             bar = self._candle_builder.on_confirmed_kline(kline)
             if bar is None or not bar.confirmed:
                 continue
 
-            configured = self._settings.trading.symbols
-            effective_symbol = bar.symbol or (
-                configured[0] if len(configured) == 1 else ""
-            )
-            if not effective_symbol:
-                self._logger.warning(
-                    "decision_loop_empty_symbol_skip",
-                    kline_symbol=kline.symbol,
-                    bar_symbol=bar.symbol,
-                    configured_symbols=configured,
-                )
+            history = self._bar_history[bar.symbol][bar.timeframe]
+            history.append(bar)
+            if bar.timeframe != self._settings.trading.candle_timeframe:
                 continue
 
-            bar_to_append: OHLCVBar = (
-                bar
-                if bar.symbol == effective_symbol
-                else OHLCVBar(
-                    symbol=effective_symbol,
-                    timeframe=bar.timeframe,
-                    open_time=bar.open_time,
-                    close_time=bar.close_time,
-                    open=bar.open,
-                    high=bar.high,
-                    low=bar.low,
-                    close=bar.close,
-                    volume=bar.volume,
-                    turnover=bar.turnover,
-                    confirmed=bar.confirmed,
-                )
-            )
-            if not bar.symbol:
-                self._logger.info(
-                    "decision_loop_symbol_fallback_applied",
-                    kline_symbol=kline.symbol,
-                    effective_symbol=effective_symbol,
-                    timeframe=bar_to_append.timeframe,
-                )
+            bars_5m = list(self._bar_history[bar.symbol][self._settings.trading.candle_timeframe])
+            bars_1h = list(self._bar_history[bar.symbol][self._settings.trading.regime_timeframe])
+            candidates = self._candidate_generator.on_closed_candle(bar.symbol, bars_5m)
 
-            history = self._bar_history[effective_symbol][bar_to_append.timeframe]
-            history.append(bar_to_append)
-            if bar_to_append.timeframe != self._settings.trading.candle_timeframe:
-                continue
-
-            bars_5m = list(self._bar_history[effective_symbol][self._settings.trading.candle_timeframe])
-            bars_1h = list(self._bar_history[effective_symbol][self._settings.trading.regime_timeframe])
-            readiness = self._candidate_generator.get_readiness(effective_symbol, bars_5m, bars_1h)
-            candidates = self._candidate_generator.on_closed_candle(effective_symbol, bars_5m)
-            raw_candidates_count = len(candidates)
-            for _ in range(raw_candidates_count):
-                self._metrics.inc("strategy_raw_candidates_total")
-            readiness = dict(readiness)
-            readiness["candidate_count"] = len(candidates)
-            if readiness["reason"] == "ready" and len(candidates) == 0:
-                readiness["reason"] = "no_pattern_match"
-
-            if readiness["reason"] == "no_pattern_match":
-                precondition = self._candidate_generator.get_precondition_report(
-                    effective_symbol, bars_5m
-                )
-                if precondition is not None:
-                    readiness["breakout_precondition"] = precondition.to_log_dict()
-                    self._logger.info(
-                        "breakout_precondition_no_match",
-                        **precondition.to_log_dict(),
-                    )
-                    if (
-                        self._settings.runtime.mode == RuntimeMode.DEMO
-                        and self._settings.runtime.demo_relaxed_candidate_validation
-                        and len(candidates) == 0
-                        and precondition.failed_conditions
-                    ):
-                        relaxed = self._candidate_generator.create_relaxed_validation_candidates(
-                            effective_symbol, precondition, bars_5m
-                        )
-                        for cand in relaxed:
-                            meta = cand.metadata or {}
-                            self._metrics.inc("strategy_relaxed_demo_candidates_created")
-                            self._logger.info(
-                                "demo_candidate_validation_relaxed",
-                                symbol=cand.symbol,
-                                candidate_type=cand.candidate_type.value,
-                                side="Buy" if "long" in cand.candidate_type.value else "Sell",
-                                original_failed_conditions=list(meta.get("original_failed_conditions", [])),
-                                relaxed_reason=meta.get("relaxed_reason", "near_miss"),
-                            )
-                        candidates = relaxed
-
-            self._last_candidate_readiness[effective_symbol] = readiness
-            if len(candidates) == 0:
-                self._logger.info(
-                    "candidate_readiness",
-                    symbol=effective_symbol,
-                    bars_5m=readiness["bars_5m"],
-                    bars_1h=readiness["bars_1h"],
-                    has_enough_5m=readiness["has_enough_5m"],
-                    has_enough_1h=readiness["has_enough_1h"],
-                    unconfirmed_in_5m_window=readiness["unconfirmed_in_5m_window"],
-                    reason=readiness["reason"],
-                    candidate_count=len(candidates),
-                    failed_conditions=readiness.get("breakout_precondition", {}).get(
-                        "failed_conditions", []
-                    ),
-                )
-
-            self._metrics.inc("strategy_bars_confirmed")
-            open_orders = await self._order_manager.get_open_orders(None)
             for candidate in candidates:
-                self._metrics.inc("strategy_candidates_total")
-                regime, regime_report = self._regime_filter.evaluate_with_report(
-                    candidate=candidate, bars_1h=bars_1h
-                )
-                if not regime.allow:
-                    self._metrics.inc("strategy_regime_rejected")
-                    self._last_regime_rejection = regime_report.to_log_dict()
-                    readiness_with_regime = dict(self._last_candidate_readiness.get(effective_symbol, {}))
-                    readiness_with_regime["regime_rejection"] = regime_report.to_log_dict()
-                    self._last_candidate_readiness[effective_symbol] = readiness_with_regime
-                    self._logger.info(
-                        "regime_rejected_detail",
-                        **regime_report.to_log_dict(),
-                    )
-                    continue
+                regime = self._regime_filter.evaluate(candidate=candidate, bars_1h=bars_1h)
                 signal = self._signal_engine.evaluate(candidate, regime)
                 if signal.side is None or signal.reference_price is None:
-                    self._metrics.inc("strategy_signal_rejected")
                     continue
                 await self._ledger.record(
                     "decision",
@@ -1025,241 +934,45 @@ class RuntimeOrchestrator:
                     self._logger.warning("missing_symbol_spec", symbol=signal.symbol)
                     continue
 
-                sizing_inputs = SizingInputs(
-                    equity_usdt=max(self._portfolio.equity_usdt, Decimal("1")),
-                    confidence=signal.confidence,
-                    volatility_bps=regime.volatility_bps,
-                    reference_price=signal.reference_price,
-                    max_leverage=self._settings.risk.max_leverage,
+                qty = self._sizer.size_qty(
+                    SizingInputs(
+                        equity_usdt=max(self._portfolio.equity_usdt, Decimal("1")),
+                        confidence=signal.confidence,
+                        volatility_bps=regime.volatility_bps,
+                        reference_price=signal.reference_price,
+                        max_leverage=self._settings.risk.max_leverage,
+                    ),
+                    symbol_spec,
                 )
-                qty = self._sizer.size_qty(sizing_inputs, symbol_spec)
-                if self._sizer._last_floor_applied and self._sizer._last_floor_details:
-                    self._last_sizing_floor_applied = {
-                        "symbol": signal.symbol,
-                        **self._sizer._last_floor_details,
-                    }
-                    self._logger.info(
-                        "sizing_floor_applied",
-                        symbol=signal.symbol,
-                        **self._sizer._last_floor_details,
-                    )
                 if qty <= 0:
-                    self._metrics.inc("strategy_sizing_rejected")
-                    reason = self._sizer.reject_reason(sizing_inputs, symbol_spec)
-                    self._last_sizing_rejection = {
-                        "symbol": signal.symbol,
-                        "reason": reason or "qty_zero",
-                        "equity_usdt": float(sizing_inputs.equity_usdt),
-                        "confidence": float(sizing_inputs.confidence),
-                        "volatility_bps": float(sizing_inputs.volatility_bps),
-                        "reference_price": float(sizing_inputs.reference_price),
-                        "min_qty": float(symbol_spec.min_qty),
-                        "qty_step": float(symbol_spec.qty_step),
-                    }
-                    self._logger.info(
-                        "sizing_rejected",
-                        symbol=signal.symbol,
-                        reason=reason or "qty_zero",
-                        equity_usdt=float(sizing_inputs.equity_usdt),
-                        confidence=float(sizing_inputs.confidence),
-                        volatility_bps=float(sizing_inputs.volatility_bps),
-                        reference_price=float(sizing_inputs.reference_price),
-                        min_qty=float(symbol_spec.min_qty),
-                    )
                     continue
 
-                risk_ctx = RiskEvaluationContext(
-                    candidate_type=candidate.candidate_type.value,
-                    orphan_position_blocked=self._orphan_position_blocked,
-                    current_open_orders_count=sum(1 for o in open_orders if o.symbol == signal.symbol),
-                )
-                risk, risk_report = self._risk_engine.evaluate_with_report(
+                risk = self._risk_engine.evaluate(
                     signal=signal,
                     portfolio=self._portfolio,
                     expected_order_notional=qty * signal.reference_price,
-                    context=risk_ctx,
                 )
                 if not risk.approved:
-                    self._metrics.inc("strategy_risk_rejected")
-                    report_dict = risk_report.to_log_dict()
-                    self._last_risk_rejection = report_dict
-                    readiness_with_risk = dict(self._last_candidate_readiness.get(effective_symbol, {}))
-                    readiness_with_risk["risk_rejection"] = report_dict
-                    self._last_candidate_readiness[effective_symbol] = readiness_with_risk
-                    self._logger.info("risk_rejected_detail", **report_dict)
-                    continue
-
-                if self._model_filter_active:
-                    from trading.models.filter_predictor import score_for_filter
-
-                    mf_mode = self._model_filter_mode
-                    model_filter_threshold = (
-                        self._model_filter_threshold
-                        if self._model_filter_threshold is not None
-                        else 0.5
-                    )
-                    pred_result, allow = score_for_filter(
-                        self._model_filter_model,
-                        symbol=signal.symbol,
-                        action=signal.action.value,
-                        side=signal.side.value if signal.side else None,
-                        qty=float(qty),
-                        risk_approved=True,
-                        reference_price=signal.reference_price,
-                        confidence=signal.confidence,
-                        ts_utc=utc_now(),
-                        threshold=model_filter_threshold,
-                    )
-                    mf = self._strategy_order_outcomes.model_filter
-                    mf.threshold = model_filter_threshold
-                    mf.mode = mf_mode.value
-                    self._metrics.inc("strategy_model_filter_reached")
-                    if not pred_result.available:
-                        mf.prediction_unavailable += 1
-                        self._metrics.inc("strategy_model_blocked")
-                        self._logger.info(
-                            "model_filter_prediction_unavailable",
-                            symbol=signal.symbol,
-                            note=pred_result.feature_missing_note,
-                        )
-                        continue
-                    prob = pred_result.prob_fill
-                    mf.prob_count += 1
-                    mf.prob_latest = prob
-                    if mf.prob_min is None or prob < mf.prob_min:
-                        mf.prob_min = prob
-                    if mf.prob_max is None or prob > mf.prob_max:
-                        mf.prob_max = prob
-                    if pred_result.features_used is not None:
-                        mf.latest_features = dict(pred_result.features_used)
-                    would_block = not allow
-                    bar_close_time = bars_5m[-1].close_time if bars_5m else None
-                    self._record_model_decision(
-                        symbol=signal.symbol,
-                        candidate_type=candidate.candidate_type.value,
-                        side=signal.side.value if signal.side else None,
-                        bar_close_time=bar_close_time,
-                        model_probability=float(prob),
-                        threshold=model_filter_threshold,
-                        shadow_would_block=would_block,
-                        allow=allow if mf_mode != ModelFilterMode.SHADOW else None,
-                        reference_price=signal.reference_price,
-                        confidence=signal.confidence,
-                        qty=qty,
-                    )
-                    if mf_mode == ModelFilterMode.SHADOW:
-                        if would_block:
-                            mf.shadow_would_have_blocked += 1
-                            self._logger.info(
-                                "model_filter_shadow_would_have_blocked",
-                                symbol=signal.symbol,
-                                prob_fill=prob,
-                                threshold=model_filter_threshold,
-                            )
-                        else:
-                            mf.allowed += 1
-                            self._logger.info(
-                                "model_filter_allowed",
-                                symbol=signal.symbol,
-                                prob_fill=prob,
-                                threshold=model_filter_threshold,
-                            )
-                    elif would_block:
-                        mf.blocked += 1
-                        self._metrics.inc("strategy_model_blocked")
-                        self._logger.info(
-                            "model_filter_blocked",
-                            symbol=signal.symbol,
-                            prob_fill=prob,
-                            threshold=model_filter_threshold,
-                        )
-                        continue
-                    else:
-                        mf.allowed += 1
-                        self._logger.info(
-                            "model_filter_allowed",
-                            symbol=signal.symbol,
-                            prob_fill=prob,
-                            threshold=model_filter_threshold,
-                        )
-
-                if self._startup_state_blocked:
                     self._logger.info(
-                        "startup_state_skipped_trade",
+                        "signal_blocked_by_risk",
                         symbol=signal.symbol,
-                        reason="startup_state_blocked",
-                    )
-                    continue
-                if self._orphan_position_blocked:
-                    self._logger.info(
-                        "orphan_position_skipped_trade",
-                        symbol=signal.symbol,
-                        reason="orphan_position_blocked",
+                        reason=risk.reason,
+                        metadata=risk.metadata,
                     )
                     continue
 
-                open_orders_fresh = await self._order_manager.get_open_orders(None)
-                blocked, block_reason, guard_payload = self._should_block_new_entry(
-                    signal.symbol, open_orders_fresh
-                )
-                diag = {
-                    **guard_payload,
-                    "blocked": blocked,
-                    "block_reason": block_reason,
-                }
-                self._logger.debug("entry_guard_evaluated", **diag)
-                if blocked:
-                    block_bucket = guard_payload.get("block_reason_bucket", block_reason or "unknown")
-                    self._entry_guard_block_reasons.append({
-                        "symbol": signal.symbol,
-                        "block_reason": block_reason,
-                        "block_reason_bucket": block_bucket,
-                        "current_position_size": guard_payload.get("current_position_size"),
-                        "open_entry_count": guard_payload.get("open_entry_order_count"),
-                        "open_reduce_only_count": guard_payload.get("open_reduce_only_order_count"),
-                    })
-                    if block_reason == "existing_position":
-                        self._metrics.inc("position_add_blocked_count")
-                        self._metrics.inc("entry_guard_block_non_flat_count")
-                        self._logger.info(
-                            "entry_blocked_existing_position",
-                            **guard_payload,
-                            block_reason_bucket=block_bucket,
-                        )
-                    elif block_reason == "existing_working_entry":
-                        self._metrics.inc("working_entry_blocked_count")
-                        self._metrics.inc("entry_guard_block_working_entry_count")
-                        self._logger.info(
-                            "entry_blocked_existing_working_entry",
-                            **guard_payload,
-                            block_reason_bucket=block_bucket,
-                        )
-                    elif block_reason == "max_concurrent_entries":
-                        self._metrics.inc("entry_guard_block_max_concurrent_count")
-                        self._logger.info(
-                            "entry_blocked_max_concurrent_entries",
-                            **guard_payload,
-                            block_reason_bucket=block_bucket,
-                        )
-                    continue
-
-                force_marketable = (
-                    self._settings.runtime.mode == RuntimeMode.DEMO
-                    and self._settings.runtime.demo_force_marketable_entries
-                )
                 intent = self._execution_engine.build_entry_intent(
                     signal=signal,
                     qty=qty,
                     reference_price=signal.reference_price,
                     now=utc_now(),
-                    force_marketable=force_marketable,
                 )
                 if intent is None:
                     continue
 
                 await self._order_manager.register_intent(intent)
-                self._metrics.inc("order_intents_total")
                 self._strategy_order_outcomes.intents += 1
+                self._metrics.inc("order_intents_total")
                 await self._ledger.record(
                     "order_intent",
                     {
@@ -1268,11 +981,10 @@ class RuntimeOrchestrator:
                         "qty": str(intent.qty),
                         "order_link_id": intent.order_link_id,
                         "reduce_only": str(intent.reduce_only),
-                        "reference_price": str(signal.reference_price),
                     },
                 )
                 self._logger.info(
-                    "strategy_order_intent_created",
+                    "order_intent_created",
                     symbol=intent.symbol,
                     side=intent.side.value,
                     qty=str(intent.qty),
@@ -1283,195 +995,14 @@ class RuntimeOrchestrator:
                 if self._can_place_exchange_orders():
                     await self._submit_intent(intent, is_drill=False)
 
-    async def _place_protective_exit_after_fill(
-        self,
-        *,
-        link_id: str,
-        event: NormalizedOrderUpdate,
-        prev: object,
-    ) -> None:
-        """On entry fill: create, register, and submit reduce-only protective exit. Orphan block remains if placement fails."""
-        from trading.execution.order_manager import ManagedOrder
-
-        if not isinstance(prev, ManagedOrder):
-            return
-        if prev.reduce_only:
-            return
-        signal_action = prev.metadata.get("signal_action")
-        if signal_action == "enter_long":
-            side_to_close = PositionSide.LONG
-        elif signal_action == "enter_short":
-            side_to_close = PositionSide.SHORT
-        else:
-            self._logger.warning(
-                "protective_exit_placement_skipped",
-                order_link_id=link_id,
-                reason="unknown_signal_action",
-                signal_action=signal_action,
-            )
-            return
-        symbol = prev.symbol or event.symbol or ""
-        if not symbol:
-            self._logger.warning("protective_exit_placement_skipped", order_link_id=link_id, reason="missing_symbol")
-            return
-        filled_qty = prev.filled_qty if prev.filled_qty and prev.filled_qty > 0 else event.qty
-        if not filled_qty or filled_qty <= 0:
-            self._logger.warning(
-                "protective_exit_placement_skipped",
-                order_link_id=link_id,
-                symbol=symbol,
-                reason="zero_filled_qty",
-            )
-            return
-        entry_avg_price = prev.avg_price or event.avg_price
-        if not entry_avg_price or entry_avg_price <= 0:
-            self._logger.warning(
-                "protective_exit_placement_skipped",
-                order_link_id=link_id,
-                symbol=symbol,
-                reason="missing_avg_price",
-            )
-            return
-        symbol_spec = self._symbol_specs.get(symbol)
-        if symbol_spec is None:
-            self._logger.warning(
-                "protective_exit_placement_skipped",
-                order_link_id=link_id,
-                symbol=symbol,
-                reason="missing_symbol_spec",
-            )
-            return
-        exit_intent = self._execution_engine.build_protective_limit_exit(
-            symbol=symbol,
-            side_to_close=side_to_close,
-            qty=filled_qty,
-            entry_avg_price=entry_avg_price,
-            price_tick=symbol_spec.price_tick,
-            qty_step=symbol_spec.qty_step,
-            now=utc_now(),
-        )
-        if exit_intent is None:
-            self._logger.warning(
-                "protective_exit_placement_failed",
-                order_link_id=link_id,
-                symbol=symbol,
-                reason="build_intent_returned_none",
-            )
-            self._metrics.inc("protective_exit_placement_failed_count")
-            await self._ledger.record(
-                "protective_exit_placement_failed",
-                {
-                    "entry_order_link_id": link_id,
-                    "symbol": symbol,
-                    "reason": "build_intent_returned_none",
-                },
-            )
-            return
-        self._metrics.inc("protective_exit_plan_created_count")
-        await self._ledger.record(
-            "protective_exit_plan_created",
-            {
-                "entry_order_link_id": link_id,
-                "symbol": symbol,
-                "qty": str(exit_intent.qty),
-                "price": str(exit_intent.price) if exit_intent.price else "",
-                "side": exit_intent.side.value,
-            },
-        )
-        self._logger.info(
-            "protective_exit_plan_created",
-            entry_order_link_id=link_id,
-            symbol=symbol,
-            qty=str(exit_intent.qty),
-            price=str(exit_intent.price) if exit_intent.price else "",
-        )
-        await self._order_manager.register_intent(exit_intent)
-        self._metrics.inc("protective_exit_tracking_registered_count")
-        await self._ledger.record(
-            "protective_exit_tracking_registered",
-            {"order_link_id": exit_intent.order_link_id, "symbol": symbol},
-        )
-        self._logger.info(
-            "protective_exit_tracking_registered",
-            order_link_id=exit_intent.order_link_id,
-            symbol=symbol,
-        )
-        if not self._can_place_exchange_orders():
-            self._logger.warning(
-                "protective_exit_order_not_submitted",
-                order_link_id=exit_intent.order_link_id,
-                symbol=symbol,
-                reason="placement_disabled",
-            )
-            self._metrics.inc("protective_exit_placement_failed_count")
-            await self._ledger.record(
-                "protective_exit_placement_failed",
-                {
-                    "order_link_id": exit_intent.order_link_id,
-                    "symbol": symbol,
-                    "reason": "placement_disabled",
-                },
-            )
-            return
-        self._metrics.inc("protective_exit_order_submitted_count")
-        await self._ledger.record(
-            "protective_exit_order_submitted",
-            {
-                "order_link_id": exit_intent.order_link_id,
-                "symbol": symbol,
-                "qty": str(exit_intent.qty),
-            },
-        )
-        self._logger.info(
-            "protective_exit_order_submitted",
-            order_link_id=exit_intent.order_link_id,
-            symbol=symbol,
-            qty=str(exit_intent.qty),
-        )
-        try:
-            await self._submit_intent(exit_intent, is_drill=False)
-            order_after = await self._order_manager.get_by_link_id(exit_intent.order_link_id)
-            if order_after and order_after.order_id:
-                self._metrics.inc("protective_exit_order_ack_received_count")
-                await self._ledger.record(
-                    "protective_exit_order_ack_received",
-                    {"order_link_id": exit_intent.order_link_id, "order_id": order_after.order_id, "symbol": symbol},
-                )
-                self._logger.info(
-                    "protective_exit_order_ack_received",
-                    order_link_id=exit_intent.order_link_id,
-                    order_id=order_after.order_id,
-                    symbol=symbol,
-                )
-        except BybitRestError as exc:
-            reason = str(exc)
-            if isinstance(exc, BybitAPIError):
-                reason = f"ret_code={exc.ret_code} ret_msg={exc.ret_msg}"
-            self._logger.warning(
-                "protective_exit_placement_failed",
-                order_link_id=exit_intent.order_link_id,
-                symbol=symbol,
-                reason=reason,
-            )
-            self._metrics.inc("protective_exit_placement_failed_count")
-            await self._ledger.record(
-                "protective_exit_placement_failed",
-                {
-                    "entry_order_link_id": link_id,
-                    "order_link_id": exit_intent.order_link_id,
-                    "symbol": symbol,
-                    "reason": reason,
-                },
-            )
-
     async def _submit_intent(self, intent: object, *, is_drill: bool = False) -> None:
         from trading.execution.order_intent import OrderIntent
 
         if not isinstance(intent, OrderIntent):
             return
-        self._metrics.inc("order_submissions_total")
-        if not is_drill:
+        if not is_drill and intent.purpose == IntentPurpose.ENTRY:
             self._strategy_order_outcomes.submissions += 1
+        self._metrics.inc("order_submissions_total")
         await self._ledger.record(
             "order_submission_attempt",
             {
@@ -1489,14 +1020,6 @@ class RuntimeOrchestrator:
             side=intent.side.value,
             qty=str(intent.qty),
         )
-        if not is_drill:
-            self._logger.info(
-                "strategy_order_submitted",
-                order_link_id=intent.order_link_id,
-                symbol=intent.symbol,
-                side=intent.side.value,
-                qty=str(intent.qty),
-            )
         try:
             ack = await self._rest.place_order(
                 PlaceOrderRequest(
@@ -1528,19 +1051,14 @@ class RuntimeOrchestrator:
                     {"order_link_id": ack.order_link_id, "order_id": ack.order_id},
                 )
                 self._logger.info("drill_ack_received", order_link_id=ack.order_link_id, order_id=ack.order_id)
-            else:
-                self._strategy_order_outcomes.acks += 1
-                self._logger.info(
-                    "strategy_order_ack_received",
-                    order_link_id=ack.order_link_id,
-                    order_id=ack.order_id,
-                )
             self._logger.info(
                 "order_ack_received",
                 order_link_id=ack.order_link_id,
                 order_id=ack.order_id,
             )
             self._metrics.inc("order_acks_total")
+            if not is_drill and intent.purpose == IntentPurpose.ENTRY:
+                self._strategy_order_outcomes.acks += 1
         except BybitRestError as exc:
             if is_drill and isinstance(intent, OrderIntent) and self._drill_outcome.order_link_id == intent.order_link_id:
                 self._drill_outcome.aborted = True
@@ -1658,77 +1176,6 @@ class RuntimeOrchestrator:
         self._metrics.set_gauge("equity_usdt", float(self._portfolio.equity_usdt))
         self._metrics.set_gauge("available_usdt", float(self._portfolio.available_balance_usdt))
 
-    async def _inspect_startup_exchange_state(self) -> None:
-        """Inspect exchange positions and orders at startup; block if dirty state detected."""
-        if not self._has_auth_credentials():
-            return
-        try:
-            positions: list = []
-            exchange_orders: list = []
-            for sym in self._settings.trading.symbols:
-                pos_list = await self._rest.get_positions(
-                    category=self._settings.trading.category, symbol=sym
-                )
-                positions.extend(pos_list)
-                orders = await self._rest.get_open_orders(
-                    category=self._settings.trading.category, symbol=sym
-                )
-                exchange_orders.extend(orders)
-        except BybitRestError as exc:
-            self._logger.warning("startup_exchange_inspect_failed", error=str(exc))
-            return
-        local_open = await self._order_manager.get_open_orders(None)
-        local_order_state_empty = len(local_open) == 0
-        details: list[dict[str, object]] = []
-        dirty = False
-        for sym in self._settings.trading.symbols:
-            sym_positions = [p for p in positions if p.symbol == sym]
-            sym_orders = [o for o in exchange_orders if o.symbol == sym]
-            non_flat = any(p.size > 0 for p in sym_positions)
-            pos_size = Decimal("0")
-            pos_side = ""
-            for p in sym_positions:
-                if p.size > 0:
-                    pos_size = p.size
-                    pos_side = p.side or ""
-                    break
-            reduce_only_count = sum(1 for o in sym_orders if o.reduce_only)
-            non_reduce_only_count = len(sym_orders) - reduce_only_count
-            order_count = len(sym_orders)
-            sym_dirty = non_flat or (non_reduce_only_count > 0)
-            if sym_dirty:
-                dirty = True
-                d: dict[str, object] = {
-                    "symbol": sym,
-                    "position_size": float(pos_size),
-                    "position_side": pos_side,
-                    "open_order_count": order_count,
-                    "reduce_only_order_count": reduce_only_count,
-                    "non_reduce_only_order_count": non_reduce_only_count,
-                    "local_order_state_empty_or_not": local_order_state_empty,
-                }
-                details.append(d)
-        if dirty:
-            self._logger.warning(
-                "startup_dirty_exchange_state",
-                details=details,
-                local_order_state_empty=local_order_state_empty,
-            )
-            if not self._startup_state_blocked:
-                self._metrics.inc("startup_state_blocked_count")
-            self._startup_state_blocked = True
-            self._startup_state_details = details
-            self._startup_block_reason = "dirty_at_startup"
-            self._logger.warning(
-                "startup_state_blocked",
-                details_count=len(details),
-                note="Exchange has non-flat position or open orders. No new entries until resolved.",
-            )
-            await self._ledger.record(
-                "startup_dirty_exchange_state",
-                {"details": details, "local_order_state_empty": local_order_state_empty},
-            )
-
     async def _reconcile_cycle(self) -> None:
         if not self._has_auth_credentials():
             return
@@ -1752,217 +1199,9 @@ class RuntimeOrchestrator:
                 self._logger.warning("reconcile_failed", error=str(exc))
             return
 
-        missing_on_exchange_issues = [
-            i for i in report_orders.issues if i.issue_type == "missing_on_exchange"
-        ]
-        resolved_missing_count = 0
-        for issue in missing_on_exchange_issues:
-            link_id = issue.order_link_id or ""
-            self._metrics.inc("missing_on_exchange_detected_count")
-            order = await self._order_manager.get_by_link_id(link_id)
-            prev_status = order.status.value if order else "unknown"
-            if await self._order_manager.mark_closed_missing_on_exchange(
-                order_link_id=link_id, updated_at=utc_now()
-            ):
-                resolved_missing_count += 1
-                self._metrics.inc("missing_on_exchange_resolved_count")
-                payload_resolved: dict[str, object] = {
-                    "order_link_id": link_id,
-                    "order_id": issue.order_id or "",
-                    "symbol": issue.symbol or "",
-                    "previous_local_status": prev_status,
-                    "new_local_status": "Cancelled",
-                    "reason": "closed_missing_on_exchange",
-                }
-                await self._ledger.record(
-                    "reconcile_missing_on_exchange_resolved",
-                    payload_resolved,
-                )
-                self._logger.info(
-                    "local_order_closed_missing_on_exchange",
-                    order_link_id=link_id,
-                    order_id=issue.order_id or "",
-                    symbol=issue.symbol or "",
-                    previous_local_status=prev_status,
-                    new_local_status="Cancelled",
-                    reason="closed_missing_on_exchange",
-                )
-                self._logger.info(
-                    "reconcile_missing_on_exchange_resolved",
-                    **payload_resolved,
-                )
-
-        only_missing_on_exchange = all(
-            i.issue_type == "missing_on_exchange" for i in report_orders.issues
-        )
-        all_missing_resolved = (
-            len(missing_on_exchange_issues) == 0
-            or resolved_missing_count == len(missing_on_exchange_issues)
-        )
-        positions_ok = report_positions.ok
-
-        only_syncable_order_issues = all(
-            i.issue_type in ("missing_locally", "qty_mismatch") for i in report_orders.issues
-        ) if report_orders.issues else False
-        recoverable_via_missing_locally_sync = (
-            only_syncable_order_issues and positions_ok
-        )
-
-        for issue in report_orders.issues:
-            if issue.issue_type == "missing_locally":
-                self._logger.info(
-                    "reconcile_missing_locally_detected",
-                    symbol=issue.symbol or "",
-                    order_link_id=issue.order_link_id or "",
-                    order_id=issue.order_id or "",
-                    reduce_only=issue.reduce_only,
-                    qty=float(issue.qty) if issue.qty is not None else None,
-                )
-                await self._ledger.record(
-                    "reconcile_missing_locally_synced",
-                    {
-                        "symbol": issue.symbol or "",
-                        "order_link_id": issue.order_link_id or "",
-                        "order_id": issue.order_id or "",
-                        "reduce_only": issue.reduce_only,
-                        "qty": str(issue.qty) if issue.qty is not None else None,
-                        "note": "reconciler_upserted_in_same_cycle",
-                    },
-                )
-                self._logger.info(
-                    "reconcile_missing_locally_synced",
-                    symbol=issue.symbol or "",
-                    order_link_id=issue.order_link_id or "",
-                    reduce_only=issue.reduce_only,
-                )
-
-        recoverable_via_missing_resolution = (
-            only_missing_on_exchange and all_missing_resolved and positions_ok
-        )
-
-        if recoverable_via_missing_resolution:
-            self._consecutive_reconcile_mismatches = 0
-            if self._orphan_position_blocked:
-                self._orphan_position_blocked = False
-                self._metrics.inc("orphan_position_block_cleared_count")
-                self._orphan_position_details = []
-                self._logger.info("orphan_position_block_cleared", note="position_flat_or_protected")
-            if self._startup_state_blocked:
-                self._startup_state_blocked = False
-                self._metrics.inc("startup_state_block_cleared_count")
-                self._startup_state_details = []
-                self._logger.info(
-                    "startup_state_block_cleared",
-                    note="missing_on_exchange_resolved_exchange_clean",
-                )
-            await self._ledger.record(
-                "reconcile_ok",
-                {
-                    "order_issues": 0,
-                    "position_issues": 0,
-                    "missing_on_exchange_resolved": resolved_missing_count,
-                },
-            )
-        elif recoverable_via_missing_locally_sync:
-            self._consecutive_reconcile_mismatches = 0
-            if self._orphan_position_blocked:
-                self._orphan_position_blocked = False
-                self._metrics.inc("orphan_position_block_cleared_count")
-                self._orphan_position_details = []
-                self._logger.info("orphan_position_block_cleared", note="position_flat_or_protected")
-            missing_locally_issues = [i for i in report_orders.issues if i.issue_type == "missing_locally"]
-            all_missing_locally_reduce_only = all(
-                i.reduce_only is True for i in missing_locally_issues
-            )
-            if all_missing_locally_reduce_only and self._startup_state_blocked:
-                self._startup_state_blocked = False
-                self._metrics.inc("startup_state_block_cleared_count")
-                self._startup_state_details = []
-                self._logger.info(
-                    "startup_state_block_cleared",
-                    note="missing_locally_synced_local_state_converged",
-                )
-                self._logger.info(
-                    "startup_state_block_cleared_after_missing_locally_sync",
-                    symbols=list({i.symbol or "" for i in report_orders.issues if i.symbol}),
-                    order_link_ids=[i.order_link_id for i in report_orders.issues if i.order_link_id],
-                    startup_block_cleared=True,
-                )
-            elif not all_missing_locally_reduce_only and missing_locally_issues:
-                self._logger.info(
-                    "missing_locally_synced_startup_block_kept",
-                    reason="non_reduce_only_or_unknown",
-                    symbols=[i.symbol or "" for i in missing_locally_issues],
-                    reduce_only_flags=[i.reduce_only for i in missing_locally_issues],
-                )
-            await self._ledger.record(
-                "reconcile_ok",
-                {
-                    "order_issues": 0,
-                    "position_issues": 0,
-                    "missing_locally_synced": len(missing_locally_issues),
-                    "qty_mismatch_synced": len([i for i in report_orders.issues if i.issue_type == "qty_mismatch"]),
-                },
-            )
-        elif not report_orders.ok or not report_positions.ok:
+        if not report_orders.ok or not report_positions.ok:
             self._metrics.inc("reconcile_mismatch_cycles")
             self._consecutive_reconcile_mismatches += 1
-            now_ts = utc_now().isoformat()
-            for issue in report_orders.issues + report_positions.issues:
-                self._reconcile_mismatch_accumulator.append({
-                    "issue_type": issue.issue_type,
-                    "symbol": issue.symbol,
-                    "details": issue.details,
-                    "occurred_at": now_ts,
-                })
-            if not self._startup_state_blocked:
-                self._metrics.inc("startup_state_blocked_count")
-            self._startup_state_blocked = True
-            orphan_issues = [i for i in report_positions.issues if i.issue_type == "missing_reduce_only_exit"]
-            if orphan_issues:
-                self._startup_block_reason = "reconcile_missing_reduce_only_exit"
-                self._startup_state_details = [
-                    {
-                        "symbol": i.symbol or "unknown",
-                        "position_size": float(i.position_size) if i.position_size is not None else None,
-                        "position_side": i.position_side or "unknown",
-                        "reason": "reconcile_missing_reduce_only_exit",
-                    }
-                    for i in orphan_issues
-                ]
-            elif report_orders.issues:
-                self._startup_block_reason = "reconcile_order_mismatch"
-                issue_types = {}
-                for i in report_orders.issues:
-                    issue_types[i.issue_type] = issue_types.get(i.issue_type, 0) + 1
-                self._startup_state_details = [
-                    {
-                        "reason": "reconcile_order_mismatch",
-                        "issue_types": issue_types,
-                        "affected_symbols": list({i.symbol or "_unknown_" for i in report_orders.issues}),
-                    }
-                ]
-            if orphan_issues:
-                if not self._orphan_position_blocked:
-                    self._metrics.inc("orphan_position_blocked_count")
-                self._orphan_position_blocked = True
-                self._orphan_position_details = [
-                    {
-                        "symbol": i.symbol or "unknown",
-                        "position_size": float(i.position_size) if i.position_size is not None else None,
-                        "side": i.position_side or "unknown",
-                        "reason": "non_flat_position_no_tracked_reduce_only_exit",
-                    }
-                    for i in orphan_issues
-                ]
-                for d in self._orphan_position_details:
-                    self._logger.warning(
-                        "orphan_position_blocked",
-                        symbol=d["symbol"],
-                        position_size=d["position_size"],
-                        side=d["side"],
-                        reason=d["reason"],
-                    )
             if self._consecutive_reconcile_mismatches >= 3 and "repeated_reconcile_mismatch" not in self._abort_reasons:
                 self._abort_reasons.append("repeated_reconcile_mismatch")
                 self._logger.warning(
@@ -2004,12 +1243,6 @@ class RuntimeOrchestrator:
                 affected_order_link_ids=affected_link_ids if affected_link_ids else None,
                 affected_order_ids=affected_order_ids if affected_order_ids else None,
             )
-            from trading.runtime.reconcile_diagnostics import bucket_details
-            by_bucket: dict[str, int] = {}
-            for i in order_issues + position_issues:
-                b = bucket_details(i.details)
-                by_bucket[b] = by_bucket.get(b, 0) + 1
-            self._logger.info("reconcile_issue_bucketed", by_reason_bucket=by_bucket)
             recovery_note = (
                 "local_synced_from_exchange_for_missing_locally_qty_mismatch; "
                 "no_auto_cancel_for_missing_on_exchange; no_auto_place_implemented"
@@ -2031,16 +1264,6 @@ class RuntimeOrchestrator:
             self._metrics.inc("reconcile_issues_total", float(len(order_issues) + len(position_issues)))
         else:
             self._consecutive_reconcile_mismatches = 0
-            if self._orphan_position_blocked:
-                self._orphan_position_blocked = False
-                self._metrics.inc("orphan_position_block_cleared_count")
-                self._orphan_position_details = []
-                self._logger.info("orphan_position_block_cleared", note="position_flat_or_protected")
-            if self._startup_state_blocked:
-                self._startup_state_blocked = False
-                self._metrics.inc("startup_state_block_cleared_count")
-                self._startup_state_details = []
-                self._logger.info("startup_state_block_cleared", note="exchange_flat_no_unsafe_orders")
             await self._ledger.record(
                 "reconcile_ok",
                 {"order_issues": 0, "position_issues": 0},
@@ -2056,21 +1279,6 @@ class RuntimeOrchestrator:
                 elif post_ack == "ack_only_no_transition":
                     payload["note"] = "drill_ack_received_no_further_transition"
                 await self._ledger.record("drill_reconcile_result", payload)
-            open_orders = await self._order_manager.get_open_orders(None)
-            drill_link = self._drill_outcome.order_link_id or ""
-            strategy_resting = [
-                o for o in open_orders
-                if not o.metadata.get("drill") and o.order_link_id != drill_link
-            ]
-            if strategy_resting:
-                await self._ledger.record(
-                    "reconcile_strategy_orders_resting",
-                    {
-                        "count": len(strategy_resting),
-                        "order_link_ids": [o.order_link_id for o in strategy_resting],
-                        "note": "strategy_orders_resting_at_reconcile",
-                    },
-                )
         self._health.mark_reconcile()
 
     async def _watchdog_cycle(self) -> None:
@@ -2137,159 +1345,12 @@ class RuntimeOrchestrator:
             and not self._settings.runtime.dry_run
         )
 
-    def _record_model_decision(
-        self,
-        *,
-        symbol: str,
-        candidate_type: str,
-        side: str | None,
-        bar_close_time: datetime | None,
-        model_probability: float,
-        threshold: float,
-        shadow_would_block: bool,
-        allow: bool | None = None,
-        reference_price: Decimal | None = None,
-        confidence: Decimal | None = None,
-        qty: Decimal | None = None,
-    ) -> None:
-        """Record per-candidate model decision for shadow evaluation. Bounded to last N."""
-        ts = utc_now()
-        record: dict[str, object] = {
-            "symbol": symbol,
-            "candidate_type": candidate_type,
-            "side": side,
-            "timestamp": ts.isoformat(),
-            "bar_close_time": bar_close_time.isoformat() if bar_close_time else None,
-            "model_probability": model_probability,
-            "threshold": threshold,
-            "shadow_would_block": shadow_would_block,
-            "strategy_submitted": False,
-            "blocking_stage": "model_evaluated",
-        }
-        if allow is not None:
-            record["allow"] = allow
-        if reference_price is not None:
-            record["reference_price"] = float(reference_price)
-        if confidence is not None:
-            record["confidence"] = float(confidence)
-        if qty is not None:
-            record["qty"] = float(qty)
-        while len(self._model_shadow_decisions) >= self._model_shadow_decisions_max:
-            self._model_shadow_decisions.pop(0)
-        self._model_shadow_decisions.append(record)
-        if self._model_filter_mode == ModelFilterMode.SHADOW:
-            self._logger.info(
-                "model_filter_shadow_decision",
-                symbol=symbol,
-                candidate_type=candidate_type,
-                side=side,
-                timestamp=record["timestamp"],
-                bar_close_time=record["bar_close_time"],
-                model_probability=model_probability,
-                threshold=threshold,
-                shadow_would_block=shadow_would_block,
-            )
-        else:
-            self._logger.info(
-                "model_filter_active_decision",
-                symbol=symbol,
-                candidate_type=candidate_type,
-                side=side,
-                model_probability=model_probability,
-                threshold=threshold,
-                allow=allow,
-            )
-
-    def _init_model_filter(self) -> None:
-        """Load model artifact and enable DEMO-only filter. Never active in LIVE."""
-        from trading.models.filter_artifact import load_model_artifact
-        from trading.models.filter_predictor import RUNTIME_FEATURE_NAMES
-        from trading.research.datasets.prepare import FEATURE_NAMES
-
-        enabled = self._settings.runtime.model_filter_enabled
-        path = self._settings.runtime.model_artifact_path
-
-        if self._settings.runtime.mode != RuntimeMode.DEMO:
-            if enabled:
-                self._logger.warning(
-                    "model_filter_disabled_not_demo",
-                    mode=self._settings.runtime.mode.value,
-                    message="Model filter is DEMO-only; disabled in non-DEMO mode.",
-                )
-            self._logger.info(
-                "model_filter_status",
-                model_filter_enabled=False,
-                model_loaded=False,
-                model_filter_active=False,
-            )
-            return
-
-        if not enabled:
-            self._logger.info(
-                "model_filter_status",
-                model_filter_enabled=False,
-                model_loaded=False,
-                model_filter_active=False,
-            )
-            return
-
-        if path is None or not path:
-            self._logger.info(
-                "model_filter_status",
-                model_filter_enabled=True,
-                model_loaded=False,
-                model_filter_active=False,
-                note="model_artifact_path not set",
-            )
-            return
-
-        result = load_model_artifact(path)
-        if not result.loaded:
-            self._logger.info(
-                "model_filter_status",
-                model_filter_enabled=True,
-                model_loaded=False,
-                model_filter_active=False,
-                path=str(result.path),
-                error=result.error,
-            )
-            return
-
-        if tuple(FEATURE_NAMES) != tuple(RUNTIME_FEATURE_NAMES):
-            self._logger.warning(
-                "model_filter_feature_mismatch",
-                offline_features=list(FEATURE_NAMES),
-                runtime_features=list(RUNTIME_FEATURE_NAMES),
-                message="Runtime features differ from offline expectations; predictions may be unreliable.",
-            )
-
-        self._model_filter_model = result.model
-        self._model_filter_active = True
-        mf_mode = self._settings.runtime.model_filter_mode
-        mf_threshold = self._settings.runtime.model_filter_threshold
-        self._model_filter_mode = mf_mode
-        self._model_filter_threshold = mf_threshold
-        effective_threshold = mf_threshold if mf_threshold is not None else 0.5
-        self._strategy_order_outcomes.model_filter.threshold = effective_threshold
-        self._strategy_order_outcomes.model_filter.mode = mf_mode.value
-        self._logger.info(
-            "model_filter_status",
-            model_filter_enabled=True,
-            model_loaded=True,
-            model_filter_active=True,
-            path=str(result.path),
-            mode=mf_mode.value,
-            threshold=effective_threshold,
-        )
-
     def _log_startup_capabilities(self) -> None:
         """Log a concise startup capability summary (enabled/disabled)."""
         private_stream = self._can_use_private_stream()
         persistence_postgres = self._postgres_store._dsn is not None
         persistence_parquet = True
         place_orders = self._can_place_exchange_orders()
-        allow_adds = self._settings.runtime.allow_position_adds
-        max_entries = self._settings.runtime.max_concurrent_entries_per_symbol
         self._logger.info(
             "runtime_capabilities",
             private_stream=private_stream,
@@ -2298,9 +1359,6 @@ class RuntimeOrchestrator:
             place_exchange_orders=place_orders,
             dry_run=self._settings.runtime.dry_run,
             safe_mode=self._settings.risk.safe_mode,
-            entry_guard_enabled=True,
-            allow_position_adds=allow_adds,
-            max_concurrent_entries_per_symbol=max_entries,
         )
 
     def _log_durable_sinks(self) -> None:
@@ -2362,278 +1420,29 @@ class RuntimeOrchestrator:
             dry_run=dry_run,
         )
 
-    def _should_block_new_entry(
-        self, symbol: str, open_orders: list
-    ) -> tuple[bool, str | None, dict[str, object]]:
-        """
-        Entry creation guard: block new entries when symbol already has exposure or working entry.
-
-        When position is flat, stale local reduce-only orders (e.g. filled/cancelled but not yet
-        synced) do NOT block: portfolio is authoritative from exchange refresh, so flat + any
-        tracked reduce-only implies those orders are inert and re-entry is allowed.
-
-        Returns (blocked, block_reason, diagnostic_payload) for every evaluation.
-        """
-        allow_adds = self._settings.runtime.allow_position_adds
-        max_entries = self._settings.runtime.max_concurrent_entries_per_symbol
-        sym_orders = [o for o in open_orders if o.symbol == symbol and not o.metadata.get("drill")]
-        entry_orders = [o for o in sym_orders if not o.reduce_only]
-        exit_orders = [o for o in sym_orders if o.reduce_only]
-        open_entry_count = len(entry_orders)
-        open_exit_count = len(exit_orders)
-
-        pos = self._portfolio.position_for(symbol)
-        current_position_size = float(pos.qty) if pos and pos.qty else 0.0
-        current_position_side = str(pos.side) if pos and pos.side else "Flat"
-
-        base_payload: dict[str, object] = {
-            "symbol": symbol,
-            "current_position_size": current_position_size,
-            "current_position_side": current_position_side,
-            "open_entry_order_count": open_entry_count,
-            "open_reduce_only_order_count": open_exit_count,
-            "local_tracked_order_count": len(sym_orders),
-            "allow_position_adds": allow_adds,
-            "max_concurrent_entries_per_symbol": max_entries,
-        }
-
-        if not allow_adds:
-            if current_position_size != 0:
-                block_payload = {**base_payload, "reason": "non_flat_position", "block_reason_bucket": "existing_position"}
-                return (True, "existing_position", block_payload)
-            if open_exit_count > 0 and current_position_size == 0:
-                self._logger.info(
-                    "entry_guard_allows_reentry_after_flatten",
-                    symbol=symbol,
-                    position_size=current_position_size,
-                    position_side=current_position_side,
-                    open_reduce_only_count=open_exit_count,
-                    block_reason_bucket="flat_with_stale_exit_allowed",
-                )
-                self._metrics.inc("entry_guard_reentry_allowed_flat_stale_exit_count")
-            if open_entry_count > 0:
-                block_payload = {**base_payload, "reason": "working_entry_order_exists", "block_reason_bucket": "existing_working_entry"}
-                return (True, "existing_working_entry", block_payload)
-            return (False, None, base_payload)
-
-        if open_entry_count >= max_entries:
-            block_payload = {**base_payload, "reason": f"max_concurrent_entries_per_symbol={max_entries}", "block_reason_bucket": "max_concurrent_entries"}
-            return (True, "max_concurrent_entries", block_payload)
-        return (False, None, base_payload)
-
-    def _aggregate_entry_guard_block_reasons(self) -> dict[str, int]:
-        """Aggregate block reasons from session accumulator for soak diagnostics."""
-        by_type: dict[str, int] = {}
-        by_symbol: dict[str, dict[str, int]] = {}
-        for r in self._entry_guard_block_reasons:
-            bucket = str(r.get("block_reason_bucket", r.get("block_reason", "unknown")))
-            by_type[bucket] = by_type.get(bucket, 0) + 1
-            sym = str(r.get("symbol", ""))
-            if sym:
-                if sym not in by_symbol:
-                    by_symbol[sym] = {}
-                by_symbol[sym][bucket] = by_symbol[sym].get(bucket, 0) + 1
-        return {"by_type": by_type, "by_symbol": by_symbol}
-
-    def _infer_strategy_blocking_stage(self, m: dict[str, float]) -> str:
-        """Infer which stage is blocking decisions for operator visibility."""
-        if self._startup_state_blocked:
-            return "startup_state_blocked"
-        intents = int(m.get("order_intents_total", 0))
-        if intents > 0:
-            return "submitted"
-        bars = int(m.get("strategy_bars_confirmed", 0))
-        if bars == 0:
-            return "no_bars"
-        candidates = int(m.get("strategy_candidates_total", 0))
-        if candidates == 0:
-            return "no_candidates"
-        regime_rej = int(m.get("strategy_regime_rejected", 0))
-        signal_rej = int(m.get("strategy_signal_rejected", 0))
-        sizing_rej = int(m.get("strategy_sizing_rejected", 0))
-        risk_rej = int(m.get("strategy_risk_rejected", 0))
-        model_reached = int(m.get("strategy_model_filter_reached", 0))
-        model_blocked = int(m.get("strategy_model_blocked", 0))
-        if regime_rej > 0 and regime_rej >= candidates:
-            return "regime_rejected"
-        if signal_rej > 0 or sizing_rej > 0:
-            passed_regime = candidates - regime_rej
-            if signal_rej + sizing_rej >= passed_regime:
-                return "signal_rejected"
-        if risk_rej > 0:
-            return "risk_rejected"
-        if self._model_filter_active and model_reached > 0 and model_blocked >= model_reached:
-            return "model_blocked"
-        return "submitted"
-
     async def _runtime_summary_cycle(self) -> None:
         """Concise periodic runtime summary for paper/demo modes."""
         health_snap = self._health.snapshot()
         metrics_snap = self._metrics.snapshot()
         equity = float(self._portfolio.equity_usdt)
         decisions = metrics_snap.counters.get("decisions_total", 0)
-        c = metrics_snap.counters
-        open_orders_summary = await self._order_manager.get_open_orders(None)
-        strategy_flow = {
-            "bars_confirmed": int(c.get("strategy_bars_confirmed", 0)),
-            "candidates": int(c.get("strategy_candidates_total", 0)),
-            "regime_rejected": int(c.get("strategy_regime_rejected", 0)),
-            "signal_rejected": int(c.get("strategy_signal_rejected", 0)),
-            "sizing_rejected": int(c.get("strategy_sizing_rejected", 0)),
-            "risk_rejected": int(c.get("strategy_risk_rejected", 0)),
-            "model_filter_reached": int(c.get("strategy_model_filter_reached", 0)),
-            "model_blocked": int(c.get("strategy_model_blocked", 0)),
-            "submitted": int(c.get("order_intents_total", 0)),
-        }
-        model_filter_calibration: dict[str, object] | None = None
-        if self._model_filter_active:
-            mf = self._strategy_order_outcomes.model_filter
-            model_filter_calibration = {
-                "mode": mf.mode,
-                "threshold": mf.threshold,
-                "blocked": mf.blocked,
-                "allowed": mf.allowed,
-                "shadow_would_have_blocked": mf.shadow_would_have_blocked,
-                "prob_count": mf.prob_count,
-                "prob_min": mf.prob_min,
-                "prob_max": mf.prob_max,
-                "prob_latest": mf.prob_latest,
-            }
-            decisions = list(self._model_shadow_decisions)
-            probs = [float(d.get("model_probability", 0)) for d in decisions if "model_probability" in d]
-            if probs:
-                from trading.runtime.model_calibration import build_runtime_calibration_stats
-                rc = build_runtime_calibration_stats(probs, current_threshold=mf.threshold)
-                model_filter_calibration["shadow_calibration"] = {
-                    "total_evaluations": rc["total_shadow_evaluations"],
-                    "prob_max": rc["probability_distribution"]["max"],
-                    "prob_p95": rc["probability_distribution"]["p95"],
-                    "prob_p99": rc["probability_distribution"]["p99"],
-                    "threshold_above_observed_max": rc["current_threshold_above_observed_max"],
-                    "retention_thresholds": rc["retention_thresholds"],
-                    "suggested_thresholds_when_above_max": rc.get("suggested_thresholds_when_above_max"),
-                }
-                sug = rc.get("suggested_thresholds_when_above_max")
-                if rc.get("current_threshold_above_observed_max") and sug:
-                    self._logger.info(
-                        "model_filter_threshold_recommendation",
-                        current_threshold=mf.threshold,
-                        prob_max=rc["probability_distribution"]["max"],
-                        prob_p95=rc["probability_distribution"]["p95"],
-                        prob_p99=rc["probability_distribution"]["p99"],
-                        threshold_above_observed_max=True,
-                        suggested_threshold_near_max=sug.get("threshold_near_max"),
-                        suggested_threshold_near_p99=sug.get("threshold_near_p99"),
-                        suggested_threshold_near_p95=sug.get("threshold_near_p95"),
-                        suggested_threshold_keep_50pct=sug.get("threshold_keep_50pct"),
-                        suggested_threshold_keep_25pct=sug.get("threshold_keep_25pct"),
-                    )
-        blocking_stage = self._infer_strategy_blocking_stage(c)
-        candidate_readiness = dict(self._last_candidate_readiness)
-        log_payload: dict[str, object] = {
-            "mode": self._settings.runtime.mode.value,
-            "equity_usdt": equity,
-            "ws_public": health_snap.ws_public_connected,
-            "ws_private": health_snap.ws_private_connected,
-            "private_stream_error": health_snap.private_stream_error,
-            "circuit_breaker": health_snap.circuit_breaker_tripped,
-            "stale_count": len(health_snap.stale_channels),
-            "decisions_total": decisions,
-            "strategy_flow": strategy_flow,
-            "blocking_stage": blocking_stage,
-            "candidate_readiness": candidate_readiness,
-        }
-        if self._settings.runtime.mode == RuntimeMode.DEMO:
-            log_payload["demo_relaxed_candidate_validation"] = self._settings.runtime.demo_relaxed_candidate_validation
-            log_payload["demo_validation_candidates_created"] = int(c.get("strategy_relaxed_demo_candidates_created", 0))
-            raw = int(c.get("strategy_raw_candidates_total", 0))
-            relaxed = int(c.get("strategy_relaxed_demo_candidates_created", 0))
-            regime_rej = int(c.get("strategy_regime_rejected", 0))
-            signal_rej = int(c.get("strategy_signal_rejected", 0))
-            sizing_rej = int(c.get("strategy_sizing_rejected", 0))
-            risk_rej = int(c.get("strategy_risk_rejected", 0))
-            total_cand = int(c.get("strategy_candidates_total", 0))
-            model_reached = int(c.get("strategy_model_filter_reached", 0))
-            model_blocked = int(c.get("strategy_model_blocked", 0))
-            submitted = int(c.get("order_intents_total", 0))
-            log_payload["candidate_pipeline_detail"] = {
-                "raw_candidates": raw,
-                "relaxed_demo_candidates": relaxed,
-                "regime_passed": total_cand - regime_rej,
-                "signal_passed": total_cand - regime_rej - signal_rej,
-                "sizing_passed": total_cand - regime_rej - signal_rej - sizing_rej,
-                "risk_passed": total_cand - regime_rej - signal_rej - sizing_rej - risk_rej,
-                "model_reached": model_reached,
-                "model_blocked": model_blocked,
-                "submitted": submitted,
-            }
-        if self._orphan_position_blocked:
-            log_payload["orphan_position_blocked"] = True
-            log_payload["orphan_position_details"] = list(self._orphan_position_details)
-        if self._last_risk_rejection is not None:
-            log_payload["last_risk_rejection"] = self._last_risk_rejection
-        if self._startup_state_blocked:
-            log_payload["startup_state_blocked"] = True
-            log_payload["startup_state_details"] = self._startup_state_details
-        if self._settings.runtime.mode == RuntimeMode.DEMO:
-            log_payload["demo_more_opportunities_enabled"] = self._settings.runtime.demo_more_opportunities_enabled
-            log_payload["demo_force_marketable_entries"] = self._settings.runtime.demo_force_marketable_entries
-        if model_filter_calibration is not None:
-            log_payload["model_filter_calibration"] = model_filter_calibration
-        pos_add_blocked = int(c.get("position_add_blocked_count", 0))
-        working_entry_blocked = int(c.get("working_entry_blocked_count", 0))
-        if pos_add_blocked > 0 or working_entry_blocked > 0:
-            log_payload["position_add_blocked_count"] = pos_add_blocked
-            log_payload["working_entry_blocked_count"] = working_entry_blocked
-        allow_adds = self._settings.runtime.allow_position_adds
-        max_entries = self._settings.runtime.max_concurrent_entries_per_symbol
-        log_payload["entry_guard"] = {
-            "allow_position_adds": allow_adds,
-            "max_concurrent_entries_per_symbol": max_entries,
-            "entry_guard_enabled": True,
-        }
-        by_symbol: dict[str, dict[str, object]] = {}
-        for sym in self._settings.trading.symbols:
-            sym_orders = [o for o in open_orders_summary if o.symbol == sym and not o.metadata.get("drill")]
-            entry_ct = sum(1 for o in sym_orders if not o.reduce_only)
-            exit_ct = sum(1 for o in sym_orders if o.reduce_only)
-            pos = self._portfolio.position_for(sym)
-            qty = float(pos.qty) if pos and pos.qty else 0.0
-            side = str(pos.side) if pos and pos.side else "Flat"
-            by_symbol[sym] = {
-                "open_entry_count": entry_ct,
-                "open_reduce_only_count": exit_ct,
-                "position_size": qty,
-                "position_side": side,
-            }
-        log_payload["entry_guard_by_symbol"] = by_symbol
-        self._logger.info("runtime_summary", **log_payload)
+        self._logger.info(
+            "runtime_summary",
+            mode=self._settings.runtime.mode.value,
+            equity_usdt=equity,
+            ws_public=health_snap.ws_public_connected,
+            ws_private=health_snap.ws_private_connected,
+            private_stream_error=health_snap.private_stream_error,
+            circuit_breaker=health_snap.circuit_breaker_tripped,
+            stale_count=len(health_snap.stale_channels),
+            decisions_total=decisions,
+        )
 
     async def _build_session_summary(self) -> dict[str, object]:
         """Build concise session summary from metrics and session state."""
         metrics = self._metrics.snapshot()
         start = self._session_start_time or utc_now()
         end = utc_now()
-        so = self._strategy_order_outcomes
-        open_orders = await self._order_manager.get_open_orders(None)
-        drill_link = self._drill_outcome.order_link_id or ""
-        strategy_resting_opens = sum(
-            1 for o in open_orders if not o.metadata.get("drill") and o.order_link_id != drill_link
-        )
-        entry_guard_by_symbol: dict[str, dict[str, object]] = {}
-        for sym in self._settings.trading.symbols:
-            sym_orders = [o for o in open_orders if o.symbol == sym and not o.metadata.get("drill")]
-            entry_ct = sum(1 for o in sym_orders if not o.reduce_only)
-            exit_ct = sum(1 for o in sym_orders if o.reduce_only)
-            pos = self._portfolio.position_for(sym)
-            qty = float(pos.qty) if pos and pos.qty else 0.0
-            side = str(pos.side) if pos and pos.side else "Flat"
-            entry_guard_by_symbol[sym] = {
-                "open_entry_count": entry_ct,
-                "open_reduce_only_count": exit_ct,
-                "position_size": qty,
-                "position_side": side,
-            }
         summary: dict[str, object] = {
             "session_start": start.isoformat(),
             "session_end": end.isoformat(),
@@ -2655,41 +1464,9 @@ class RuntimeOrchestrator:
             "order_state_transitions_total": int(metrics.counters.get("order_state_transitions_total", 0)),
             "reconcile_mismatch_cycles": int(metrics.counters.get("reconcile_mismatch_cycles", 0)),
             "reconcile_issues_total": int(metrics.counters.get("reconcile_issues_total", 0)),
-            "missing_on_exchange_detected_count": int(metrics.counters.get("missing_on_exchange_detected_count", 0)),
-            "missing_on_exchange_resolved_count": int(metrics.counters.get("missing_on_exchange_resolved_count", 0)),
-            "position_add_blocked_count": int(metrics.counters.get("position_add_blocked_count", 0)),
-            "working_entry_blocked_count": int(metrics.counters.get("working_entry_blocked_count", 0)),
-            "entry_guard": {
-                "allow_position_adds": self._settings.runtime.allow_position_adds,
-                "max_concurrent_entries_per_symbol": self._settings.runtime.max_concurrent_entries_per_symbol,
-                "entry_guard_enabled": True,
-            },
-            "entry_guard_by_symbol": entry_guard_by_symbol,
-            "entry_guard_block_reasons": self._aggregate_entry_guard_block_reasons(),
-            "entry_guard_reentry_allowed_flat_stale_exit_count": int(metrics.counters.get("entry_guard_reentry_allowed_flat_stale_exit_count", 0)),
             "staleness_incidents_total": int(metrics.counters.get("staleness_incidents_total", 0)),
             "circuit_breaker_trips_total": int(metrics.counters.get("circuit_breaker_trips_total", 0)),
-            "strategy_flow": {
-                "bars_confirmed": int(metrics.counters.get("strategy_bars_confirmed", 0)),
-                "candidates": int(metrics.counters.get("strategy_candidates_total", 0)),
-                "regime_rejected": int(metrics.counters.get("strategy_regime_rejected", 0)),
-                "signal_rejected": int(metrics.counters.get("strategy_signal_rejected", 0)),
-                "sizing_rejected": int(metrics.counters.get("strategy_sizing_rejected", 0)),
-                "risk_rejected": int(metrics.counters.get("strategy_risk_rejected", 0)),
-                "model_filter_reached": int(metrics.counters.get("strategy_model_filter_reached", 0)),
-                "model_blocked": int(metrics.counters.get("strategy_model_blocked", 0)),
-                "submitted": int(metrics.counters.get("order_intents_total", 0)),
-            },
-            "blocking_stage": self._infer_strategy_blocking_stage(metrics.counters),
-            "candidate_readiness": dict(self._last_candidate_readiness),
-            "warmup_results": [
-                {"symbol": r.symbol, "timeframe": r.timeframe, "bars_loaded": r.bars_loaded, "min_required": r.min_required, "satisfied": r.satisfied}
-                for r in self._warmup_results
-            ],
         }
-        if self._settings.runtime.mode == RuntimeMode.DEMO:
-            summary["demo_more_opportunities_enabled"] = self._settings.runtime.demo_more_opportunities_enabled
-            summary["demo_force_marketable_entries"] = self._settings.runtime.demo_force_marketable_entries
         if self._health.snapshot().private_stream_error is not None:
             summary["private_stream_error"] = self._health.snapshot().private_stream_error
         if self._drill_outcome.enabled:
@@ -2718,102 +1495,59 @@ class RuntimeOrchestrator:
                 summary["drill_outcome"] = "pending"
         if self._abort_reasons:
             summary["abort_reasons"] = self._abort_reasons
-        if self._last_sizing_rejection is not None:
-            summary["last_sizing_rejection"] = dict(self._last_sizing_rejection)
-        if self._last_sizing_floor_applied is not None:
-            summary["last_sizing_floor_applied"] = dict(self._last_sizing_floor_applied)
-        if self._last_regime_rejection is not None:
-            summary["last_regime_rejection"] = dict(self._last_regime_rejection)
-        if self._last_risk_rejection is not None:
-            summary["last_risk_rejection"] = dict(self._last_risk_rejection)
-        if self._orphan_position_blocked:
-            summary["orphan_position_blocked"] = True
-            summary["orphan_position_details"] = list(self._orphan_position_details)
-        if self._startup_state_blocked:
-            summary["startup_state_blocked"] = True
-            summary["startup_state_details"] = list(self._startup_state_details)
-        startup_blocked_count = int(metrics.counters.get("startup_state_blocked_count", 0))
-        startup_cleared_count = int(metrics.counters.get("startup_state_block_cleared_count", 0))
-        if startup_blocked_count > 0 or self._startup_state_blocked:
-            summary["startup_state_diagnostics"] = {
-                "block_reason": self._startup_block_reason,
-                "cleared": startup_cleared_count > 0 or not self._startup_state_blocked,
-                "blocked_count": startup_blocked_count,
-                "cleared_count": startup_cleared_count,
-                "uncleared_at_session_end": self._startup_state_blocked,
-                "final_unresolved_details": list(self._startup_state_details) if self._startup_state_blocked else None,
-            }
-        if self._reconcile_mismatch_accumulator:
-            from trading.runtime.reconcile_diagnostics import aggregate_reconcile_issues, build_reconcile_diagnostics_summary
-            agg = aggregate_reconcile_issues(self._reconcile_mismatch_accumulator)
-            summary["reconcile_diagnostics"] = build_reconcile_diagnostics_summary(agg)
         if self._startup_auth_disabled:
             summary["startup_auth_disabled"] = True
+
+        mf = self._strategy_order_outcomes.model_filter
+        summary["strategy_flow"] = {
+            "bars_confirmed": int(metrics.counters.get("bars_confirmed_total", 0)),
+            "candidates": int(metrics.counters.get("strategy_raw_candidates_total", 0)),
+            "regime_rejected": int(metrics.counters.get("regime_rejected_total", 0)),
+            "signal_rejected": int(metrics.counters.get("signal_rejected_total", 0)),
+            "sizing_rejected": int(metrics.counters.get("sizing_rejected_total", 0)),
+            "risk_rejected": int(metrics.counters.get("risk_rejected_total", 0)),
+            "model_filter_reached": mf.allowed + mf.blocked + mf.prediction_unavailable,
+            "model_blocked": mf.blocked,
+            "submitted": self._strategy_order_outcomes.submissions,
+        }
+        opens = await self._order_manager.get_open_orders()
+        resting = sum(
+            1
+            for o in opens
+            if not o.reduce_only and not self._is_drill_order_link(o.order_link_id)
+        )
+        so = self._strategy_order_outcomes
         summary["strategy_order_outcomes"] = {
             "intents": so.intents,
             "submissions": so.submissions,
             "acks": so.acks,
-            "resting_opens": strategy_resting_opens,
-            "partially_filled": so.partially_filled,
             "filled": so.filled,
             "cancelled": so.cancelled,
             "rejected": so.rejected,
+            "partially_filled": so.partially_filled,
+            "resting_opens": resting,
         }
         summary["model_filter"] = {
-            "enabled": self._settings.runtime.model_filter_enabled,
-            "active": self._model_filter_active,
-            "model_loaded": self._model_filter_model is not None,
-            "mode": so.model_filter.mode,
-            "threshold": so.model_filter.threshold,
-            "blocked": so.model_filter.blocked,
-            "allowed": so.model_filter.allowed,
-            "shadow_would_have_blocked": so.model_filter.shadow_would_have_blocked,
-            "prediction_unavailable": so.model_filter.prediction_unavailable,
-            "prob_min": so.model_filter.prob_min,
-            "prob_max": so.model_filter.prob_max,
-            "prob_latest": so.model_filter.prob_latest,
-            "prob_count": so.model_filter.prob_count,
-            "latest_features": dict(so.model_filter.latest_features) if so.model_filter.latest_features else None,
+            "enabled": True,
+            "active": True,
+            "mode": mf.mode,
+            "threshold": mf.threshold,
+            "allowed": mf.allowed,
+            "blocked": mf.blocked,
+            "prediction_unavailable": mf.prediction_unavailable,
+            "shadow_would_have_blocked": mf.shadow_would_have_blocked,
+            "prob_min": mf.prob_min,
+            "prob_max": mf.prob_max,
+            "prob_latest": mf.prob_latest,
+            "prob_count": mf.prob_count,
         }
-        decisions = list(self._model_shadow_decisions)
-        if decisions:
-            probs = [float(d.get("model_probability", 0)) for d in decisions if "model_probability" in d]
-            active_decisions = [d for d in decisions if "allow" in d]
-            active_blocked = sum(1 for d in active_decisions if d.get("allow") is False)
-            active_allowed = sum(1 for d in active_decisions if d.get("allow") is True)
-            latest_active = active_decisions[-1] if active_decisions else None
-            summary["model_shadow_decisions"] = {
-                "decisions": decisions,
-                "total_model_evaluations": len(decisions),
-                "shadow_would_block_count": sum(1 for d in decisions if d.get("shadow_would_block")),
-                "shadow_would_allow_count": sum(1 for d in decisions if not d.get("shadow_would_block")),
-                "active_blocked_count": active_blocked,
-                "active_allowed_count": active_allowed,
-                "latest_active_decision": latest_active,
-                "avg_probability": round(sum(probs) / len(probs), 6) if probs else None,
-                "min_probability": min(probs) if probs else None,
-                "max_probability": max(probs) if probs else None,
-            }
-            so = self._strategy_order_outcomes
-            threshold_cfg = self._strategy_order_outcomes.model_filter.threshold
-            cal = build_model_calibration_summary(
-                decisions,
-                threshold_configured=threshold_cfg,
-                session_submitted=so.intents,
-                session_filled=so.filled,
-            )
-            summary["model_calibration"] = cal
-            if rc := cal.get("runtime_calibration"):
-                dist = rc.get("probability_distribution", {})
-                summary["promotion_recommendation"] = build_promotion_recommendation(
-                    current_threshold=threshold_cfg,
-                    observed_max=dist.get("max"),
-                    observed_p95=dist.get("p95"),
-                    observed_p99=dist.get("p99"),
-                    observed_min=dist.get("min"),
-                    observed_mean=dist.get("mean"),
-                    retention_thresholds=rc.get("retention_thresholds"),
-                )
+        pe_sub = int(metrics.counters.get("protective_exit_order_submitted_count", 0))
+        fills_metric = int(metrics.counters.get("entry_fill_received_count", 0))
+        summary["protective_exit_diagnostics"] = {
+            "fills_with_exit_submission": pe_sub,
+            "fills_without_exit_submission": max(0, fills_metric - pe_sub),
+            "protective_exit_skip_reasons_by_type": dict(self._protective_exit_skip_reasons),
+        }
         return summary
 
     def _build_markdown_summary(self, summary: dict[str, object]) -> str:
@@ -2838,109 +1572,28 @@ class RuntimeOrchestrator:
             f"- Acks: {summary.get('order_acks_total', 0)}",
             f"- State transitions: {summary.get('order_state_transitions_total', 0)}",
             f"- Reconcile mismatch cycles: {summary.get('reconcile_mismatch_cycles', 0)}",
-            f"- Missing on exchange detected: {summary.get('missing_on_exchange_detected_count', 0)} resolved: {summary.get('missing_on_exchange_resolved_count', 0)}",
-            f"- Entry guards: position_add_blocked={summary.get('position_add_blocked_count', 0)} working_entry_blocked={summary.get('working_entry_blocked_count', 0)}",
             f"- Reconcile issues: {summary.get('reconcile_issues_total', 0)}",
-            f"- Blocking stage: {summary.get('blocking_stage', 'unknown')}",
             "",
         ]
-        if summary.get("mode") == "demo" and (
-            summary.get("demo_more_opportunities_enabled") or summary.get("demo_force_marketable_entries")
-        ):
-            lines.append("## Demo Profile")
-            if summary.get("demo_more_opportunities_enabled"):
-                lines.append("- More opportunities: enabled")
-            if summary.get("demo_force_marketable_entries"):
-                lines.append("- Force marketable entries: enabled (MARKET/IOC for validation)")
+        if so := summary.get("strategy_order_outcomes"):
+            lines.append("## Strategy Order Outcomes")
             lines.append("")
-        if warmup := summary.get("warmup_results"):
-            lines.append("## Warmup Preload")
-            for r in warmup:
-                lines.append(f"- {r.get('symbol', '')} {r.get('timeframe', '')}: loaded={r.get('bars_loaded', 0)} required={r.get('min_required', 0)} satisfied={r.get('satisfied', False)}")
+            lines.append(f"- Intents: {so.get('intents', 0)}")
+            lines.append(f"- Submissions: {so.get('submissions', 0)}")
+            lines.append(f"- Acks: {so.get('acks', 0)}")
+            lines.append(f"- Filled: {so.get('filled', 0)}")
+            lines.append(f"- Partially filled: {so.get('partially_filled', 0)}")
+            lines.append(f"- Cancelled: {so.get('cancelled', 0)}")
+            lines.append(f"- Rejected: {so.get('rejected', 0)}")
+            lines.append(f"- Resting opens: {so.get('resting_opens', 0)}")
             lines.append("")
-        if readiness := summary.get("candidate_readiness"):
-            lines.append("## Candidate Readiness")
-            for sym, r in sorted(readiness.items()):
-                lines.append(f"- {sym}: bars_5m={r.get('bars_5m', 0)} bars_1h={r.get('bars_1h', 0)} "
-                    f"enough_5m={r.get('has_enough_5m', False)} enough_1h={r.get('has_enough_1h', False)} "
-                    f"reason={r.get('reason', '')} candidates={r.get('candidate_count', 0)}")
-                if bp := r.get("breakout_precondition"):
-                    failed = bp.get("failed_conditions", [])
-                    lines.append(f"  - breakout_precondition: failed={failed} "
-                        f"up_bps={bp.get('breakout_up_bps')} dn_bps={bp.get('breakout_dn_bps')} "
-                        f"move_bps={bp.get('candle_move_bps')} vol_mult={bp.get('vol_multiplier')}")
-                if rr := r.get("regime_rejection"):
-                    failed = rr.get("failed_conditions", [])
-                    lines.append(f"  - regime_rejection: reason={rr.get('reason', '')} failed={failed} "
-                        f"state={rr.get('state', '')} trend_bps={rr.get('trend_bps')} vol_bps={rr.get('volatility_bps')}")
-                if rkr := r.get("risk_rejection"):
-                    failed = rkr.get("failed_conditions", [])
-                    lines.append(f"  - risk_rejection: reason={rkr.get('reason', '')} failed={failed} "
-                        f"projected_notional={rkr.get('projected_notional')} max_notional={rkr.get('max_total_notional_usdt')}")
+        if ped := summary.get("protective_exit_diagnostics"):
+            lines.append("## Protective exit diagnostics")
             lines.append("")
-        if flow := summary.get("strategy_flow"):
-            lines.append("## Strategy Flow")
-            f = flow
-            lines.append(f"- Bars confirmed: {f.get('bars_confirmed', 0)}")
-            lines.append(f"- Candidates: {f.get('candidates', 0)}")
-            lines.append(f"- Regime rejected: {f.get('regime_rejected', 0)}")
-            lines.append(f"- Signal rejected: {f.get('signal_rejected', 0)}")
-            lines.append(f"- Sizing rejected: {f.get('sizing_rejected', 0)}")
-            lines.append(f"- Risk rejected: {f.get('risk_rejected', 0)}")
-            lines.append(f"- Model filter reached: {f.get('model_filter_reached', 0)}")
-            lines.append(f"- Model blocked: {f.get('model_blocked', 0)}")
-            lines.append(f"- Submitted: {f.get('submitted', 0)}")
-            lines.append("")
-        if lsr := summary.get("last_sizing_rejection"):
-            lines.append("## Last Sizing Rejection")
-            lines.append(f"- Symbol: {lsr.get('symbol', '')}")
-            lines.append(f"- Reason: {lsr.get('reason', '')}")
-            lines.append(f"- equity_usdt={lsr.get('equity_usdt')} confidence={lsr.get('confidence')} volatility_bps={lsr.get('volatility_bps')}")
-            lines.append(f"- reference_price={lsr.get('reference_price')} min_qty={lsr.get('min_qty')}")
-            lines.append("")
-        if lrr := summary.get("last_regime_rejection"):
-            lines.append("## Last Regime Rejection")
-            lines.append(f"- Symbol: {lrr.get('symbol', '')}")
-            lines.append(f"- Reason: {lrr.get('reason', '')}")
-            lines.append(f"- Failed conditions: {lrr.get('failed_conditions', [])}")
-            lines.append(f"- State: {lrr.get('state', '')} candidate_type: {lrr.get('candidate_type', '')}")
-            lines.append(f"- volatility_bps={lrr.get('volatility_bps')} trend_bps={lrr.get('trend_bps')} adaptive_threshold={lrr.get('adaptive_trend_threshold_bps')}")
-            lines.append("")
-        if lkr := summary.get("last_risk_rejection"):
-            lines.append("## Last Risk Rejection")
-            lines.append(f"- Symbol: {lkr.get('symbol', '')}")
-            lines.append(f"- Reason: {lkr.get('reason', '')}")
-            lines.append(f"- Failed conditions: {lkr.get('failed_conditions', [])}")
-            lines.append(f"- Side: {lkr.get('side', '')} candidate_type: {lkr.get('candidate_type', '')}")
-            lines.append(f"- notional={lkr.get('notional')} projected_notional={lkr.get('projected_notional')} max_total_notional_usdt={lkr.get('max_total_notional_usdt')}")
-            lines.append(f"- max_leverage={lkr.get('max_leverage')} effective_leverage={lkr.get('effective_leverage')} position_leverage={lkr.get('position_leverage')}")
-            lines.append(f"- confidence={lkr.get('confidence')} min_confidence_threshold={lkr.get('min_confidence_threshold')}")
-            lines.append(f"- realized_pnl_today_usdt={lkr.get('realized_pnl_today_usdt')} daily_loss_limit_usdt={lkr.get('daily_loss_limit_usdt')}")
-            lines.append("")
-        if summary.get("startup_state_blocked"):
-            lines.append("## Last Startup Dirty State")
-            lines.append("- Non-flat position or unexpected open orders detected at startup/reconcile. No new entries until resolved.")
-            for d in summary.get("startup_state_details", []):
-                parts = [f"{d.get('symbol', '')}: position_size={d.get('position_size')} side={d.get('position_side', '')}"]
-                if "open_order_count" in d:
-                    parts.append(f"open_orders={d.get('open_order_count')} reduce_only={d.get('reduce_only_order_count')} non_reduce_only={d.get('non_reduce_only_order_count')}")
-                if "local_order_state_empty_or_not" in d:
-                    parts.append(f"local_empty={d.get('local_order_state_empty_or_not')}")
-                if "reason" in d:
-                    parts.append(f"reason={d.get('reason')}")
-                lines.append("- " + " ".join(parts))
-            lines.append("")
-        if summary.get("orphan_position_blocked"):
-            lines.append("## Orphan Position Blocked (SAFETY)")
-            lines.append("- Non-flat exchange position has no local tracked reduce-only exit order.")
-            lines.append("- Trading blocked until operator resolves manually.")
-            for d in summary.get("orphan_position_details", []):
-                lines.append(f"- {d.get('symbol', '')}: size={d.get('position_size')} side={d.get('side', '')} reason={d.get('reason', '')}")
-            lines.append("")
-        if lsf := summary.get("last_sizing_floor_applied"):
-            lines.append("## Last Sizing Floor Applied (DEMO min-notional)")
-            lines.append(f"- Symbol: {lsf.get('symbol', '')}")
-            lines.append(f"- original_notional={lsf.get('original_notional')} effective_notional={lsf.get('effective_notional')} qty={lsf.get('qty')}")
+            lines.append(f"- Fills with exit submission: {ped.get('fills_with_exit_submission', 0)}")
+            lines.append(f"- Fills without exit submission: {ped.get('fills_without_exit_submission', 0)}")
+            for k, v in sorted((ped.get("protective_exit_skip_reasons_by_type") or {}).items()):
+                lines.append(f"- Skip {k}: {v}")
             lines.append("")
         if summary.get("drill_enabled"):
             lines.append("## Demo Drill")
@@ -2961,110 +1614,6 @@ class RuntimeOrchestrator:
                 for k, v in details.items():
                     lines.append(f"  - {k}: {v}")
             lines.append("")
-        if outcomes := summary.get("strategy_order_outcomes"):
-            lines.append("## Strategy Order Outcomes")
-            o = outcomes
-            lines.append(f"- Intents: {o.get('intents', 0)}")
-            lines.append(f"- Submissions: {o.get('submissions', 0)}")
-            lines.append(f"- Acks: {o.get('acks', 0)}")
-            lines.append(f"- Resting opens: {o.get('resting_opens', 0)}")
-            lines.append(f"- Partially filled: {o.get('partially_filled', 0)}")
-            lines.append(f"- Filled: {o.get('filled', 0)}")
-            lines.append(f"- Cancelled: {o.get('cancelled', 0)}")
-            lines.append(f"- Rejected: {o.get('rejected', 0)}")
-            lines.append("")
-        if mf := summary.get("model_filter"):
-            lines.append("## Model Filter (DEMO-only)")
-            lines.append(f"- Enabled: {mf.get('enabled', False)}")
-            lines.append(f"- Active: {mf.get('active', False)}")
-            lines.append(f"- Mode: {mf.get('mode', 'hard_block')}")
-            lines.append(f"- Model loaded: {mf.get('model_loaded', False)}")
-            lines.append(f"- Threshold: {mf.get('threshold', 0.5)}")
-            lines.append(f"- Trades allowed by model: {mf.get('allowed', 0)}")
-            lines.append(f"- Trades blocked by model: {mf.get('blocked', 0)}")
-            if mf.get("shadow_would_have_blocked", 0) > 0:
-                lines.append(f"- Shadow would have blocked: {mf.get('shadow_would_have_blocked', 0)}")
-            lines.append(f"- Prediction unavailable: {mf.get('prediction_unavailable', 0)}")
-            if mf.get("prob_count", 0) > 0:
-                lines.append(f"- Prob stats: min={mf.get('prob_min')} max={mf.get('prob_max')} latest={mf.get('prob_latest')} count={mf.get('prob_count')}")
-            if lf := mf.get("latest_features"):
-                lines.append(f"- Latest features: reference_price={lf.get('reference_price')} confidence={lf.get('confidence')} qty={lf.get('qty')} ts_ordinal={lf.get('ts_ordinal')}")
-            lines.append("")
-        if msd := summary.get("model_shadow_decisions"):
-            lines.append("## Model Shadow Evaluation")
-            lines.append(f"- Total model evaluations: {msd.get('total_model_evaluations', 0)}")
-            lines.append(f"- Shadow would block: {msd.get('shadow_would_block_count', 0)}")
-            lines.append(f"- Shadow would allow: {msd.get('shadow_would_allow_count', 0)}")
-            if (msd.get("active_blocked_count") or 0) > 0 or (msd.get("active_allowed_count") or 0) > 0:
-                lines.append(f"- Active blocked: {msd.get('active_blocked_count', 0)}")
-                lines.append(f"- Active allowed: {msd.get('active_allowed_count', 0)}")
-            if latest := msd.get("latest_active_decision"):
-                lines.append(f"- Latest active decision: {latest.get('symbol', '')} {latest.get('candidate_type', '')} "
-                    f"side={latest.get('side', '')} prob={latest.get('model_probability')} "
-                    f"threshold={latest.get('threshold')} allow={latest.get('allow')}")
-            if msd.get("avg_probability") is not None:
-                lines.append(f"- Prob: avg={msd.get('avg_probability')} min={msd.get('min_probability')} max={msd.get('max_probability')}")
-            lines.append("")
-            lines.append("## Recent Model Shadow Decisions")
-            for d in msd.get("decisions", [])[-20:]:
-                sym = d.get("symbol", "")
-                ct = d.get("candidate_type", "")
-                side = d.get("side", "")
-                prob = d.get("model_probability", "")
-                thresh = d.get("threshold", "")
-                block = d.get("shadow_would_block", False)
-                ts_ = d.get("timestamp", "")[:19] if d.get("timestamp") else ""
-                lines.append(f"- {ts_} | {sym} {ct} {side} | prob={prob} thresh={thresh} | would_block={block}")
-            lines.append("")
-        if cal := summary.get("model_calibration"):
-            lines.append("## Model Calibration Review")
-            lines.append(f"- Evaluations: {cal.get('total_model_evaluations', 0)} | blocks: {cal.get('total_shadow_blocks', 0)} | allows: {cal.get('total_shadow_allows', 0)}")
-            lines.append(f"- Block rate: {cal.get('block_rate', 0)} | mean prob: {cal.get('mean_probability')} | median prob: {cal.get('median_probability')}")
-            lines.append(f"- Threshold configured: {cal.get('threshold_configured')}")
-            lines.append(f"- Session submitted: {cal.get('session_submitted_count', 0)} | filled: {cal.get('session_filled_count', 0)}")
-            lines.append(f"- Outcome linkage: {cal.get('outcome_linkage_note', '')}")
-            if buckets := cal.get("probability_buckets"):
-                lines.append("- Probability buckets (sample_count | shadow_block | shadow_allow):")
-                for b in buckets:
-                    lines.append(f"  - {b.get('probability_bucket', '')}: n={b.get('sample_count', 0)} block={b.get('shadow_block_count', 0)} allow={b.get('shadow_allow_count', 0)}")
-            if rc := cal.get("runtime_calibration"):
-                lines.append("")
-                lines.append("## Runtime Probability Distribution")
-                dist = rc.get("probability_distribution", {})
-                lines.append(f"- Min: {dist.get('min')} | Max: {dist.get('max')} | Mean: {dist.get('mean')} | Median: {dist.get('median')}")
-                lines.append(f"- Percentiles: p50={dist.get('p50')} p75={dist.get('p75')} p90={dist.get('p90')} p95={dist.get('p95')} p99={dist.get('p99')}")
-                lines.append(f"- Current threshold above observed max: {rc.get('current_threshold_above_observed_max')}")
-                if ret := rc.get("retention_thresholds"):
-                    lines.append("- Candidate retention thresholds (empirical):")
-                    for k, v in ret.items():
-                        if v is not None:
-                            lines.append(f"  - {k}: {v}")
-                if log_buckets := rc.get("probability_buckets_log"):
-                    lines.append("- Log-scale probability buckets:")
-                    for b in log_buckets:
-                        if b.get("count", 0) > 0:
-                            lines.append(f"  - {b.get('bucket', '')}: count={b.get('count', 0)}")
-            lines.append("")
-            lines.append("## Threshold Readiness")
-            for row in cal.get("threshold_sweep", []):
-                t = row.get("threshold", 0)
-                wb = row.get("would_block_count", 0)
-                wa = row.get("would_allow_count", 0)
-                br = row.get("block_rate", 0)
-                lines.append(f"- thresh={t}: would_block={wb} would_allow={wa} block_rate={br}")
-            lines.append("")
-        if pr := summary.get("promotion_recommendation"):
-            lines.append("## Promotion Recommendation")
-            lines.append(f"- Current runtime threshold: {pr.get('current_runtime_threshold')}")
-            lines.append(f"- Observed max probability: {pr.get('observed_max_probability')}")
-            lines.append(f"- Observed p95: {pr.get('observed_p95')} | p99: {pr.get('observed_p99')}")
-            lines.append(f"- Current threshold realistic (<= observed max): {pr.get('current_threshold_realistic')}")
-            if sug := pr.get("suggested_threshold_shadow"):
-                lines.append(f"- Suggested next threshold (shadow, ~75% retain): {sug}")
-            if sug := pr.get("suggested_threshold_active_demo"):
-                lines.append(f"- Suggested next threshold (active-demo, ~50% retain): {sug}")
-            lines.append(f"- **Verdict: {pr.get('verdict', 'remain_shadow')}**")
-            lines.append("")
         if summary.get("abort_reasons"):
             lines.append("## Abort Reasons")
             for r in summary["abort_reasons"]:
@@ -3077,13 +1626,6 @@ class RuntimeOrchestrator:
         if self._settings.runtime.mode not in {RuntimeMode.PAPER, RuntimeMode.DEMO}:
             return
         summary = await self._build_session_summary()
-        if summary.get("startup_state_blocked"):
-            diag = summary.get("startup_state_diagnostics") or {}
-            self._logger.warning(
-                "startup_state_uncleared_at_session_end",
-                block_reason=diag.get("block_reason"),
-                final_unresolved_details=diag.get("final_unresolved_details"),
-            )
         root = Path(self._parquet_store._root_dir)
         root.mkdir(parents=True, exist_ok=True)
         start = self._session_start_time or utc_now()
@@ -3092,172 +1634,27 @@ class RuntimeOrchestrator:
         report_dir.mkdir(parents=True, exist_ok=True)
         json_path = report_dir / f"session_{ts}.json"
         md_path = report_dir / f"session_{ts}.md"
-        json_ok = False
-        md_ok = False
         try:
             json_path.write_text(dumps_json_safe(summary, indent=2), encoding="utf-8")
-            json_ok = True
-        except OSError as exc:
-            self._logger.warning(
-                "session_summary_write_failed",
-                path=str(json_path),
-                file_type="json",
-                error=str(exc),
-            )
-        try:
             md_path.write_text(self._build_markdown_summary(summary), encoding="utf-8")
-            md_ok = True
-        except OSError as exc:
-            self._logger.warning(
-                "session_summary_write_failed",
-                path=str(md_path),
-                file_type="markdown",
-                error=str(exc),
-            )
-        csv_ok = False
-        csv_path: Path | None = None
-        cal_json_ok = False
-        cal_json_path: Path | None = None
-        if cal_data := summary.get("model_calibration"):
-            _cal_path = report_dir / f"model_calibration_{ts}.json"
-            try:
-                _cal_path.write_text(dumps_json_safe(cal_data, indent=2), encoding="utf-8")
-                cal_json_ok = True
-                cal_json_path = _cal_path
-            except OSError as exc:
-                self._logger.warning(
-                    "session_summary_write_failed",
-                    path=str(_cal_path),
-                    file_type="calibration_json",
-                    error=str(exc),
-                )
-        if decisions := summary.get("model_shadow_decisions", {}).get("decisions"):
-            _csv_path = report_dir / f"model_shadow_decisions_{ts}.csv"
-            session_id = f"session_{ts}"
-            fieldnames = [
-                "session_id",
-                "timestamp",
-                "symbol",
-                "candidate_type",
-                "side",
-                "model_probability",
-                "threshold",
-                "shadow_would_block",
-                "allow",
-                "strategy_submitted",
-                "blocking_stage",
-            ]
-            try:
-                with _csv_path.open("w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-                    writer.writeheader()
-                    for d in decisions:
-                        row = {
-                            "session_id": session_id,
-                            "timestamp": d.get("timestamp", ""),
-                            "symbol": d.get("symbol", ""),
-                            "candidate_type": d.get("candidate_type", ""),
-                            "side": d.get("side", ""),
-                            "model_probability": d.get("model_probability", ""),
-                            "threshold": d.get("threshold", ""),
-                            "shadow_would_block": d.get("shadow_would_block", False),
-                            "allow": d.get("allow") if "allow" in d else "",
-                            "strategy_submitted": d.get("strategy_submitted", False),
-                            "blocking_stage": d.get("blocking_stage", ""),
-                        }
-                        writer.writerow(row)
-                csv_ok = True
-                csv_path = _csv_path
-            except OSError as exc:
-                self._logger.warning(
-                    "session_summary_write_failed",
-                    path=str(_csv_path),
-                    file_type="csv",
-                    error=str(exc),
-                )
-        if json_ok and md_ok:
-            ledger_payload: dict[str, object] = {
-                "json_path": str(json_path),
-                "md_path": str(md_path),
-            }
-            if csv_ok and csv_path is not None:
-                ledger_payload["csv_path"] = str(csv_path)
-            if cal_json_ok and cal_json_path is not None:
-                ledger_payload["calibration_json_path"] = str(cal_json_path)
             self._logger.info(
                 "session_summary_written",
                 path=str(json_path),
                 session_ended_cleanly=summary.get("session_ended_cleanly"),
                 abort_reasons=summary.get("abort_reasons"),
             )
-            await self._ledger.record(
-                "session_summary_written",
-                ledger_payload,
-            )
-
-        soak_result = await self._write_soak_report(summary, report_dir, ts)
-        if soak_result is not None:
-            soak_json_path, soak_md_path, soak_report = soak_result
-            verdict_block = soak_report.get("health_verdict") or {}
+            soak_json = report_dir / f"soak_report_{ts}.json"
+            soak_md = report_dir / f"soak_report_{ts}.md"
+            soak = build_soak_report(summary, self._metrics.snapshot())
+            soak_json.write_text(dumps_json_safe(soak, indent=2), encoding="utf-8")
+            soak_md.write_text(build_soak_markdown(soak), encoding="utf-8")
             self._logger.info(
                 "soak_report_written",
-                json_path=str(soak_json_path),
-                markdown_path=str(soak_md_path),
-                verdict=verdict_block.get("verdict", ""),
-                warnings_count=len(verdict_block.get("warnings") or []),
-                failures_count=len(verdict_block.get("failures") or []),
+                path=str(soak_json),
+                verdict=(soak.get("health_verdict") or {}).get("verdict"),
             )
-            self._logger.info(
-                "soak_report_verdict",
-                verdict=verdict_block.get("verdict", ""),
-                failures=verdict_block.get("failures"),
-                warnings=verdict_block.get("warnings"),
-            )
-            await self._ledger.record(
-                "soak_report_written",
-                {
-                    "json_path": str(soak_json_path),
-                    "markdown_path": str(soak_md_path),
-                    "verdict": verdict_block.get("verdict", ""),
-                    "warnings_count": len(verdict_block.get("warnings") or []),
-                    "failures_count": len(verdict_block.get("failures") or []),
-                },
-            )
-
-    async def _write_soak_report(
-        self, summary: dict[str, object], report_dir: Path, ts: str
-    ) -> tuple[Path, Path, dict[str, object]] | None:
-        """Write soak report JSON and markdown. Returns (json_path, md_path, report) or None."""
-        session_id = f"session_{ts}"
-        soak_json_path = report_dir / f"soak_report_{session_id}.json"
-        soak_md_path = report_dir / f"soak_report_{session_id}.md"
-        metrics_snap = self._metrics.snapshot()
-        report = build_soak_report(summary, metrics_snap)
-        json_ok = False
-        md_ok = False
-        try:
-            soak_json_path.write_text(dumps_json_safe(report, indent=2), encoding="utf-8")
-            json_ok = True
         except OSError as exc:
-            self._logger.warning(
-                "soak_report_write_failed",
-                path=str(soak_json_path),
-                file_type="json",
-                error=str(exc),
-            )
-        try:
-            soak_md_path.write_text(build_soak_markdown(report), encoding="utf-8")
-            md_ok = True
-        except OSError as exc:
-            self._logger.warning(
-                "soak_report_write_failed",
-                path=str(soak_md_path),
-                file_type="markdown",
-                error=str(exc),
-            )
-        if json_ok and md_ok:
-            return (soak_json_path, soak_md_path, report)
-        return None
+            self._logger.warning("session_summary_write_failed", path=str(json_path), error=str(exc))
 
 
 def _public_topics(*, symbols: list[str], candle_timeframe: str, regime_timeframe: str) -> list[str]:
