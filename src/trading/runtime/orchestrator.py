@@ -185,6 +185,7 @@ class RuntimeOrchestrator:
         self._model_shadow_decisions_max: int = 100
         self._protective_exit_skip_reasons: dict[str, int] = {}
         self._protective_exit_done_link_ids: set[str] = set()
+        self._protective_exit_fill_outcomes: list[dict[str, object]] = []
         self._warmup_results: list[WarmupResult] = []
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
@@ -1295,6 +1296,29 @@ class RuntimeOrchestrator:
         """On entry fill: create, register, and submit reduce-only protective exit. Orphan block remains if placement fails."""
         from trading.execution.order_manager import ManagedOrder
 
+        async def _record_skip(reason: str, *, symbol: str = "") -> None:
+            self._protective_exit_skip_reasons[reason] = self._protective_exit_skip_reasons.get(reason, 0) + 1
+            self._metrics.inc("protective_exit_placement_skipped_count")
+            payload = {"entry_order_link_id": link_id, "symbol": symbol, "reason": reason}
+            await self._ledger.record("protective_exit_placement_skipped", payload)
+            self._logger.warning(
+                "protective_exit_placement_skipped",
+                order_link_id=link_id,
+                symbol=symbol,
+                reason=reason,
+            )
+            self._protective_exit_fill_outcomes.append(
+                {
+                    "entry_order_link_id": link_id,
+                    "symbol": symbol,
+                    "outcome": "skipped",
+                    "reason": reason,
+                    "timestamp": utc_now().isoformat(),
+                }
+            )
+            while len(self._protective_exit_fill_outcomes) > 200:
+                self._protective_exit_fill_outcomes.pop(0)
+
         if not isinstance(prev, ManagedOrder):
             return
         if prev.reduce_only:
@@ -1305,43 +1329,23 @@ class RuntimeOrchestrator:
         elif signal_action == "enter_short":
             side_to_close = PositionSide.SHORT
         else:
-            self._logger.warning(
-                "protective_exit_placement_skipped",
-                order_link_id=link_id,
-                reason="unknown_signal_action",
-                signal_action=signal_action,
-            )
+            await _record_skip("unknown_signal_action", symbol=prev.symbol or event.symbol or "")
             return
         symbol = prev.symbol or event.symbol or ""
         if not symbol:
-            self._logger.warning("protective_exit_placement_skipped", order_link_id=link_id, reason="missing_symbol")
+            await _record_skip("missing_symbol")
             return
         filled_qty = prev.filled_qty if prev.filled_qty and prev.filled_qty > 0 else event.qty
         if not filled_qty or filled_qty <= 0:
-            self._logger.warning(
-                "protective_exit_placement_skipped",
-                order_link_id=link_id,
-                symbol=symbol,
-                reason="zero_filled_qty",
-            )
+            await _record_skip("zero_filled_qty", symbol=symbol)
             return
         entry_avg_price = prev.avg_price or event.avg_price
         if not entry_avg_price or entry_avg_price <= 0:
-            self._logger.warning(
-                "protective_exit_placement_skipped",
-                order_link_id=link_id,
-                symbol=symbol,
-                reason="missing_avg_price",
-            )
+            await _record_skip("missing_avg_price", symbol=symbol)
             return
         symbol_spec = self._symbol_specs.get(symbol)
         if symbol_spec is None:
-            self._logger.warning(
-                "protective_exit_placement_skipped",
-                order_link_id=link_id,
-                symbol=symbol,
-                reason="missing_symbol_spec",
-            )
+            await _record_skip("missing_symbol_spec", symbol=symbol)
             return
         exit_intent = self._execution_engine.build_protective_limit_exit(
             symbol=symbol,
@@ -1367,6 +1371,15 @@ class RuntimeOrchestrator:
                     "symbol": symbol,
                     "reason": "build_intent_returned_none",
                 },
+            )
+            self._protective_exit_fill_outcomes.append(
+                {
+                    "entry_order_link_id": link_id,
+                    "symbol": symbol,
+                    "outcome": "failed",
+                    "reason": "build_intent_returned_none",
+                    "timestamp": utc_now().isoformat(),
+                }
             )
             return
         self._metrics.inc("protective_exit_plan_created_count")
@@ -1399,12 +1412,7 @@ class RuntimeOrchestrator:
             symbol=symbol,
         )
         if not self._can_place_exchange_orders():
-            self._logger.warning(
-                "protective_exit_order_not_submitted",
-                order_link_id=exit_intent.order_link_id,
-                symbol=symbol,
-                reason="placement_disabled",
-            )
+            await _record_skip("placement_disabled", symbol=symbol)
             self._metrics.inc("protective_exit_placement_failed_count")
             await self._ledger.record(
                 "protective_exit_placement_failed",
@@ -1436,6 +1444,16 @@ class RuntimeOrchestrator:
             if order_after and order_after.order_id:
                 self._metrics.inc("protective_exit_order_ack_received_count")
                 self._protective_exit_done_link_ids.add(link_id)
+                self._protective_exit_fill_outcomes.append(
+                    {
+                        "entry_order_link_id": link_id,
+                        "order_link_id": exit_intent.order_link_id,
+                        "symbol": symbol,
+                        "outcome": "submitted",
+                        "acked": True,
+                        "timestamp": utc_now().isoformat(),
+                    }
+                )
                 await self._ledger.record(
                     "protective_exit_order_ack_received",
                     {"order_link_id": exit_intent.order_link_id, "order_id": order_after.order_id, "symbol": symbol},
@@ -1466,6 +1484,18 @@ class RuntimeOrchestrator:
                     "reason": reason,
                 },
             )
+            self._protective_exit_fill_outcomes.append(
+                {
+                    "entry_order_link_id": link_id,
+                    "order_link_id": exit_intent.order_link_id,
+                    "symbol": symbol,
+                    "outcome": "failed",
+                    "reason": reason,
+                    "timestamp": utc_now().isoformat(),
+                }
+            )
+        while len(self._protective_exit_fill_outcomes) > 200:
+            self._protective_exit_fill_outcomes.pop(0)
 
     async def _submit_intent(self, intent: object, *, is_drill: bool = False) -> None:
         from trading.execution.order_intent import OrderIntent
@@ -2825,6 +2855,7 @@ class RuntimeOrchestrator:
             "fills_with_exit_submission": pe_sub,
             "fills_without_exit_submission": max(0, fills_metric - pe_sub),
             "protective_exit_skip_reasons_by_type": dict(self._protective_exit_skip_reasons),
+            "recent_fill_outcomes": list(self._protective_exit_fill_outcomes[-50:]),
         }
         return summary
 

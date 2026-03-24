@@ -141,3 +141,130 @@ async def test_protective_exit_session_summary_diagnostics() -> None:
     assert ped.get("fills_with_exit_submission") == 1
     assert ped.get("fills_without_exit_submission") == 0
     assert "protective_exit_skip_reasons_by_type" in ped
+
+
+@pytest.mark.asyncio
+async def test_filled_entry_with_unknown_signal_action_records_explicit_skip() -> None:
+    """A filled entry lacking a valid signal action is explicitly counted as skipped."""
+    orch = _orch_with_mocks()
+    orch._settings.runtime.mode = RuntimeMode.DEMO
+    orch._settings.runtime.dry_run = False
+    orch._settings.exchange.bybit_api_key = "k"
+    orch._settings.exchange.bybit_api_secret = "s"
+
+    now = datetime.now(UTC)
+    intent = OrderIntent(
+        symbol="BTCUSDT",
+        side=OrderSide.BUY,
+        qty=Decimal("0.01"),
+        order_type=OrderType.LIMIT,
+        time_in_force=TimeInForce.POST_ONLY,
+        reduce_only=False,
+        price=Decimal("50000"),
+        order_link_id="entry_link_skip",
+        purpose=IntentPurpose.ENTRY,
+        created_at=now,
+        metadata={"signal_action": "bad_action"},
+    )
+    await orch._order_manager.register_intent(intent)
+    orch._rest.place_order = AsyncMock()
+
+    from trading.marketdata.normalizers import NormalizedOrderUpdate
+
+    upd = NormalizedOrderUpdate(
+        order_id="oid_skip",
+        order_link_id="entry_link_skip",
+        symbol="BTCUSDT",
+        status=OrderStatus.FILLED,
+        qty=Decimal("0.01"),
+        avg_price=Decimal("50000"),
+        ts_event_utc=now,
+        raw={},
+    )
+    await orch._on_private_events([upd])
+
+    counters = orch._metrics.snapshot().counters
+    assert counters.get("entry_fill_received_count", 0) == 1
+    assert counters.get("protective_exit_order_submitted_count", 0) == 0
+    assert counters.get("protective_exit_placement_failed_count", 0) == 0
+    assert counters.get("protective_exit_placement_skipped_count", 0) == 1
+    assert orch._protective_exit_skip_reasons.get("unknown_signal_action", 0) == 1
+    orch._rest.place_order.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_two_fills_one_submission_is_explicitly_attributed() -> None:
+    """Two entry fills with one valid and one invalid path have deterministic diagnostics."""
+    orch = _orch_with_mocks()
+    orch._settings.runtime.mode = RuntimeMode.DEMO
+    orch._settings.runtime.dry_run = False
+    orch._settings.exchange.bybit_api_key = "k"
+    orch._settings.exchange.bybit_api_secret = "s"
+
+    now = datetime.now(UTC)
+    valid = OrderIntent(
+        symbol="BTCUSDT",
+        side=OrderSide.BUY,
+        qty=Decimal("0.01"),
+        order_type=OrderType.LIMIT,
+        time_in_force=TimeInForce.POST_ONLY,
+        reduce_only=False,
+        price=Decimal("50000"),
+        order_link_id="entry_link_valid",
+        purpose=IntentPurpose.ENTRY,
+        created_at=now,
+        metadata={"signal_action": "enter_long"},
+    )
+    invalid = OrderIntent(
+        symbol="BTCUSDT",
+        side=OrderSide.BUY,
+        qty=Decimal("0.01"),
+        order_type=OrderType.LIMIT,
+        time_in_force=TimeInForce.POST_ONLY,
+        reduce_only=False,
+        price=Decimal("50010"),
+        order_link_id="entry_link_invalid",
+        purpose=IntentPurpose.ENTRY,
+        created_at=now,
+        metadata={"signal_action": "bad_action"},
+    )
+    await orch._order_manager.register_intent(valid)
+    await orch._order_manager.register_intent(invalid)
+
+    ack = MagicMock()
+    ack.order_link_id = "pe_link_two_fill"
+    ack.order_id = "ex_oid_two_fill"
+    orch._rest.place_order = AsyncMock(return_value=ack)
+
+    from trading.marketdata.normalizers import NormalizedOrderUpdate
+
+    await orch._on_private_events(
+        [
+            NormalizedOrderUpdate(
+                order_id="oid_valid",
+                order_link_id="entry_link_valid",
+                symbol="BTCUSDT",
+                status=OrderStatus.FILLED,
+                qty=Decimal("0.01"),
+                avg_price=Decimal("50000"),
+                ts_event_utc=now,
+                raw={},
+            ),
+            NormalizedOrderUpdate(
+                order_id="oid_invalid",
+                order_link_id="entry_link_invalid",
+                symbol="BTCUSDT",
+                status=OrderStatus.FILLED,
+                qty=Decimal("0.01"),
+                avg_price=Decimal("50010"),
+                ts_event_utc=now,
+                raw={},
+            ),
+        ]
+    )
+
+    summary = await orch._build_session_summary()
+    ped = summary.get("protective_exit_diagnostics") or {}
+    assert ped.get("fills_with_exit_submission") == 1
+    assert ped.get("fills_without_exit_submission") == 1
+    assert (ped.get("protective_exit_skip_reasons_by_type") or {}).get("unknown_signal_action") == 1
