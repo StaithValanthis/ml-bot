@@ -1261,29 +1261,20 @@ class RuntimeOrchestrator:
                         "exchange_position_side": guard_payload.get("exchange_position_side"),
                         "exchange_open_order_count": guard_payload.get("exchange_open_order_count"),
                     })
+                    # Single merged dict: guard_payload already contains block_reason_bucket;
+                    # spreading **guard_payload plus block_reason_bucket= crashes structlog (duplicate kw).
+                    _guard_block_log = {**guard_payload, "block_reason_bucket": block_bucket}
                     if block_reason == "existing_position":
                         self._metrics.inc("position_add_blocked_count")
                         self._metrics.inc("entry_guard_block_non_flat_count")
-                        self._logger.info(
-                            "entry_blocked_existing_position",
-                            **guard_payload,
-                            block_reason_bucket=block_bucket,
-                        )
+                        self._logger.info("entry_blocked_existing_position", **_guard_block_log)
                     elif block_reason == "existing_working_entry":
                         self._metrics.inc("working_entry_blocked_count")
                         self._metrics.inc("entry_guard_block_working_entry_count")
-                        self._logger.info(
-                            "entry_blocked_existing_working_entry",
-                            **guard_payload,
-                            block_reason_bucket=block_bucket,
-                        )
+                        self._logger.info("entry_blocked_existing_working_entry", **_guard_block_log)
                     elif block_reason == "max_concurrent_entries":
                         self._metrics.inc("entry_guard_block_max_concurrent_count")
-                        self._logger.info(
-                            "entry_blocked_max_concurrent_entries",
-                            **guard_payload,
-                            block_reason_bucket=block_bucket,
-                        )
+                        self._logger.info("entry_blocked_max_concurrent_entries", **_guard_block_log)
                     continue
 
                 force_marketable = (

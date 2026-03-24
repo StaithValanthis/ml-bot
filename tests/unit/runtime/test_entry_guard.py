@@ -203,6 +203,30 @@ def test_non_flat_position_with_reduce_only_still_blocks() -> None:
     assert payload["open_reduce_only_order_count"] == 1
 
 
+def test_entry_blocked_existing_position_log_merge_no_duplicate_keywords() -> None:
+    """Regression: guard_payload includes block_reason_bucket; merging once avoids structlog TypeError."""
+    orch = _make_orchestrator()
+    orch._settings.runtime.allow_position_adds = False
+    from trading.risk.portfolio_state import PositionRiskView
+
+    orch._portfolio.positions["BTCUSDT"] = PositionRiskView(
+        symbol="BTCUSDT",
+        side=PositionSide.LONG,
+        qty=Decimal("0.01"),
+        entry_price=Decimal("60000"),
+        mark_price=Decimal("60100"),
+        leverage=Decimal("1"),
+        liquidation_price=None,
+    )
+    blocked, block_reason, guard_payload = orch._should_block_new_entry("BTCUSDT", [])
+    assert blocked is True
+    assert block_reason == "existing_position"
+    assert guard_payload.get("block_reason_bucket") == "existing_position"
+    block_bucket = guard_payload.get("block_reason_bucket", block_reason or "unknown")
+    merged = {**guard_payload, "block_reason_bucket": block_bucket}
+    orch._logger.info("entry_blocked_existing_position", **merged)
+
+
 def test_effectively_flat_dust_position_does_not_block_existing_position() -> None:
     """Dust positions below qty-step threshold are treated as flat for guard checks."""
     orch = _make_orchestrator()
