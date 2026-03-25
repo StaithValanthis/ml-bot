@@ -268,3 +268,122 @@ async def test_two_fills_one_submission_is_explicitly_attributed() -> None:
     assert ped.get("fills_with_exit_submission") == 1
     assert ped.get("fills_without_exit_submission") == 1
     assert (ped.get("protective_exit_skip_reasons_by_type") or {}).get("unknown_signal_action") == 1
+
+
+@pytest.mark.asyncio
+async def test_reduce_only_fill_does_not_increment_entry_fill_received() -> None:
+    """Protective exit (reduce-only) fill must not count as entry_fill_received (soak attribution)."""
+    orch = _orch_with_mocks()
+    orch._settings.runtime.mode = RuntimeMode.DEMO
+
+    now = datetime.now(UTC)
+    intent = OrderIntent(
+        symbol="BTCUSDT",
+        side=OrderSide.SELL,
+        qty=Decimal("0.01"),
+        order_type=OrderType.LIMIT,
+        time_in_force=TimeInForce.POST_ONLY,
+        reduce_only=True,
+        price=Decimal("51000"),
+        order_link_id="pe_reduce_only_link",
+        purpose=IntentPurpose.EXIT,
+        created_at=now,
+        metadata={},
+    )
+    await orch._order_manager.register_intent(intent)
+
+    from trading.marketdata.normalizers import NormalizedOrderUpdate
+
+    await orch._on_private_events(
+        [
+            NormalizedOrderUpdate(
+                order_id="oid_ro",
+                order_link_id="pe_reduce_only_link",
+                symbol="BTCUSDT",
+                status=OrderStatus.FILLED,
+                qty=Decimal("0.01"),
+                avg_price=Decimal("51000"),
+                ts_event_utc=now,
+                raw={},
+            ),
+        ]
+    )
+
+    assert orch._metrics.snapshot().counters.get("entry_fill_received_count", 0) == 0
+    assert orch._strategy_order_outcomes.filled == 1
+
+
+@pytest.mark.asyncio
+async def test_entry_fill_then_protective_exit_fill_diagnostics_aligned() -> None:
+    """Entry fill + later reduce-only fill: one entry_fill_received, one PE submit; no false 'missing exit'."""
+    orch = _orch_with_mocks()
+    orch._settings.runtime.mode = RuntimeMode.DEMO
+    orch._settings.runtime.dry_run = False
+    orch._settings.exchange.bybit_api_key = "k"
+    orch._settings.exchange.bybit_api_secret = "s"
+
+    now = datetime.now(UTC)
+    entry = OrderIntent(
+        symbol="BTCUSDT",
+        side=OrderSide.BUY,
+        qty=Decimal("0.01"),
+        order_type=OrderType.LIMIT,
+        time_in_force=TimeInForce.POST_ONLY,
+        reduce_only=False,
+        price=Decimal("50000"),
+        order_link_id="entry_then_pe_exit",
+        purpose=IntentPurpose.ENTRY,
+        created_at=now,
+        metadata={"signal_action": "enter_long"},
+    )
+    await orch._order_manager.register_intent(entry)
+    ack = MagicMock()
+    ack.order_link_id = "ack_pe"
+    ack.order_id = "ex_pe_1"
+    orch._rest.place_order = AsyncMock(return_value=ack)
+
+    from trading.marketdata.normalizers import NormalizedOrderUpdate
+
+    await orch._on_private_events(
+        [
+            NormalizedOrderUpdate(
+                order_id="oid_ent",
+                order_link_id="entry_then_pe_exit",
+                symbol="BTCUSDT",
+                status=OrderStatus.FILLED,
+                qty=Decimal("0.01"),
+                avg_price=Decimal("50000"),
+                ts_event_utc=now,
+                raw={},
+            ),
+        ]
+    )
+
+    open_orders = await orch._order_manager.get_open_orders(None)
+    pe_orders = [o for o in open_orders if o.reduce_only and o.symbol == "BTCUSDT"]
+    assert len(pe_orders) == 1
+    pe_link = pe_orders[0].order_link_id
+
+    await orch._on_private_events(
+        [
+            NormalizedOrderUpdate(
+                order_id="oid_pe_fill",
+                order_link_id=pe_link,
+                symbol="BTCUSDT",
+                status=OrderStatus.FILLED,
+                qty=Decimal("0.01"),
+                avg_price=Decimal("51000"),
+                ts_event_utc=now,
+                raw={},
+            ),
+        ]
+    )
+
+    c = orch._metrics.snapshot().counters
+    assert c.get("entry_fill_received_count", 0) == 1
+    assert c.get("protective_exit_order_submitted_count", 0) == 1
+
+    summary = await orch._build_session_summary()
+    ped = summary.get("protective_exit_diagnostics") or {}
+    assert ped.get("fills_with_exit_submission") == 1
+    assert ped.get("fills_without_exit_submission") == 0

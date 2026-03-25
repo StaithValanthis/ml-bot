@@ -837,25 +837,37 @@ class RuntimeOrchestrator:
                                 "strategy_order_filled",
                                 order_link_id=link_id,
                                 symbol=event.symbol or "",
+                                reduce_only=prev.reduce_only,
                             )
-                            self._metrics.inc("entry_fill_received_count")
-                            await self._ledger.record(
-                                "entry_fill_received",
-                                {
-                                    "order_link_id": link_id,
-                                    "symbol": event.symbol or "",
-                                    "filled_qty": str(event.qty) if event.qty is not None else "",
-                                    "avg_price": str(event.avg_price) if event.avg_price is not None else "",
-                                },
-                            )
-                            self._logger.info(
-                                "entry_fill_received",
-                                order_link_id=link_id,
-                                symbol=event.symbol or "",
-                                filled_qty=str(event.qty) if event.qty else "",
-                                avg_price=str(event.avg_price) if event.avg_price else "",
-                            )
-                            await self._place_protective_exit_after_fill(link_id=link_id, event=event, prev=prev)
+                            # Entry-fill metrics and protective exit apply only to opening orders.
+                            # Reduce-only fills (e.g. protective exit hit) must not increment
+                            # entry_fill_received_count or they falsely show fills_without_exit_submission.
+                            if not prev.reduce_only:
+                                self._metrics.inc("entry_fill_received_count")
+                                await self._ledger.record(
+                                    "entry_fill_received",
+                                    {
+                                        "order_link_id": link_id,
+                                        "symbol": event.symbol or "",
+                                        "filled_qty": str(event.qty) if event.qty is not None else "",
+                                        "avg_price": str(event.avg_price) if event.avg_price is not None else "",
+                                    },
+                                )
+                                self._logger.info(
+                                    "entry_fill_received",
+                                    order_link_id=link_id,
+                                    symbol=event.symbol or "",
+                                    filled_qty=str(event.qty) if event.qty else "",
+                                    avg_price=str(event.avg_price) if event.avg_price else "",
+                                )
+                                await self._place_protective_exit_after_fill(link_id=link_id, event=event, prev=prev)
+                            else:
+                                self._logger.info(
+                                    "strategy_reduce_only_order_filled",
+                                    order_link_id=link_id,
+                                    symbol=event.symbol or "",
+                                    filled_qty=str(event.qty) if event.qty else "",
+                                )
                         elif new_status == "Cancelled" and link_id not in so._seen_cancelled:
                             so._seen_cancelled.add(link_id)
                             so.cancelled += 1
@@ -1351,8 +1363,16 @@ class RuntimeOrchestrator:
                 self._protective_exit_fill_outcomes.pop(0)
 
         if not isinstance(prev, ManagedOrder):
+            await _record_skip(
+                "invalid_managed_order_context",
+                symbol=getattr(event, "symbol", "") or "",
+            )
             return
         if prev.reduce_only:
+            await _record_skip(
+                "reduce_only_fill_not_entry",
+                symbol=prev.symbol or event.symbol or "",
+            )
             return
         signal_action = prev.metadata.get("signal_action")
         if signal_action == "enter_long":
@@ -1494,6 +1514,23 @@ class RuntimeOrchestrator:
                     order_link_id=exit_intent.order_link_id,
                     order_id=order_after.order_id,
                     symbol=symbol,
+                )
+            else:
+                self._logger.warning(
+                    "protective_exit_order_submitted_ack_missing",
+                    entry_order_link_id=link_id,
+                    order_link_id=exit_intent.order_link_id,
+                    symbol=symbol,
+                )
+                self._protective_exit_fill_outcomes.append(
+                    {
+                        "entry_order_link_id": link_id,
+                        "order_link_id": exit_intent.order_link_id,
+                        "symbol": symbol,
+                        "outcome": "submitted",
+                        "acked": False,
+                        "timestamp": utc_now().isoformat(),
+                    }
                 )
         except BybitRestError as exc:
             reason = str(exc)
