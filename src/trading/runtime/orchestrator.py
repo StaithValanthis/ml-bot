@@ -2936,11 +2936,18 @@ class RuntimeOrchestrator:
                 )
         pe_sub = int(metrics.counters.get("protective_exit_order_submitted_count", 0))
         fills_metric = int(metrics.counters.get("entry_fill_received_count", 0))
+        outcomes_by_entry: dict[str, dict[str, object]] = {}
+        for rec in self._protective_exit_fill_outcomes:
+            entry_link = rec.get("entry_order_link_id")
+            if isinstance(entry_link, str):
+                # Keep the latest outcome for this entry link id (idempotency should keep this stable).
+                outcomes_by_entry[entry_link] = dict(rec)
         summary["protective_exit_diagnostics"] = {
             "fills_with_exit_submission": pe_sub,
             "fills_without_exit_submission": max(0, fills_metric - pe_sub),
             "protective_exit_skip_reasons_by_type": dict(self._protective_exit_skip_reasons),
             "recent_fill_outcomes": list(self._protective_exit_fill_outcomes[-50:]),
+            "protective_exit_fill_outcomes_by_entry_link_id": outcomes_by_entry,
         }
         return summary
 

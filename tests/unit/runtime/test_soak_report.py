@@ -174,6 +174,40 @@ def test_soak_report_verdict_pass_ack_pending_at_session_end() -> None:
     assert exec_s.get("filled_entries_without_exit_ack") == 1
 
 
+def test_soak_report_does_not_misattribute_pe_fills_as_entry_fills() -> None:
+    """strategy_order_filled_count may include reduce-only protective-exit fills.
+
+    The safety checks must be based on entry_fill_received_count, so a session with
+    entry_fill=1 and PE ack=1 should not fail even if strategy_filled=2.
+    """
+    summary = _minimal_session_summary(
+        session_ended_cleanly=True,
+        # Includes: 1 entry fill + 1 reduce-only PE fill.
+        strategy_filled=2,
+        submitted=1,
+        model_filter_reached=1,
+        model_allowed=1,
+        candidates=1,
+    )
+    metrics = MetricsSnapshot(
+        counters={
+            "entry_fill_received_count": 1,
+            "protective_exit_plan_created_count": 1,
+            "protective_exit_order_submitted_count": 1,
+            "protective_exit_order_ack_received_count": 1,
+            "protective_exit_placement_failed_count": 0,
+        },
+        gauges={},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    verdict_block = report.get("health_verdict") or {}
+    assert verdict_block.get("verdict") == VERDICT_PASS
+    assert "fills_without_protective_exit_ack" not in (verdict_block.get("failures") or [])
+    exec_s = report.get("execution_summary") or {}
+    assert exec_s.get("filled_entries_without_exit_ack") == 0
+
+
 def test_soak_report_verdict_fail_protective_exit_placement_failed() -> None:
     """protective_exit_placement_failed > 0 yields FAIL."""
     summary = _minimal_session_summary(

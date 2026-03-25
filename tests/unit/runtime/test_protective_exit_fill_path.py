@@ -79,6 +79,11 @@ async def test_filled_entry_triggers_protective_submission_and_metrics() -> None
     assert orch._metrics.snapshot().counters.get("protective_exit_order_submitted_count", 0) >= 1
     assert orch._metrics.snapshot().counters.get("protective_exit_order_ack_received_count", 0) >= 1
     assert "entry_link_1" in orch._protective_exit_done_link_ids
+    summary = await orch._build_session_summary()
+    ped = summary.get("protective_exit_diagnostics") or {}
+    by_entry = ped.get("protective_exit_fill_outcomes_by_entry_link_id") or {}
+    assert by_entry.get("entry_link_1", {}).get("outcome") == "submitted"
+    assert by_entry.get("entry_link_1", {}).get("acked") is True
     orch._rest.place_order.assert_awaited()
 
 

@@ -186,7 +186,8 @@ def build_soak_report(
             "protective_exit_order_ack_received_count": pe_ack,
             "protective_exit_placement_failed_count": pe_failed,
             "protective_exit_ack_pending_count": max(0, pe_order_submitted - pe_ack),
-            "filled_entries_without_exit_ack": max(0, strategy_filled - pe_ack),
+            # Use entry fill count (not total strategy order fills, which also include reduce-only PE fills).
+            "filled_entries_without_exit_ack": max(0, entry_fill_count - pe_ack),
             "runtime_decision_failures_count": int(counters.get("runtime_decision_failures_count", 0)),
         },
         "safety_summary": {
@@ -319,7 +320,8 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
         failures.append(REASON_SESSION_ABORTED)
 
     pe_submitted = _g(exec_s, "protective_exit_order_submitted_count")
-    missing_ack_hard_failure = strategy_filled > pe_submitted
+    # strategy_filled includes reduce-only protective-exit fills; compare against entry fills only.
+    missing_ack_hard_failure = entry_fill > pe_submitted
     if missing_ack_hard_failure:
         failures.append(REASON_FILLS_WITHOUT_PROTECTIVE_EXIT_ACK)
 

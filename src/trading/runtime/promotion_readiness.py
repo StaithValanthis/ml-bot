@@ -153,7 +153,9 @@ def aggregate_soak_reports(
             durations.append(float(dur))
 
         total_submitted += _g(exec_s, "strategy_order_submitted_count")
-        total_fills += _g(exec_s, "strategy_order_filled_count")
+        # total_fills should represent *entry* fills; total strategy fills also include
+        # reduce-only protective-exit fills, which would create false "missing PE" attribution.
+        total_fills += _g(exec_s, "entry_fill_received_count")
         total_entry_fill_received += _g(exec_s, "entry_fill_received_count")
         total_protective_exit_ack += _g(exec_s, "protective_exit_order_ack_received_count")
         total_protective_exit_failures += _g(exec_s, "protective_exit_placement_failed_count")
@@ -178,7 +180,7 @@ def aggregate_soak_reports(
             prob_sum += p_latest
             prob_count += 1
 
-        sf = _g(exec_s, "strategy_order_filled_count")
+        sf = _g(exec_s, "entry_fill_received_count", _g(exec_s, "strategy_order_filled_count"))
         pe_submitted = _g(exec_s, "protective_exit_order_submitted_count")
         pe_ack = _g(exec_s, "protective_exit_order_ack_received_count")
         pe_failed_sess = _g(exec_s, "protective_exit_placement_failed_count")
