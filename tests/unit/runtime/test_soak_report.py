@@ -174,6 +174,38 @@ def test_soak_report_verdict_pass_ack_pending_at_session_end() -> None:
     assert exec_s.get("filled_entries_without_exit_ack") == 1
 
 
+
+
+def test_soak_report_verdict_pass_when_one_protective_exit_is_skipped_explicitly() -> None:
+    # Explicit protective-exit placement skip is terminal attribution, not a missing submission.
+    summary = _minimal_session_summary(
+        session_ended_cleanly=True,
+        strategy_filled=2,
+        submitted=2,
+        model_filter_reached=2,
+        model_allowed=2,
+        candidates=1,
+    )
+    metrics = MetricsSnapshot(
+        counters={
+            "entry_fill_received_count": 2,
+            "protective_exit_plan_created_count": 2,
+            "protective_exit_order_submitted_count": 1,
+            "protective_exit_order_ack_received_count": 1,
+            "protective_exit_placement_failed_count": 0,
+            "protective_exit_placement_skipped_count": 1,
+        },
+        gauges={},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    verdict_block = report.get("health_verdict") or {}
+    assert verdict_block.get("verdict") in (VERDICT_PASS, VERDICT_PASS_WITH_WARNINGS)
+    assert "fills_without_protective_exit_ack" not in (verdict_block.get("failures") or [])
+    exec_s = report.get("execution_summary") or {}
+    assert exec_s.get("filled_entries_without_exit_ack") == 0
+
+
 def test_soak_report_does_not_misattribute_pe_fills_as_entry_fills() -> None:
     """strategy_order_filled_count may include reduce-only protective-exit fills.
 

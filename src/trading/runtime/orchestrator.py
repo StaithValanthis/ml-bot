@@ -183,6 +183,12 @@ class RuntimeOrchestrator:
         self._entry_guard_block_reasons: list[dict[str, object]] = []
         self._model_shadow_decisions: list[dict[str, object]] = []
         self._model_shadow_decisions_max: int = 100
+        self._protective_exit_skip_reasons: dict[str, int] = {}
+        self._protective_exit_done_link_ids: set[str] = set()
+        self._protective_exit_fill_outcomes: list[dict[str, object]] = []
+        self._last_runtime_decision_context: dict[str, object] | None = None
+        self._runtime_decision_failure_reasons: dict[str, int] = {}
+        self._recent_runtime_decision_failures: list[dict[str, object]] = []
         self._warmup_results: list[WarmupResult] = []
         self._portfolio = PortfolioState(
             equity_usdt=Decimal("0"),
@@ -474,6 +480,21 @@ class RuntimeOrchestrator:
                     exc_type = type(exc).__name__
                     exc_msg = str(exc)
                     tb_summary = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))[-1200:]
+                    if task.get_name() == "runtime-decision":
+                        self._runtime_decision_failure_reasons[exc_type] = self._runtime_decision_failure_reasons.get(exc_type, 0) + 1
+                        decision_ctx = self._last_runtime_decision_context or {}
+                        failure = {
+                            "task": task.get_name(),
+                            "exception_type": exc_type,
+                            "exception_message": exc_msg,
+                            "abort_reason": reason,
+                            "decision_context": decision_ctx,
+                            "timestamp": utc_now().isoformat(),
+                            "traceback_summary": tb_summary,
+                        }
+                        self._recent_runtime_decision_failures.append(failure)
+                        while len(self._recent_runtime_decision_failures) > 50:
+                            self._recent_runtime_decision_failures.pop(0)
                     self._logger.exception(
                         "runtime_task_failed",
                         task=task.get_name(),
@@ -814,24 +835,25 @@ class RuntimeOrchestrator:
                                 order_link_id=link_id,
                                 symbol=event.symbol or "",
                             )
-                            self._metrics.inc("entry_fill_received_count")
-                            await self._ledger.record(
-                                "entry_fill_received",
-                                {
-                                    "order_link_id": link_id,
-                                    "symbol": event.symbol or "",
-                                    "filled_qty": str(event.qty) if event.qty is not None else "",
-                                    "avg_price": str(event.avg_price) if event.avg_price is not None else "",
-                                },
-                            )
-                            self._logger.info(
-                                "entry_fill_received",
-                                order_link_id=link_id,
-                                symbol=event.symbol or "",
-                                filled_qty=str(event.qty) if event.qty else "",
-                                avg_price=str(event.avg_price) if event.avg_price else "",
-                            )
-                            await self._place_protective_exit_after_fill(link_id=link_id, event=event, prev=prev)
+                            if not prev.reduce_only:
+                                self._metrics.inc("entry_fill_received_count")
+                                await self._ledger.record(
+                                    "entry_fill_received",
+                                    {
+                                        "order_link_id": link_id,
+                                        "symbol": event.symbol or "",
+                                        "filled_qty": str(event.qty) if event.qty is not None else "",
+                                        "avg_price": str(event.avg_price) if event.avg_price is not None else "",
+                                    },
+                                )
+                                self._logger.info(
+                                    "entry_fill_received",
+                                    order_link_id=link_id,
+                                    symbol=event.symbol or "",
+                                    filled_qty=str(event.qty) if event.qty else "",
+                                    avg_price=str(event.avg_price) if event.avg_price else "",
+                                )
+                                await self._place_protective_exit_after_fill(link_id=link_id, event=event, prev=prev)
                         elif new_status == "Cancelled" and link_id not in so._seen_cancelled:
                             so._seen_cancelled.add(link_id)
                             so.cancelled += 1
@@ -1294,8 +1316,34 @@ class RuntimeOrchestrator:
         from trading.execution.order_manager import ManagedOrder
 
         if not isinstance(prev, ManagedOrder):
+            reason = "invalid_managed_order_context"
+            self._metrics.inc("protective_exit_placement_skipped_count")
+            self._protective_exit_skip_reasons[reason] = self._protective_exit_skip_reasons.get(reason, 0) + 1
+            self._protective_exit_fill_outcomes.append(
+                {
+                    "entry_order_link_id": link_id,
+                    "symbol": getattr(event, "symbol", "") or "",
+                    "outcome": "skipped",
+                    "acked": False,
+                    "skip_reason": reason,
+                    "timestamp": utc_now().isoformat(),
+                }
+            )
             return
         if prev.reduce_only:
+            reason = "reduce_only_fill_not_entry"
+            self._metrics.inc("protective_exit_placement_skipped_count")
+            self._protective_exit_skip_reasons[reason] = self._protective_exit_skip_reasons.get(reason, 0) + 1
+            self._protective_exit_fill_outcomes.append(
+                {
+                    "entry_order_link_id": link_id,
+                    "symbol": prev.symbol or getattr(event, "symbol", "") or "",
+                    "outcome": "skipped",
+                    "acked": False,
+                    "skip_reason": reason,
+                    "timestamp": utc_now().isoformat(),
+                }
+            )
             return
         signal_action = prev.metadata.get("signal_action")
         if signal_action == "enter_long":
@@ -1309,10 +1357,37 @@ class RuntimeOrchestrator:
                 reason="unknown_signal_action",
                 signal_action=signal_action,
             )
+            self._metrics.inc("protective_exit_placement_skipped_count")
+            self._protective_exit_skip_reasons["unknown_signal_action"] = (
+                self._protective_exit_skip_reasons.get("unknown_signal_action", 0) + 1
+            )
+            self._protective_exit_fill_outcomes.append(
+                {
+                    "entry_order_link_id": link_id,
+                    "symbol": prev.symbol or event.symbol or "",
+                    "outcome": "skipped",
+                    "acked": False,
+                    "skip_reason": "unknown_signal_action",
+                    "timestamp": utc_now().isoformat(),
+                }
+            )
             return
         symbol = prev.symbol or event.symbol or ""
         if not symbol:
             self._logger.warning("protective_exit_placement_skipped", order_link_id=link_id, reason="missing_symbol")
+            reason = "missing_symbol"
+            self._metrics.inc("protective_exit_placement_skipped_count")
+            self._protective_exit_skip_reasons[reason] = self._protective_exit_skip_reasons.get(reason, 0) + 1
+            self._protective_exit_fill_outcomes.append(
+                {
+                    "entry_order_link_id": link_id,
+                    "symbol": getattr(event, "symbol", "") or "",
+                    "outcome": "skipped",
+                    "acked": False,
+                    "skip_reason": reason,
+                    "timestamp": utc_now().isoformat(),
+                }
+            )
             return
         filled_qty = prev.filled_qty if prev.filled_qty and prev.filled_qty > 0 else event.qty
         if not filled_qty or filled_qty <= 0:
@@ -1321,6 +1396,19 @@ class RuntimeOrchestrator:
                 order_link_id=link_id,
                 symbol=symbol,
                 reason="zero_filled_qty",
+            )
+            reason = "zero_filled_qty"
+            self._metrics.inc("protective_exit_placement_skipped_count")
+            self._protective_exit_skip_reasons[reason] = self._protective_exit_skip_reasons.get(reason, 0) + 1
+            self._protective_exit_fill_outcomes.append(
+                {
+                    "entry_order_link_id": link_id,
+                    "symbol": symbol,
+                    "outcome": "skipped",
+                    "acked": False,
+                    "skip_reason": reason,
+                    "timestamp": utc_now().isoformat(),
+                }
             )
             return
         entry_avg_price = prev.avg_price or event.avg_price
@@ -1331,6 +1419,19 @@ class RuntimeOrchestrator:
                 symbol=symbol,
                 reason="missing_avg_price",
             )
+            reason = "missing_avg_price"
+            self._metrics.inc("protective_exit_placement_skipped_count")
+            self._protective_exit_skip_reasons[reason] = self._protective_exit_skip_reasons.get(reason, 0) + 1
+            self._protective_exit_fill_outcomes.append(
+                {
+                    "entry_order_link_id": link_id,
+                    "symbol": symbol,
+                    "outcome": "skipped",
+                    "acked": False,
+                    "skip_reason": reason,
+                    "timestamp": utc_now().isoformat(),
+                }
+            )
             return
         symbol_spec = self._symbol_specs.get(symbol)
         if symbol_spec is None:
@@ -1339,6 +1440,19 @@ class RuntimeOrchestrator:
                 order_link_id=link_id,
                 symbol=symbol,
                 reason="missing_symbol_spec",
+            )
+            reason = "missing_symbol_spec"
+            self._metrics.inc("protective_exit_placement_skipped_count")
+            self._protective_exit_skip_reasons[reason] = self._protective_exit_skip_reasons.get(reason, 0) + 1
+            self._protective_exit_fill_outcomes.append(
+                {
+                    "entry_order_link_id": link_id,
+                    "symbol": symbol,
+                    "outcome": "skipped",
+                    "acked": False,
+                    "skip_reason": reason,
+                    "timestamp": utc_now().isoformat(),
+                }
             )
             return
         exit_intent = self._execution_engine.build_protective_limit_exit(
@@ -1443,6 +1557,30 @@ class RuntimeOrchestrator:
                     order_id=order_after.order_id,
                     symbol=symbol,
                 )
+                # Track deterministic completion of the protective exit for this specific entry fill.
+                self._protective_exit_done_link_ids.add(link_id)
+                self._protective_exit_fill_outcomes.append(
+                    {
+                        "entry_order_link_id": link_id,
+                        "order_link_id": exit_intent.order_link_id,
+                        "symbol": symbol,
+                        "outcome": "submitted",
+                        "acked": True,
+                        "timestamp": utc_now().isoformat(),
+                    }
+                )
+            else:
+                # Submitted intent but ack not observed yet (or order id missing).
+                self._protective_exit_fill_outcomes.append(
+                    {
+                        "entry_order_link_id": link_id,
+                        "order_link_id": exit_intent.order_link_id,
+                        "symbol": symbol,
+                        "outcome": "submitted",
+                        "acked": False,
+                        "timestamp": utc_now().isoformat(),
+                    }
+                )
         except BybitRestError as exc:
             reason = str(exc)
             if isinstance(exc, BybitAPIError):
@@ -1511,14 +1649,18 @@ class RuntimeOrchestrator:
                     reduce_only=intent.reduce_only,
                 )
             )
+            # Local ManagedOrder is keyed by the submitted client `intent.order_link_id`.
+            # The exchange response `ack.order_link_id` may differ (e.g. tests/mocks).
+            # Use the intent link id as the local source of truth.
+            ack_link = intent.order_link_id
             await self._order_manager.ack_exchange_order(
-                order_link_id=ack.order_link_id,
+                order_link_id=ack_link,
                 order_id=ack.order_id,
                 updated_at=utc_now(),
             )
             await self._ledger.record(
                 "order_ack",
-                {"order_link_id": ack.order_link_id, "order_id": ack.order_id},
+                {"order_link_id": ack_link, "order_id": ack.order_id},
             )
             if is_drill and self._drill_outcome.order_link_id == ack.order_link_id:
                 self._drill_outcome.ack_received = True
@@ -1532,12 +1674,12 @@ class RuntimeOrchestrator:
                 self._strategy_order_outcomes.acks += 1
                 self._logger.info(
                     "strategy_order_ack_received",
-                    order_link_id=ack.order_link_id,
+                    order_link_id=ack_link,
                     order_id=ack.order_id,
                 )
             self._logger.info(
                 "order_ack_received",
-                order_link_id=ack.order_link_id,
+                order_link_id=ack_link,
                 order_id=ack.order_id,
             )
             self._metrics.inc("order_acks_total")
@@ -2383,8 +2525,16 @@ class RuntimeOrchestrator:
         open_exit_count = len(exit_orders)
 
         pos = self._portfolio.position_for(symbol)
-        current_position_size = float(pos.qty) if pos and pos.qty else 0.0
+        pos_qty = Decimal(pos.qty) if pos and pos.qty is not None else Decimal("0")
+        current_position_size = float(pos_qty)
         current_position_side = str(pos.side) if pos and pos.side else "Flat"
+
+        flat_threshold_qty = Decimal("0")
+        symbol_spec = self._symbol_specs.get(symbol)
+        if symbol_spec is not None and getattr(symbol_spec, "qty_step", None) is not None:
+            flat_threshold_qty = Decimal(symbol_spec.qty_step) / Decimal("2")
+
+        position_effectively_flat = abs(pos_qty) <= flat_threshold_qty
 
         base_payload: dict[str, object] = {
             "symbol": symbol,
@@ -2395,13 +2545,16 @@ class RuntimeOrchestrator:
             "local_tracked_order_count": len(sym_orders),
             "allow_position_adds": allow_adds,
             "max_concurrent_entries_per_symbol": max_entries,
+            "position_effectively_flat": position_effectively_flat,
+            "effective_flat_threshold_qty": float(flat_threshold_qty),
         }
 
         if not allow_adds:
-            if current_position_size != 0:
+            if not position_effectively_flat:
                 block_payload = {**base_payload, "reason": "non_flat_position", "block_reason_bucket": "existing_position"}
                 return (True, "existing_position", block_payload)
-            if open_exit_count > 0 and current_position_size == 0:
+
+            if open_exit_count > 0 and position_effectively_flat:
                 self._logger.info(
                     "entry_guard_allows_reentry_after_flatten",
                     symbol=symbol,
@@ -2411,9 +2564,11 @@ class RuntimeOrchestrator:
                     block_reason_bucket="flat_with_stale_exit_allowed",
                 )
                 self._metrics.inc("entry_guard_reentry_allowed_flat_stale_exit_count")
+
             if open_entry_count > 0:
                 block_payload = {**base_payload, "reason": "working_entry_order_exists", "block_reason_bucket": "existing_working_entry"}
                 return (True, "existing_working_entry", block_payload)
+
             return (False, None, base_payload)
 
         if open_entry_count >= max_entries:
@@ -2433,7 +2588,7 @@ class RuntimeOrchestrator:
                 if sym not in by_symbol:
                     by_symbol[sym] = {}
                 by_symbol[sym][bucket] = by_symbol[sym].get(bucket, 0) + 1
-        return {"by_type": by_type, "by_symbol": by_symbol}
+        return {"by_type": by_type, "by_symbol": by_symbol, "recent_context": list(self._entry_guard_block_reasons[-50:])}
 
     def _infer_strategy_blocking_stage(self, m: dict[str, float]) -> str:
         """Infer which stage is blocking decisions for operator visibility."""
@@ -2749,6 +2904,29 @@ class RuntimeOrchestrator:
             summary["reconcile_diagnostics"] = build_reconcile_diagnostics_summary(agg)
         if self._startup_auth_disabled:
             summary["startup_auth_disabled"] = True
+
+        # Protective-exit determinism diagnostics (per entry-fill attribution).
+        counters = self._metrics.snapshot().counters
+        entry_fill_count = int(counters.get("entry_fill_received_count", 0))
+        pe_submitted = int(counters.get("protective_exit_order_submitted_count", 0))
+        outcomes_by_entry: dict[str, dict[str, object]] = {}
+        for o in self._protective_exit_fill_outcomes:
+            entry_key = str(o.get("entry_order_link_id", ""))
+            if not entry_key:
+                continue
+            outcomes_by_entry[entry_key] = o
+
+        summary["protective_exit_diagnostics"] = {
+            "fills_with_exit_submission": pe_submitted,
+            "fills_without_exit_submission": max(0, entry_fill_count - pe_submitted),
+            "protective_exit_skip_reasons_by_type": dict(self._protective_exit_skip_reasons),
+            "recent_fill_outcomes": list(self._protective_exit_fill_outcomes[-50:]),
+            "protective_exit_fill_outcomes_by_entry_link_id": outcomes_by_entry,
+        }
+
+        summary["runtime_decision_failure_reasons"] = dict(self._runtime_decision_failure_reasons)
+        summary["recent_runtime_decision_failures"] = list(self._recent_runtime_decision_failures)
+
         summary["strategy_order_outcomes"] = {
             "intents": so.intents,
             "submissions": so.submissions,

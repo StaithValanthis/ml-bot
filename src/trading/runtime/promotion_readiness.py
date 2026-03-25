@@ -184,10 +184,11 @@ def aggregate_soak_reports(
         pe_submitted = _g(exec_s, "protective_exit_order_submitted_count")
         pe_ack = _g(exec_s, "protective_exit_order_ack_received_count")
         pe_failed_sess = _g(exec_s, "protective_exit_placement_failed_count")
+        pe_skipped_sess = _g(exec_s, "protective_exit_placement_skipped_count")
         pe_pending = _g(exec_s, "protective_exit_ack_pending_count", max(0, pe_submitted - pe_ack))
         fills_without_ack = _g(exec_s, "filled_entries_without_exit_ack", max(0, sf - pe_ack))
 
-        if sf > pe_submitted:
+        if sf > (pe_submitted + pe_failed_sess + pe_skipped_sess):
             fills_without_protective_exit_ack = True
             sessions_causing_fills_without_protective_exit_ack.append(session_id)
         if sf > pe_ack:

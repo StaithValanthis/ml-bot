@@ -94,6 +94,7 @@ def build_soak_report(
     pe_order_submitted = int(counters.get("protective_exit_order_submitted_count", 0))
     pe_ack = int(counters.get("protective_exit_order_ack_received_count", 0))
     pe_failed = int(counters.get("protective_exit_placement_failed_count", 0))
+    pe_skipped = int(counters.get("protective_exit_placement_skipped_count", 0))
 
     model_allowed = _g(mf, "allowed")
     model_blocked_count = _g(mf, "blocked")
@@ -185,9 +186,10 @@ def build_soak_report(
             "protective_exit_order_submitted_count": pe_order_submitted,
             "protective_exit_order_ack_received_count": pe_ack,
             "protective_exit_placement_failed_count": pe_failed,
+            "protective_exit_placement_skipped_count": pe_skipped,
             "protective_exit_ack_pending_count": max(0, pe_order_submitted - pe_ack),
             # Use entry fill count (not total strategy order fills, which also include reduce-only PE fills).
-            "filled_entries_without_exit_ack": max(0, entry_fill_count - pe_ack),
+            "filled_entries_without_exit_ack": max(0, entry_fill_count - pe_ack - pe_failed - pe_skipped),
             "runtime_decision_failures_count": int(counters.get("runtime_decision_failures_count", 0)),
         },
         "safety_summary": {
@@ -297,6 +299,7 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
     strategy_filled = _g(exec_s, "strategy_order_filled_count")
     pe_ack = _g(exec_s, "protective_exit_order_ack_received_count")
     pe_failed = _g(exec_s, "protective_exit_placement_failed_count")
+    pe_skipped = _g(exec_s, "protective_exit_placement_skipped_count")
     entry_fill = _g(exec_s, "entry_fill_received_count")
     submitted = _g(exec_s, "strategy_order_submitted_count")
     ack = _g(exec_s, "strategy_order_ack_received_count")
@@ -321,7 +324,7 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
 
     pe_submitted = _g(exec_s, "protective_exit_order_submitted_count")
     # strategy_filled includes reduce-only protective-exit fills; compare against entry fills only.
-    missing_ack_hard_failure = entry_fill > pe_submitted
+    missing_ack_hard_failure = entry_fill > (pe_submitted + pe_failed + pe_skipped)
     if missing_ack_hard_failure:
         failures.append(REASON_FILLS_WITHOUT_PROTECTIVE_EXIT_ACK)
 

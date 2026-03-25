@@ -107,6 +107,30 @@ def test_not_ready_when_fill_gt_protective_exit_ack() -> None:
     assert "fills_without_protective_exit_ack" in (verdict_block.get("reasons") or [])
 
 
+
+
+def test_no_false_missing_protective_exit_when_terminal_skip_present() -> None:
+    # A recorded protective-exit placement skip counts as terminal attribution.
+    reports = [
+        _minimal_soak_report(filled=2, pe_ack=1, pe_submitted=1, session_id="skip_terminal"),
+    ]
+    # Simulate explicit terminal skip attribution.
+    reports[0]["execution_summary"]["protective_exit_placement_skipped_count"] = 1
+    reports[0]["execution_summary"]["filled_entries_without_exit_ack"] = 0
+
+    assessment = build_promotion_assessment(
+        reports,
+        minimum_passing_sessions=0,
+        minimum_total_duration_seconds=0,
+        minimum_total_fills=0,
+        minimum_model_evaluations=0,
+    )
+    verdict_block = assessment.get("promotion_verdict") or {}
+    reasons = verdict_block.get("reasons") or []
+    assert "fills_without_protective_exit_ack" not in reasons
+    assert verdict_block.get("verdict") != VERDICT_NOT_READY
+
+
 def test_no_false_missing_protective_exit_when_strategy_fills_include_pe() -> None:
     """If strategy_filled includes reduce-only PE fills, safety checks must still use entry_fill_received_count."""
     reports = [
