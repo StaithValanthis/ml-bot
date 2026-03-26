@@ -31,14 +31,14 @@ def _make_orchestrator() -> RuntimeOrchestrator:
         return RuntimeOrchestrator(load_settings())
 
 
-def _mock_order(symbol: str = "BTCUSDT", reduce_only: bool = False, drill: bool = False):
+def _mock_order(symbol: str = "BTCUSDT", reduce_only: bool = False, drill: bool = False, order_link_id: str = "link-1"):
     from trading.execution.order_manager import ManagedOrder
     from datetime import datetime, timezone
     from trading.util.types import OrderStatus
 
     return ManagedOrder(
         order_id="ord-1",
-        order_link_id="link-1",
+        order_link_id=order_link_id,
         symbol=symbol,
         status=OrderStatus.NEW,
         qty=Decimal("0.001"),
@@ -223,8 +223,44 @@ def test_entry_blocked_existing_position_log_merge_no_duplicate_keywords() -> No
     assert block_reason == "existing_position"
     assert guard_payload.get("block_reason_bucket") == "existing_position"
     block_bucket = guard_payload.get("block_reason_bucket", block_reason or "unknown")
-    merged = {**guard_payload, "block_reason_bucket": block_bucket}
-    orch._logger.info("entry_blocked_existing_position", **merged)
+    # Exact shape used by _decision_loop after fix (single ** expansion).
+    _guard_block_log = {**guard_payload, "block_reason_bucket": block_bucket}
+    orch._logger.info("entry_blocked_existing_position", **_guard_block_log)
+    # Proves the pre-fix call form is invalid Python / structlog duplicate-kwarg territory.
+    with pytest.raises(TypeError, match="multiple values"):
+        orch._logger.info(
+            "entry_blocked_existing_position",
+            **guard_payload,
+            block_reason_bucket=block_bucket,
+        )
+
+
+def test_entry_blocked_working_entry_and_max_concurrent_log_merge_no_duplicate_keywords() -> None:
+    """Same structlog hazard for entry_blocked_existing_working_entry / max_concurrent_entries."""
+    orch = _make_orchestrator()
+    orch._settings.runtime.allow_position_adds = False
+    orch._settings.runtime.max_concurrent_entries_per_symbol = 1
+    open_working = [
+        _mock_order(symbol="BTCUSDT", reduce_only=False),
+    ]
+    blocked_w, reason_w, payload_w = orch._should_block_new_entry("BTCUSDT", open_working)
+    assert blocked_w and reason_w == "existing_working_entry"
+    bucket_w = payload_w.get("block_reason_bucket", reason_w or "unknown")
+    log_w = {**payload_w, "block_reason_bucket": bucket_w}
+    orch._logger.info("entry_blocked_existing_working_entry", **log_w)
+
+    orch2 = _make_orchestrator()
+    orch2._settings.runtime.allow_position_adds = True
+    orch2._settings.runtime.max_concurrent_entries_per_symbol = 1
+    two_entries = [
+        _mock_order(symbol="BTCUSDT", reduce_only=False, order_link_id="link-a"),
+        _mock_order(symbol="BTCUSDT", reduce_only=False, order_link_id="link-b"),
+    ]
+    blocked_m, reason_m, payload_m = orch2._should_block_new_entry("BTCUSDT", two_entries)
+    assert blocked_m and reason_m == "max_concurrent_entries"
+    bucket_m = payload_m.get("block_reason_bucket", reason_m or "unknown")
+    log_m = {**payload_m, "block_reason_bucket": bucket_m}
+    orch2._logger.info("entry_blocked_max_concurrent_entries", **log_m)
 
 
 def test_effectively_flat_dust_position_does_not_block_existing_position() -> None:

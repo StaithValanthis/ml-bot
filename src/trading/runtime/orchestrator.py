@@ -1240,28 +1240,25 @@ class RuntimeOrchestrator:
                         "open_entry_count": guard_payload.get("open_entry_order_count"),
                         "open_reduce_only_count": guard_payload.get("open_reduce_only_order_count"),
                     })
+                    # guard_payload already includes block_reason_bucket; structlog cannot receive
+                    # the same keyword twice (**guard_payload + block_reason_bucket=...).
+                    _guard_block_log = {**guard_payload, "block_reason_bucket": block_bucket}
                     if block_reason == "existing_position":
                         self._metrics.inc("position_add_blocked_count")
                         self._metrics.inc("entry_guard_block_non_flat_count")
-                        self._logger.info(
-                            "entry_blocked_existing_position",
-                            **guard_payload,
-                            block_reason_bucket=block_bucket,
-                        )
+                        self._logger.info("entry_blocked_existing_position", **_guard_block_log)
                     elif block_reason == "existing_working_entry":
                         self._metrics.inc("working_entry_blocked_count")
                         self._metrics.inc("entry_guard_block_working_entry_count")
                         self._logger.info(
                             "entry_blocked_existing_working_entry",
-                            **guard_payload,
-                            block_reason_bucket=block_bucket,
+                            **_guard_block_log,
                         )
                     elif block_reason == "max_concurrent_entries":
                         self._metrics.inc("entry_guard_block_max_concurrent_count")
                         self._logger.info(
                             "entry_blocked_max_concurrent_entries",
-                            **guard_payload,
-                            block_reason_bucket=block_bucket,
+                            **_guard_block_log,
                         )
                     continue
 
