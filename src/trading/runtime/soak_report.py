@@ -339,7 +339,8 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
     if model_filter_reached > 0 and submitted == 0 and model_allowed > 0:
         # If the model allowed candidates, but the bot never submitted because the entry guard
         # blocked exclusively due to a non-flat active position, treat it as a warning instead
-        # of a hard failure (the session is "explained", not "missing").
+        # of a hard failure — only when the session is otherwise operationally clean (no abort,
+        # reconcile mismatch, protective-exit failures, runtime-decision failures, or missing PE).
         entry_guard_block_reasons_by_type = safety.get("entry_guard_block_reasons_by_type") or {}
         existing_pos_cnt = int(entry_guard_block_reasons_by_type.get("existing_position", 0) or 0)
         other_cnt = sum(
@@ -351,7 +352,17 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
             and _g(safety, "position_add_blocked_count", 0) > 0
             and _g(safety, "working_entry_blocked_count", 0) == 0
         )
-        if guard_blocked_active_position_only:
+        runtime_decision_failures = _g(exec_s, "runtime_decision_failures_count", 0)
+        operational_clean_for_guard_warn = (
+            session_clean
+            and not abort_reasons
+            and not repeated_reconcile
+            and reconcile_count == 0
+            and pe_failed == 0
+            and runtime_decision_failures == 0
+            and not missing_ack_hard_failure
+        )
+        if guard_blocked_active_position_only and operational_clean_for_guard_warn:
             warnings.append(REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION)
         else:
             failures.append(REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED)

@@ -8,6 +8,11 @@ from pathlib import Path
 
 import pytest
 
+from trading.monitoring.metrics import MetricsSnapshot
+from trading.runtime.soak_report import (
+    REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION,
+    build_soak_report,
+)
 from trading.runtime.promotion_readiness import (
     VERDICT_CONTINUE_DEMO_SOAK,
     VERDICT_NOT_READY,
@@ -110,6 +115,81 @@ def test_promotion_does_not_not_ready_for_guard_blocked_model_allowed_session() 
     # Promotion readiness is verdict-driven; ensure it doesn't go NOT_READY due to fail_count.
     assessment = build_promotion_assessment(
         reports,
+        minimum_passing_sessions=0,
+        minimum_total_duration_seconds=0,
+        minimum_total_fills=0,
+        minimum_model_evaluations=0,
+    )
+    verdict_block = assessment.get("promotion_verdict") or {}
+    assert verdict_block.get("verdict") != VERDICT_NOT_READY
+    assert "any_fail_soak_report" not in (verdict_block.get("reasons") or [])
+
+
+def test_promotion_end_to_end_built_soak_guard_blocked_active_position_warn() -> None:
+    """Soak builder must emit guard warning verdict; promotion must not treat that as FAIL."""
+    summary = {
+        "session_start": "2025-03-19T10:00:00+00:00",
+        "session_end": "2025-03-19T11:00:00+00:00",
+        "mode": "demo",
+        "symbols": ["BTCUSDT"],
+        "session_ended_cleanly": True,
+        "abort_reasons": [],
+        "strategy_flow": {
+            "bars_confirmed": 10,
+            "candidates": 55,
+            "regime_rejected": 0,
+            "signal_rejected": 0,
+            "sizing_rejected": 0,
+            "risk_rejected": 0,
+            "model_filter_reached": 55,
+            "model_blocked": 0,
+            "submitted": 0,
+        },
+        "strategy_order_outcomes": {
+            "intents": 0,
+            "submissions": 0,
+            "acks": 0,
+            "filled": 0,
+            "cancelled": 0,
+            "rejected": 0,
+        },
+        "model_filter": {
+            "enabled": True,
+            "active": True,
+            "mode": "hard_block",
+            "threshold": 0.5,
+            "allowed": 55,
+            "blocked": 0,
+            "prob_count": 55,
+        },
+        "reconcile_mismatch_cycles": 0,
+        "blocking_stage": "submitted",
+        "entry_guard_block_reasons": {
+            "by_type": {"existing_position": 55},
+            "by_symbol": {"BTCUSDT": {"existing_position": 55}},
+        },
+    }
+    metrics = MetricsSnapshot(
+        counters={
+            "entry_fill_received_count": 0,
+            "protective_exit_plan_created_count": 0,
+            "protective_exit_order_submitted_count": 0,
+            "protective_exit_order_ack_received_count": 0,
+            "protective_exit_placement_failed_count": 0,
+            "position_add_blocked_count": 55,
+            "working_entry_blocked_count": 0,
+            "startup_state_blocked_count": 0,
+        },
+        gauges={},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    hv = report.get("health_verdict") or {}
+    assert hv.get("verdict") == "PASS_WITH_WARNINGS"
+    assert REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION in (hv.get("warnings") or [])
+
+    assessment = build_promotion_assessment(
+        [report],
         minimum_passing_sessions=0,
         minimum_total_duration_seconds=0,
         minimum_total_fills=0,
