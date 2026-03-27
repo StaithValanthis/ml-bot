@@ -347,9 +347,13 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
         other_cnt = sum(
             int(v) for k, v in entry_guard_block_reasons_by_type.items() if k != "existing_position"
         )
+        nonzero_reason_keys = {
+            str(k) for k, v in entry_guard_block_reasons_by_type.items() if int(v or 0) > 0
+        }
         guard_blocked_active_position_only = (
             existing_pos_cnt > 0
             and other_cnt == 0
+            and nonzero_reason_keys == {"existing_position"}
             and _g(safety, "position_add_blocked_count", 0) > 0
             and _g(safety, "working_entry_blocked_count", 0) == 0
         )

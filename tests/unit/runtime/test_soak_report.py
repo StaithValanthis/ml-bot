@@ -309,6 +309,40 @@ def test_soak_report_fail_model_allowed_guard_only_when_reconcile_mismatch() -> 
     )
 
 
+def test_soak_report_fail_when_existing_position_is_not_only_nonzero_guard_reason() -> None:
+    """Guard-block warning is only allowed when existing_position is the sole non-zero reason."""
+    summary = _minimal_session_summary(
+        session_ended_cleanly=True,
+        submitted=0,
+        model_filter_reached=55,
+        model_allowed=55,
+        candidates=55,
+    )
+    summary["entry_guard_block_reasons"] = {
+        "by_type": {"existing_position": 55, "max_concurrent_entries": 1},
+        "by_symbol": {"BTCUSDT": {"existing_position": 55, "max_concurrent_entries": 1}},
+    }
+    metrics = MetricsSnapshot(
+        counters={
+            "entry_fill_received_count": 0,
+            "protective_exit_order_submitted_count": 0,
+            "protective_exit_order_ack_received_count": 0,
+            "protective_exit_placement_failed_count": 0,
+            "protective_exit_placement_skipped_count": 0,
+            "runtime_decision_failures_count": 0,
+            "position_add_blocked_count": 55,
+            "working_entry_blocked_count": 0,
+        },
+        gauges={},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    verdict_block = report.get("health_verdict") or {}
+    assert verdict_block.get("verdict") == VERDICT_FAIL
+    assert REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION not in (verdict_block.get("warnings") or [])
+    assert REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED in (verdict_block.get("failures") or [])
+
+
 def test_soak_report_fail_model_allowed_but_no_submissions_unexplained() -> None:
     """model_filter_allowed>0 with zero submissions is a hard FAIL if guard wasn't explained as existing_position-only."""
     summary = _minimal_session_summary(

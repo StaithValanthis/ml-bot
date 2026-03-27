@@ -285,6 +285,80 @@ def test_promotion_exact_session_shape_guard_blocked_active_position_not_fail() 
     assert "any_fail_soak_report" not in (verdict_block.get("reasons") or [])
 
 
+def test_promotion_marks_fail_when_guard_reason_not_existing_position_only() -> None:
+    """A mixed non-zero guard reason set must remain fail-soak and trigger any_fail_soak_report."""
+    summary = {
+        "session_start": "2026-03-26T12:43:08+00:00",
+        "session_end": "2026-03-26T21:31:33+00:00",
+        "mode": "demo",
+        "symbols": ["BTCUSDT"],
+        "session_ended_cleanly": True,
+        "abort_reasons": [],
+        "strategy_flow": {
+            "bars_confirmed": 106,
+            "candidates": 106,
+            "regime_rejected": 51,
+            "signal_rejected": 0,
+            "sizing_rejected": 0,
+            "risk_rejected": 0,
+            "model_filter_reached": 55,
+            "model_blocked": 0,
+            "submitted": 0,
+        },
+        "strategy_order_outcomes": {
+            "intents": 0,
+            "submissions": 0,
+            "acks": 0,
+            "filled": 0,
+            "cancelled": 0,
+            "rejected": 0,
+        },
+        "model_filter": {
+            "enabled": True,
+            "active": True,
+            "mode": "hard_block",
+            "threshold": 1.75e-07,
+            "allowed": 55,
+            "blocked": 0,
+            "prob_count": 55,
+        },
+        "reconcile_mismatch_cycles": 0,
+        "entry_guard_block_reasons": {
+            "by_type": {"existing_position": 55, "max_concurrent_entries": 1},
+            "by_symbol": {"BTCUSDT": {"existing_position": 55, "max_concurrent_entries": 1}},
+        },
+    }
+    metrics = MetricsSnapshot(
+        counters={
+            "entry_fill_received_count": 0,
+            "protective_exit_order_submitted_count": 0,
+            "protective_exit_order_ack_received_count": 0,
+            "protective_exit_placement_failed_count": 0,
+            "protective_exit_placement_skipped_count": 0,
+            "runtime_decision_failures_count": 0,
+            "position_add_blocked_count": 55,
+            "working_entry_blocked_count": 0,
+        },
+        gauges={},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    hv = report.get("health_verdict") or {}
+    assert hv.get("verdict") == "FAIL"
+    assert "model_allowed_but_no_submissions_unexplained" in (hv.get("failures") or [])
+
+    assessment = build_promotion_assessment(
+        [report],
+        minimum_passing_sessions=0,
+        minimum_total_duration_seconds=0,
+        minimum_total_fills=0,
+        minimum_model_evaluations=0,
+    )
+    verdict_block = assessment.get("promotion_verdict") or {}
+    assert verdict_block.get("verdict") == VERDICT_NOT_READY
+    assert "any_fail_soak_report" in (verdict_block.get("reasons") or [])
+
+
 def test_not_ready_when_fill_gt_protective_exit_ack() -> None:
     """NOT_READY when fills > protective_exit submitted (hard failure)."""
     reports = [
