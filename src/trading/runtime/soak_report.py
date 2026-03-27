@@ -302,6 +302,7 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
     pe_ack = _g(exec_s, "protective_exit_order_ack_received_count")
     pe_failed = _g(exec_s, "protective_exit_placement_failed_count")
     pe_skipped = _g(exec_s, "protective_exit_placement_skipped_count")
+    fills_without_exit_ack = _g(exec_s, "filled_entries_without_exit_ack")
     entry_fill = _g(exec_s, "entry_fill_received_count")
     submitted = _g(exec_s, "strategy_order_submitted_count")
     ack = _g(exec_s, "strategy_order_ack_received_count")
@@ -360,6 +361,7 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
             and reconcile_count == 0
             and pe_failed == 0
             and runtime_decision_failures == 0
+            and fills_without_exit_ack == 0
             and not missing_ack_hard_failure
         )
         if guard_blocked_active_position_only and operational_clean_for_guard_warn:

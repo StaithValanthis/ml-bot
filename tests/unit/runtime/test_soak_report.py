@@ -11,6 +11,7 @@ import pytest
 from trading.monitoring.metrics import MetricsSnapshot
 from trading.runtime.orchestrator import RuntimeOrchestrator
 from trading.runtime.soak_report import (
+    REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS,
     VERDICT_FAIL,
     VERDICT_PASS,
     VERDICT_PASS_WITH_WARNINGS,
@@ -183,6 +184,55 @@ def test_soak_report_warn_model_allowed_but_guard_blocked_due_to_active_position
         in (verdict_block.get("warnings") or [])
     )
     assert REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED not in (verdict_block.get("failures") or [])
+
+
+def test_soak_report_exact_session_shape_guard_blocked_active_position_is_warning_only() -> None:
+    """Exact provided session shape must be PASS_WITH_WARNINGS, not model-allowed-no-submissions FAIL."""
+    summary = _minimal_session_summary(
+        session_ended_cleanly=True,
+        submitted=0,
+        model_filter_reached=55,
+        model_allowed=55,
+        candidates=106,
+    )
+    summary["strategy_flow"]["bars_confirmed"] = 106
+    summary["strategy_flow"]["regime_rejected"] = 51
+    summary["entry_guard_block_reasons"] = {
+        "by_type": {"existing_position": 55},
+        "by_symbol": {"BTCUSDT": {"existing_position": 55}},
+    }
+    summary["startup_state_diagnostics"] = {
+        "block_reason": "dirty_at_startup",
+        "cleared": True,
+        "uncleared_at_session_end": False,
+    }
+    metrics = MetricsSnapshot(
+        counters={
+            "entry_fill_received_count": 0,
+            "protective_exit_order_submitted_count": 0,
+            "protective_exit_order_ack_received_count": 0,
+            "protective_exit_placement_failed_count": 0,
+            "protective_exit_placement_skipped_count": 0,
+            "runtime_decision_failures_count": 0,
+            "startup_state_blocked_count": 1,
+            "startup_state_block_cleared_count": 1,
+            "position_add_blocked_count": 55,
+            "working_entry_blocked_count": 0,
+            "missing_on_exchange_detected_count": 0,
+            "missing_on_exchange_resolved_count": 0,
+        },
+        gauges={},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    verdict_block = report.get("health_verdict") or {}
+    failures = verdict_block.get("failures") or []
+    warnings = verdict_block.get("warnings") or []
+    assert verdict_block.get("verdict") == VERDICT_PASS_WITH_WARNINGS
+    assert REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION in warnings
+    assert "startup_state_block_triggered" in warnings
+    assert REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED not in failures
+    assert REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS not in failures
 
 
 def test_soak_report_fail_model_allowed_guard_only_when_runtime_decision_failures() -> None:
