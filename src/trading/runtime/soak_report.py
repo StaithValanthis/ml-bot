@@ -368,7 +368,10 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
             and fills_without_exit_ack == 0
             and not missing_ack_hard_failure
         )
-        if guard_blocked_active_position_only and operational_clean_for_guard_warn:
+        clean_existing_position_only_block_case = (
+            guard_blocked_active_position_only and operational_clean_for_guard_warn
+        )
+        if clean_existing_position_only_block_case:
             warnings.append(REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION)
         else:
             failures.append(REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED)

@@ -269,6 +269,7 @@ def test_promotion_exact_session_shape_guard_blocked_active_position_not_fail() 
     report = build_soak_report(summary, metrics)
     hv = report.get("health_verdict") or {}
     assert hv.get("verdict") == "PASS_WITH_WARNINGS"
+    assert (hv.get("failures") or []) == []
     assert REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION in (hv.get("warnings") or [])
     assert "model_allowed_but_no_submissions" not in (hv.get("failures") or [])
     assert "model_allowed_but_no_submissions_unexplained" not in (hv.get("failures") or [])

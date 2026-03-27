@@ -229,6 +229,7 @@ def test_soak_report_exact_session_shape_guard_blocked_active_position_is_warnin
     failures = verdict_block.get("failures") or []
     warnings = verdict_block.get("warnings") or []
     assert verdict_block.get("verdict") == VERDICT_PASS_WITH_WARNINGS
+    assert failures == []
     assert REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION in warnings
     assert "startup_state_block_triggered" in warnings
     assert REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED not in failures
