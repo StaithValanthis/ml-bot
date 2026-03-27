@@ -17,6 +17,8 @@ from trading.runtime.soak_report import (
     build_soak_markdown,
     build_soak_report,
     compute_verdict,
+    REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION,
+    REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED,
 )
 from trading.settings import load_settings
 from trading.util.types import RuntimeMode
@@ -144,6 +146,79 @@ def test_soak_report_verdict_fail_fill_without_protective_exit_submit() -> None:
     verdict_block = report.get("health_verdict") or {}
     assert verdict_block.get("verdict") == VERDICT_FAIL
     assert "fills_without_protective_exit_ack" in (verdict_block.get("failures") or [])
+
+
+def test_soak_report_warn_model_allowed_but_guard_blocked_due_to_active_position() -> None:
+    """model_filter_allowed>0 with zero submissions is a warning if guard-only existing_position blocked it."""
+    summary = _minimal_session_summary(
+        session_ended_cleanly=True,
+        submitted=0,
+        model_filter_reached=55,
+        model_allowed=55,
+        candidates=55,
+    )
+    summary["entry_guard_block_reasons"] = {
+        "by_type": {"existing_position": 55},
+        "by_symbol": {"BTCUSDT": {"existing_position": 55}},
+    }
+    metrics = MetricsSnapshot(
+        counters={
+            "entry_fill_received_count": 0,
+            "protective_exit_plan_created_count": 0,
+            "protective_exit_order_submitted_count": 0,
+            "protective_exit_order_ack_received_count": 0,
+            "protective_exit_placement_failed_count": 0,
+            "position_add_blocked_count": 55,
+            "working_entry_blocked_count": 0,
+            "startup_state_blocked_count": 0,
+        },
+        gauges={},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    verdict_block = report.get("health_verdict") or {}
+    assert verdict_block.get("verdict") == VERDICT_PASS_WITH_WARNINGS
+    assert (
+        REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION
+        in (verdict_block.get("warnings") or [])
+    )
+    assert REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED not in (verdict_block.get("failures") or [])
+
+
+def test_soak_report_fail_model_allowed_but_no_submissions_unexplained() -> None:
+    """model_filter_allowed>0 with zero submissions is a hard FAIL if guard wasn't explained as existing_position-only."""
+    summary = _minimal_session_summary(
+        session_ended_cleanly=True,
+        submitted=0,
+        model_filter_reached=55,
+        model_allowed=55,
+        candidates=55,
+    )
+    summary["entry_guard_block_reasons"] = {
+        "by_type": {"existing_working_entry": 55},
+        "by_symbol": {"BTCUSDT": {"existing_working_entry": 55}},
+    }
+    metrics = MetricsSnapshot(
+        counters={
+            "entry_fill_received_count": 0,
+            "protective_exit_plan_created_count": 0,
+            "protective_exit_order_submitted_count": 0,
+            "protective_exit_order_ack_received_count": 0,
+            "protective_exit_placement_failed_count": 0,
+            "position_add_blocked_count": 0,
+            "working_entry_blocked_count": 55,
+            "startup_state_blocked_count": 0,
+        },
+        gauges={},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    verdict_block = report.get("health_verdict") or {}
+    assert verdict_block.get("verdict") == VERDICT_FAIL
+    assert (
+        REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED
+        in (verdict_block.get("failures") or [])
+    )
 
 
 def test_soak_report_verdict_pass_ack_pending_at_session_end() -> None:

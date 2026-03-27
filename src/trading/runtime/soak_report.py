@@ -18,7 +18,9 @@ REASON_SESSION_ABORTED = "session_aborted"
 REASON_FILLS_WITHOUT_PROTECTIVE_EXIT_ACK = "fills_without_protective_exit_ack"
 REASON_PROTECTIVE_EXIT_FAILURES_PRESENT = "protective_exit_failures_present"
 REASON_REPEATED_RECONCILE_MISMATCH_ABORT = "repeated_reconcile_mismatch_abort"
-REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS = "model_allowed_but_no_submissions"
+REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS = "model_allowed_but_no_submissions"  # legacy
+REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED = "model_allowed_but_no_submissions_unexplained"
+REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION = "model_allowed_but_guard_blocked_due_to_active_position"
 REASON_SUBMITTED_GT_ACK = "submitted_gt_ack"
 REASON_ENTRY_FILL_INCONSISTENT = "entry_fill_inconsistent"
 REASON_NO_MODEL_EVALUATIONS = "no_model_evaluations"
@@ -335,7 +337,24 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
         failures.append(REASON_REPEATED_RECONCILE_MISMATCH_ABORT)
 
     if model_filter_reached > 0 and submitted == 0 and model_allowed > 0:
-        failures.append(REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS)
+        # If the model allowed candidates, but the bot never submitted because the entry guard
+        # blocked exclusively due to a non-flat active position, treat it as a warning instead
+        # of a hard failure (the session is "explained", not "missing").
+        entry_guard_block_reasons_by_type = safety.get("entry_guard_block_reasons_by_type") or {}
+        existing_pos_cnt = int(entry_guard_block_reasons_by_type.get("existing_position", 0) or 0)
+        other_cnt = sum(
+            int(v) for k, v in entry_guard_block_reasons_by_type.items() if k != "existing_position"
+        )
+        guard_blocked_active_position_only = (
+            existing_pos_cnt > 0
+            and other_cnt == 0
+            and _g(safety, "position_add_blocked_count", 0) > 0
+            and _g(safety, "working_entry_blocked_count", 0) == 0
+        )
+        if guard_blocked_active_position_only:
+            warnings.append(REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION)
+        else:
+            failures.append(REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED)
 
     if submitted > ack:
         failures.append(REASON_SUBMITTED_GT_ACK)

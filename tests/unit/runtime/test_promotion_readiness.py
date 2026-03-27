@@ -96,6 +96,30 @@ def test_not_ready_when_single_fail_soak_exists() -> None:
     assert "any_fail_soak_report" in (verdict_block.get("reasons") or [])
 
 
+def test_promotion_does_not_not_ready_for_guard_blocked_model_allowed_session() -> None:
+    """PASS_WITH_WARNINGS (explained guard block) must not trigger any_fail_soak_report."""
+    reports = [
+        _minimal_soak_report(
+            verdict="PASS_WITH_WARNINGS",
+            session_id="guard_blocked_active_position_warn",
+            filled=0,
+            pe_ack=0,
+            pe_submitted=0,
+        ),
+    ]
+    # Promotion readiness is verdict-driven; ensure it doesn't go NOT_READY due to fail_count.
+    assessment = build_promotion_assessment(
+        reports,
+        minimum_passing_sessions=0,
+        minimum_total_duration_seconds=0,
+        minimum_total_fills=0,
+        minimum_model_evaluations=0,
+    )
+    verdict_block = assessment.get("promotion_verdict") or {}
+    assert verdict_block.get("verdict") != VERDICT_NOT_READY
+    assert "any_fail_soak_report" not in (verdict_block.get("reasons") or [])
+
+
 def test_not_ready_when_fill_gt_protective_exit_ack() -> None:
     """NOT_READY when fills > protective_exit submitted (hard failure)."""
     reports = [
