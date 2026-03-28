@@ -2340,7 +2340,7 @@ class RuntimeOrchestrator:
             )
 
     def _init_model_filter(self) -> None:
-        """Load model artifact and enable DEMO-only filter. Never active in LIVE."""
+        """Load model artifact and enable filter in DEMO/PAPER (validation). Disabled in LIVE/BACKTEST."""
         from trading.models.filter_artifact import load_model_artifact
         from trading.models.filter_predictor import RUNTIME_FEATURE_NAMES
         from trading.research.datasets.prepare import FEATURE_NAMES
@@ -2348,12 +2348,12 @@ class RuntimeOrchestrator:
         enabled = self._settings.runtime.model_filter_enabled
         path = self._settings.runtime.model_artifact_path
 
-        if self._settings.runtime.mode != RuntimeMode.DEMO:
+        if self._settings.runtime.mode not in {RuntimeMode.DEMO, RuntimeMode.PAPER}:
             if enabled:
                 self._logger.warning(
-                    "model_filter_disabled_not_demo",
+                    "model_filter_disabled_non_validation_mode",
                     mode=self._settings.runtime.mode.value,
-                    message="Model filter is DEMO-only; disabled in non-DEMO mode.",
+                    message="Model filter runs in DEMO/PAPER only; disabled in this mode.",
                 )
             self._logger.info(
                 "model_filter_status",
@@ -3161,7 +3161,7 @@ class RuntimeOrchestrator:
             lines.append(f"- Rejected: {o.get('rejected', 0)}")
             lines.append("")
         if mf := summary.get("model_filter"):
-            lines.append("## Model Filter (DEMO-only)")
+            lines.append("## Model Filter (DEMO / PAPER)")
             lines.append(f"- Enabled: {mf.get('enabled', False)}")
             lines.append(f"- Active: {mf.get('active', False)}")
             lines.append(f"- Mode: {mf.get('mode', 'hard_block')}")

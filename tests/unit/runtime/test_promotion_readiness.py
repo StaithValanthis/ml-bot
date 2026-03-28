@@ -42,13 +42,14 @@ def _minimal_soak_report(
     model_allowed: int = 10,
     submitted: int = 5,
     session_id: str | None = None,
+    mode: str = "demo",
 ) -> dict:
     pe_sub = pe_submitted if pe_submitted is not None else filled
     sid = session_id or "session_20250319_100000"
     return {
         "session_metadata": {
             "session_id": sid,
-            "mode": "demo",
+            "mode": mode,
             "symbols": ["BTCUSDT"],
             "started_at": "2025-03-19T10:00:00+00:00",
             "ended_at": "2025-03-19T11:00:00+00:00",
@@ -429,6 +430,88 @@ def test_promotion_paper_recovered_stale_feed_no_session_aborted_reason() -> Non
     safety = assessment.get("safety_checks") or {}
     assert safety.get("session_abort_present") is False
     assert "session_aborted" not in (assessment.get("promotion_verdict") or {}).get("reasons") or []
+
+
+def test_promotion_all_paper_sessions_skip_minimum_fills_gate() -> None:
+    """Paper does not place exchange orders; promotion must not block on total_fills when every soak is paper."""
+    reports = [
+        _minimal_soak_report(
+            mode="paper",
+            verdict="PASS_WITH_WARNINGS",
+            session_id=f"paper_soak_{i}",
+            filled=0,
+            pe_ack=0,
+            pe_submitted=0,
+            duration_seconds=8000,
+            total_model_evaluations=15,
+            model_allowed=2,
+            submitted=0,
+        )
+        for i in range(3)
+    ]
+    assessment = build_promotion_assessment(
+        reports,
+        minimum_passing_sessions=3,
+        minimum_total_duration_seconds=7200,
+        minimum_total_fills=3,
+        minimum_model_evaluations=10,
+    )
+    cov = assessment.get("session_coverage") or {}
+    assert cov.get("all_sessions_paper") is True
+    verdict_block = assessment.get("promotion_verdict") or {}
+    assert verdict_block.get("verdict") == VERDICT_READY_FOR_PAPER
+    assert not any("total_fills_" in r for r in (verdict_block.get("reasons") or []))
+
+
+def test_promotion_mixed_paper_demo_still_enforces_minimum_fills() -> None:
+    """If any session is non-paper, demo-style fill coverage still applies."""
+    reports = [
+        _minimal_soak_report(
+            mode="paper",
+            verdict="PASS",
+            session_id="paper_1",
+            filled=0,
+            pe_ack=0,
+            pe_submitted=0,
+            duration_seconds=8000,
+            total_model_evaluations=15,
+            submitted=0,
+        ),
+        _minimal_soak_report(
+            mode="demo",
+            verdict="PASS",
+            session_id="demo_1",
+            filled=0,
+            pe_ack=0,
+            pe_submitted=0,
+            duration_seconds=8000,
+            total_model_evaluations=15,
+            submitted=0,
+        ),
+        _minimal_soak_report(
+            mode="demo",
+            verdict="PASS",
+            session_id="demo_2",
+            filled=0,
+            pe_ack=0,
+            pe_submitted=0,
+            duration_seconds=8000,
+            total_model_evaluations=15,
+            submitted=0,
+        ),
+    ]
+    assessment = build_promotion_assessment(
+        reports,
+        minimum_passing_sessions=3,
+        minimum_total_duration_seconds=7200,
+        minimum_total_fills=3,
+        minimum_model_evaluations=10,
+    )
+    cov = assessment.get("session_coverage") or {}
+    assert cov.get("all_sessions_paper") is False
+    verdict_block = assessment.get("promotion_verdict") or {}
+    assert verdict_block.get("verdict") == VERDICT_CONTINUE_DEMO_SOAK
+    assert any(str(r).startswith("total_fills_") for r in (verdict_block.get("reasons") or []))
 
 
 def test_not_ready_when_fill_gt_protective_exit_ack() -> None:

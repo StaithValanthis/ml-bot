@@ -293,7 +293,7 @@ def test_strategy_order_outcomes_includes_model_filter() -> None:
 
 
 def test_demo_only_gating_orchestrator_init_model_filter() -> None:
-    """Model filter is disabled when mode is not DEMO."""
+    """Model filter is disabled in LIVE (non validation modes)."""
     from trading.runtime.orchestrator import RuntimeOrchestrator
     from trading.settings import load_settings
 
@@ -325,6 +325,57 @@ def test_demo_only_gating_orchestrator_init_model_filter() -> None:
 
     assert orch._model_filter_active is False
     assert orch._model_filter_model is None
+
+
+def test_paper_mode_loads_model_filter_when_enabled(tmp_path: Path) -> None:
+    """PAPER uses the same model filter path as DEMO when artifact and config allow."""
+    try:
+        import joblib
+        from sklearn.linear_model import LogisticRegression
+    except ImportError:
+        pytest.skip("sklearn/joblib not available")
+
+    from trading.runtime.orchestrator import RuntimeOrchestrator
+    from trading.settings import load_settings
+
+    settings = load_settings()
+    runtime = MagicMock()
+    runtime.mode = RuntimeMode.PAPER
+    runtime.model_filter_enabled = True
+    runtime.model_filter_mode = ModelFilterMode.HARD_BLOCK
+    runtime.model_filter_threshold = 0.42
+    runtime.model_artifact_path = None
+    runtime.demo_drill = MagicMock()
+    runtime.demo_candidate_overrides = None
+    settings.runtime = runtime
+
+    model_path = tmp_path / "paper_m.pkl"
+    clf = LogisticRegression(max_iter=100, random_state=42)
+    clf.fit([[0, 0], [1, 1]], [0, 1])
+    joblib.dump(clf, model_path)
+    runtime.model_artifact_path = model_path
+
+    mock_rest = MagicMock()
+    mock_ws_public = MagicMock()
+    mock_ws_public.subscribe = MagicMock()
+    mock_ws_public.run_forever = MagicMock()
+    mock_ws_public.close = MagicMock()
+    mock_ws_private = MagicMock()
+    mock_ws_private.subscribe = MagicMock()
+    mock_ws_private.run_forever = MagicMock()
+    mock_ws_private.close = MagicMock()
+
+    with (
+        patch("trading.runtime.orchestrator.BybitRestClient", return_value=mock_rest),
+        patch("trading.runtime.orchestrator.BybitWsPublicClient", return_value=mock_ws_public),
+        patch("trading.runtime.orchestrator.BybitWsPrivateClient", return_value=mock_ws_private),
+    ):
+        orch = RuntimeOrchestrator(settings)
+        orch._init_model_filter()
+
+    assert orch._model_filter_active is True
+    assert orch._model_filter_threshold == 0.42
+    assert orch._strategy_order_outcomes.model_filter.mode == "hard_block"
 
 
 def test_score_for_filter_returns_features_used_when_available() -> None:
@@ -421,7 +472,7 @@ async def test_session_summary_model_filter_reporting() -> None:
     }
 
     markdown = orch._build_markdown_summary(summary)
-    assert "## Model Filter (DEMO-only)" in markdown
+    assert "## Model Filter (DEMO / PAPER)" in markdown
     assert "Mode: hard_block" in markdown
     assert "Trades allowed by model: 5" in markdown
     assert "Trades blocked by model: 2" in markdown

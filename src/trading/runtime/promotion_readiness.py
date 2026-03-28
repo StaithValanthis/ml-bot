@@ -132,6 +132,7 @@ def aggregate_soak_reports(
     sessions_with_fill_ack_gap: list[str] = []
     session_protective_exit_breakdown: list[dict[str, Any]] = []
 
+    paper_session_count = 0
     for r in reports:
         meta = r.get("session_metadata") or {}
         exec_s = r.get("execution_summary") or {}
@@ -140,6 +141,8 @@ def aggregate_soak_reports(
         verdict_block = r.get("health_verdict") or {}
         verdict = verdict_block.get("verdict", "")
         session_id = meta.get("session_id", "unknown")
+        if str(meta.get("mode") or "").lower() == "paper":
+            paper_session_count += 1
 
         if verdict == "PASS":
             pass_count += 1
@@ -286,6 +289,7 @@ def aggregate_soak_reports(
             "fail_count": fail_count,
             "total_duration_seconds": round(total_duration_seconds, 1),
             "average_duration_seconds": round(average_duration_seconds, 1) if average_duration_seconds is not None else None,
+            "all_sessions_paper": paper_session_count == len(reports) and len(reports) > 0,
         },
         "execution_health": {
             "total_submitted": total_submitted,
@@ -378,6 +382,7 @@ def compute_promotion_verdict(
     pass_count = _g(cov, "pass_count")
     pass_with_warnings_count = _g(cov, "pass_with_warnings_count")
     total_sessions = _g(cov, "total_sessions")
+    all_sessions_paper = _g_bool(cov, "all_sessions_paper", False)
     total_duration = cov.get("total_duration_seconds") or 0
     total_fills = _g(exec_h, "total_fills")
     total_pe_failures = _g(exec_h, "total_protective_exit_failures")
@@ -414,7 +419,7 @@ def compute_promotion_verdict(
         reasons.append(f"passing_sessions_{passing_sessions}_lt_minimum_{minimum_passing_sessions}")
     if total_duration < minimum_total_duration_seconds:
         reasons.append(f"total_duration_{total_duration:.0f}s_lt_minimum_{minimum_total_duration_seconds:.0f}s")
-    if total_fills < minimum_total_fills:
+    if not all_sessions_paper and total_fills < minimum_total_fills:
         reasons.append(f"total_fills_{total_fills}_lt_minimum_{minimum_total_fills}")
     if total_model_evals < minimum_model_evaluations:
         reasons.append(f"total_model_evaluations_{total_model_evals}_lt_minimum_{minimum_model_evaluations}")
