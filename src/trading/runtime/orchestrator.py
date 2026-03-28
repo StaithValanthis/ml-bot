@@ -2868,6 +2868,18 @@ class RuntimeOrchestrator:
                     summary["drill_abort_details"] = self._drill_outcome.abort_details
             else:
                 summary["drill_outcome"] = "pending"
+        health_end = self._health.snapshot()
+        summary["circuit_breaker_tripped_at_session_end"] = health_end.circuit_breaker_tripped
+        summary["stale_channel_count_at_session_end"] = len(health_end.stale_channels)
+        summary["stale_feed_recovered"] = (
+            "stale_feed" in self._abort_reasons
+            and not health_end.circuit_breaker_tripped
+            and len(health_end.stale_channels) == 0
+        )
+        summary["stale_feed_unrecovered_at_session_end"] = (
+            "stale_feed" in self._abort_reasons
+            and (health_end.circuit_breaker_tripped or len(health_end.stale_channels) > 0)
+        )
         if self._abort_reasons:
             summary["abort_reasons"] = self._abort_reasons
         if self._last_sizing_rejection is not None:

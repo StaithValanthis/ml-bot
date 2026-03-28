@@ -12,6 +12,8 @@ from trading.monitoring.metrics import MetricsSnapshot
 from trading.runtime.orchestrator import RuntimeOrchestrator
 from trading.runtime.soak_report import (
     REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS,
+    REASON_STALE_FEED_INCIDENTS_PRESENT,
+    REASON_STALE_FEED_RECOVERED,
     VERDICT_FAIL,
     VERDICT_PASS,
     VERDICT_PASS_WITH_WARNINGS,
@@ -534,6 +536,7 @@ def test_soak_report_json_structure() -> None:
     assert "safety_summary" in report
     assert "candidate_summary" in report
     assert "health_verdict" in report
+    assert "feed_health_summary" in report
 
     meta = report["session_metadata"]
     assert "session_id" in meta
@@ -544,6 +547,8 @@ def test_soak_report_json_structure() -> None:
     assert "duration_seconds" in meta
     assert "session_ended_cleanly" in meta
     assert "abort_reasons" in meta
+    assert "circuit_breaker_tripped_at_session_end" in meta
+    assert "stale_channel_count_at_session_end" in meta
 
     exec_s = report["execution_summary"]
     assert "strategy_order_intent_created_count" in exec_s
@@ -608,6 +613,64 @@ async def test_soak_report_written_on_session_summary_generation(tmp_path: Path)
 
     md = soak_mds[0].read_text(encoding="utf-8")
     assert "## Final Verdict" in md
+
+
+def test_paper_transient_stale_feed_recovered_pass_with_warnings() -> None:
+    """Paper session: stale_feed recorded but feed recovered at end => PASS_WITH_WARNINGS, not session_aborted."""
+    summary = _minimal_session_summary(
+        session_ended_cleanly=True,
+        submitted=0,
+        model_filter_reached=0,
+        model_allowed=0,
+        candidates=5,
+    )
+    summary["mode"] = "paper"
+    summary["abort_reasons"] = ["stale_feed"]
+    summary["circuit_breaker_tripped_at_session_end"] = False
+    summary["stale_channel_count_at_session_end"] = 0
+    summary["staleness_incidents_total"] = 2
+    summary["circuit_breaker_trips_total"] = 1
+    summary["startup_state_diagnostics"] = {"uncleared_at_session_end": False}
+    metrics = MetricsSnapshot(
+        counters={
+            "runtime_decision_failures_count": 0,
+            "staleness_incidents_total": 2,
+            "circuit_breaker_trips_total": 1,
+        },
+        gauges={"circuit_breaker_tripped": 0.0, "stale_channel_count": 0.0},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    hv = report.get("health_verdict") or {}
+    assert hv.get("verdict") == VERDICT_PASS_WITH_WARNINGS
+    assert "session_aborted" not in (hv.get("failures") or [])
+    assert REASON_STALE_FEED_RECOVERED in (hv.get("warnings") or [])
+    assert REASON_STALE_FEED_INCIDENTS_PRESENT in (hv.get("warnings") or [])
+
+
+def test_paper_stale_feed_unrecovered_cb_tripped_still_fail() -> None:
+    """Paper stale_feed with circuit breaker still tripped at session end remains FAIL."""
+    summary = _minimal_session_summary(
+        session_ended_cleanly=True,
+        submitted=0,
+        model_filter_reached=0,
+        model_allowed=0,
+        candidates=3,
+    )
+    summary["mode"] = "paper"
+    summary["abort_reasons"] = ["stale_feed"]
+    summary["circuit_breaker_tripped_at_session_end"] = True
+    summary["stale_channel_count_at_session_end"] = 0
+    summary["staleness_incidents_total"] = 2
+    metrics = MetricsSnapshot(
+        counters={"runtime_decision_failures_count": 0, "staleness_incidents_total": 2},
+        gauges={"circuit_breaker_tripped": 1.0, "stale_channel_count": 0.0},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    hv = report.get("health_verdict") or {}
+    assert hv.get("verdict") == VERDICT_FAIL
+    assert "session_aborted" in (hv.get("failures") or [])
 
 
 def test_compute_verdict_session_aborted_fail() -> None:

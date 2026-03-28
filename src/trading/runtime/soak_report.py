@@ -30,6 +30,8 @@ REASON_NO_SUBMISSIONS = "no_submissions"
 REASON_ORPHAN_POSITION_BLOCK_TRIGGERED = "orphan_position_block_triggered"
 REASON_STARTUP_STATE_BLOCK_TRIGGERED = "startup_state_block_triggered"
 REASON_RECONCILE_MISMATCHES_PRESENT = "reconcile_mismatches_present"
+REASON_STALE_FEED_RECOVERED = "stale_feed_recovered"
+REASON_STALE_FEED_INCIDENTS_PRESENT = "stale_feed_incidents_present"
 
 
 def _g(d: dict[str, Any], key: str, default: Any = 0) -> Any:
@@ -58,6 +60,41 @@ def _g_bool(d: dict[str, Any], key: str, default: bool = False) -> bool:
     return bool(v) if v is not None else default
 
 
+def paper_stale_feed_recovered_session(report: dict[str, Any]) -> bool:
+    """
+    True when a paper session recorded stale_feed but feed/circuit state at session end
+    indicates recovery (transient incident), not an unrecoverable abort for soak/promotion.
+    """
+    meta = report.get("session_metadata") or {}
+    if _g_str(meta, "mode", "").lower() != "paper":
+        return False
+    if not _g_bool(meta, "session_ended_cleanly", True):
+        return False
+    reasons = [str(x) for x in (meta.get("abort_reasons") or [])]
+    if set(reasons) != {"stale_feed"}:
+        return False
+    exec_s = report.get("execution_summary") or {}
+    safety = report.get("safety_summary") or {}
+    if _g(exec_s, "runtime_decision_failures_count", 0) != 0:
+        return False
+    if safety.get("repeated_reconcile_mismatch_triggered") is True:
+        return False
+    if _g(safety, "reconcile_mismatch_detected_count", 0) != 0:
+        return False
+    if _g(exec_s, "protective_exit_placement_failed_count", 0) != 0:
+        return False
+    if _g(exec_s, "filled_entries_without_exit_ack", 0) != 0:
+        return False
+    ssd = report.get("startup_state_diagnostics") or {}
+    if _g_bool(ssd, "uncleared_at_session_end", False):
+        return False
+    if _g_bool(meta, "circuit_breaker_tripped_at_session_end", False):
+        return False
+    if _g(meta, "stale_channel_count_at_session_end", 1) != 0:
+        return False
+    return True
+
+
 def build_soak_report(
     summary: dict[str, Any],
     metrics_snapshot: MetricsSnapshot | None = None,
@@ -70,8 +107,22 @@ def build_soak_report(
     so = summary.get("strategy_order_outcomes") or {}
     mf = summary.get("model_filter") or {}
     counters: dict[str, float] = {}
+    gauges: dict[str, float] = {}
     if metrics_snapshot is not None:
         counters = getattr(metrics_snapshot, "counters", counters) or {}
+        gauges = getattr(metrics_snapshot, "gauges", gauges) or {}
+
+    staleness_incidents = int(summary.get("staleness_incidents_total", counters.get("staleness_incidents_total", 0)))
+    cb_trips_total = int(summary.get("circuit_breaker_trips_total", counters.get("circuit_breaker_trips_total", 0)))
+    if summary.get("circuit_breaker_tripped_at_session_end") is not None:
+        cb_at_end = bool(summary["circuit_breaker_tripped_at_session_end"])
+    else:
+        gcb = gauges.get("circuit_breaker_tripped")
+        cb_at_end = gcb is not None and float(gcb) >= 1.0
+    if summary.get("stale_channel_count_at_session_end") is not None:
+        stale_ch_at_end = int(summary["stale_channel_count_at_session_end"])
+    else:
+        stale_ch_at_end = int(gauges.get("stale_channel_count", 0) or 0)
 
     bars_confirmed = _g(flow, "bars_confirmed")
     candidates = _g(flow, "candidates")
@@ -147,6 +198,16 @@ def build_soak_report(
             "duration_seconds": round(duration_seconds, 1) if duration_seconds is not None else None,
             "session_ended_cleanly": _g_bool(summary, "session_ended_cleanly", True),
             "abort_reasons": abort_reasons,
+            "circuit_breaker_tripped_at_session_end": cb_at_end,
+            "stale_channel_count_at_session_end": stale_ch_at_end,
+            "staleness_incidents_total": staleness_incidents,
+            "circuit_breaker_trips_total": cb_trips_total,
+        },
+        "feed_health_summary": {
+            "staleness_incidents_total": staleness_incidents,
+            "circuit_breaker_trips_total": cb_trips_total,
+            "circuit_breaker_tripped_at_session_end": cb_at_end,
+            "stale_channel_count_at_session_end": stale_ch_at_end,
         },
         "runtime_pipeline_totals": {
             "bars_confirmed": bars_confirmed,
@@ -318,12 +379,20 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
     startup_blocked = _g(safety, "startup_state_blocked_count", 0) > 0
     reconcile_count = _g(safety, "reconcile_mismatch_detected_count", 0)
 
+    recovered_paper_stale = paper_stale_feed_recovered_session(report)
+
     failures: list[str] = []
     warnings: list[str] = []
 
     # --- FAIL conditions ---
-    if not session_clean or abort_reasons:
+    if not session_clean:
         failures.append(REASON_SESSION_ABORTED)
+    elif abort_reasons and not recovered_paper_stale:
+        failures.append(REASON_SESSION_ABORTED)
+    elif recovered_paper_stale:
+        warnings.append(REASON_STALE_FEED_RECOVERED)
+        if _g(meta, "staleness_incidents_total", 0) > 0:
+            warnings.append(REASON_STALE_FEED_INCIDENTS_PRESENT)
 
     pe_submitted = _g(exec_s, "protective_exit_order_submitted_count")
     # strategy_filled includes reduce-only protective-exit fills; compare against entry fills only.
@@ -360,7 +429,7 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
         runtime_decision_failures = _g(exec_s, "runtime_decision_failures_count", 0)
         operational_clean_for_guard_warn = (
             session_clean
-            and not abort_reasons
+            and (not abort_reasons or recovered_paper_stale)
             and not repeated_reconcile
             and reconcile_count == 0
             and pe_failed == 0

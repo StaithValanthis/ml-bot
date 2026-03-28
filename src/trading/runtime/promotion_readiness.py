@@ -10,6 +10,8 @@ from typing import Any
 
 from trading.util.logging import get_logger
 
+from trading.runtime.soak_report import paper_stale_feed_recovered_session
+
 # --- Verdict constants ---
 VERDICT_NOT_READY = "NOT_READY"
 VERDICT_CONTINUE_DEMO_SOAK = "CONTINUE_DEMO_SOAK"
@@ -206,7 +208,9 @@ def aggregate_soak_reports(
 
         if _g_bool(safety, "repeated_reconcile_mismatch_triggered"):
             repeated_reconcile_issue_present = True
-        if not _g_bool(meta, "session_ended_cleanly", True) or (meta.get("abort_reasons") or []):
+        abort_list = meta.get("abort_reasons") or []
+        dirty_session = not _g_bool(meta, "session_ended_cleanly", True)
+        if dirty_session or (abort_list and not paper_stale_feed_recovered_session(r)):
             session_abort_present = True
             sessions_causing_session_aborted.append(session_id)
         if "repeated_reconcile_mismatch" in (meta.get("abort_reasons") or []):

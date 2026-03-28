@@ -11,6 +11,7 @@ import pytest
 from trading.monitoring.metrics import MetricsSnapshot
 from trading.runtime.soak_report import (
     REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION,
+    REASON_STALE_FEED_RECOVERED,
     build_soak_report,
 )
 from trading.runtime.promotion_readiness import (
@@ -358,6 +359,76 @@ def test_promotion_marks_fail_when_guard_reason_not_existing_position_only() -> 
     verdict_block = assessment.get("promotion_verdict") or {}
     assert verdict_block.get("verdict") == VERDICT_NOT_READY
     assert "any_fail_soak_report" in (verdict_block.get("reasons") or [])
+
+
+def test_promotion_paper_recovered_stale_feed_no_session_aborted_reason() -> None:
+    """Transient paper stale_feed with recovery must not set session_abort_present / session_aborted reason."""
+    summary = {
+        "session_start": "2026-03-27T21:34:07+00:00",
+        "session_end": "2026-03-27T23:00:00+00:00",
+        "mode": "paper",
+        "symbols": ["BTCUSDT"],
+        "session_ended_cleanly": True,
+        "abort_reasons": ["stale_feed"],
+        "reconcile_mismatch_cycles": 0,
+        "strategy_flow": {
+            "bars_confirmed": 10,
+            "candidates": 10,
+            "regime_rejected": 0,
+            "signal_rejected": 0,
+            "sizing_rejected": 0,
+            "risk_rejected": 0,
+            "model_filter_reached": 0,
+            "model_blocked": 0,
+            "submitted": 0,
+        },
+        "strategy_order_outcomes": {
+            "intents": 0,
+            "submissions": 0,
+            "acks": 0,
+            "filled": 0,
+            "cancelled": 0,
+            "rejected": 0,
+        },
+        "model_filter": {
+            "enabled": True,
+            "active": True,
+            "mode": "hard_block",
+            "threshold": 0.5,
+            "allowed": 0,
+            "blocked": 0,
+            "prob_count": 0,
+        },
+        "blocking_stage": "unknown",
+        "circuit_breaker_tripped_at_session_end": False,
+        "stale_channel_count_at_session_end": 0,
+        "staleness_incidents_total": 2,
+        "circuit_breaker_trips_total": 1,
+        "startup_state_diagnostics": {"uncleared_at_session_end": False},
+    }
+    metrics = MetricsSnapshot(
+        counters={
+            "runtime_decision_failures_count": 0,
+            "staleness_incidents_total": 2,
+            "circuit_breaker_trips_total": 1,
+        },
+        gauges={"circuit_breaker_tripped": 0.0, "stale_channel_count": 0.0},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    assert report["health_verdict"]["verdict"] == "PASS_WITH_WARNINGS"
+    assert REASON_STALE_FEED_RECOVERED in (report["health_verdict"].get("warnings") or [])
+
+    assessment = build_promotion_assessment(
+        [report],
+        minimum_passing_sessions=0,
+        minimum_total_duration_seconds=0,
+        minimum_total_fills=0,
+        minimum_model_evaluations=0,
+    )
+    safety = assessment.get("safety_checks") or {}
+    assert safety.get("session_abort_present") is False
+    assert "session_aborted" not in (assessment.get("promotion_verdict") or {}).get("reasons") or []
 
 
 def test_not_ready_when_fill_gt_protective_exit_ack() -> None:
