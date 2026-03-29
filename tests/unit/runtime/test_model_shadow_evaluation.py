@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -10,7 +11,8 @@ import pytest
 
 from trading.runtime.orchestrator import RuntimeOrchestrator
 from trading.settings import load_settings
-from trading.util.types import ModelFilterMode
+from trading.strategy.signal_engine import SignalAction, SignalDecision
+from trading.util.types import ModelFilterMode, OrderSide
 
 
 def _make_orchestrator() -> RuntimeOrchestrator:
@@ -29,6 +31,46 @@ def _make_orchestrator() -> RuntimeOrchestrator:
         patch("trading.runtime.orchestrator.BybitWsPrivateClient", return_value=mock_ws_private),
     ):
         return RuntimeOrchestrator(load_settings())
+
+
+def test_run_model_filter_stage_evaluates_probe_min_qty() -> None:
+    """Paper sizing-rejection probe uses exchange min_qty; predictor must see that quantity."""
+    orch = _make_orchestrator()
+    orch._model_filter_active = True
+    orch._model_filter_mode = ModelFilterMode.SHADOW
+    orch._model_filter_threshold = 0.5
+    orch._model_filter_model = MagicMock()
+
+    pred = MagicMock()
+    pred.available = True
+    pred.prob_fill = 0.61
+    pred.features_used = None
+
+    signal = SignalDecision(
+        symbol="BTCUSDT",
+        action=SignalAction.ENTER_LONG,
+        side=OrderSide.BUY,
+        confidence=Decimal("0.7"),
+        reference_price=Decimal("60000"),
+        stop_price=None,
+        reason="t",
+        generated_at=datetime(2025, 1, 1, tzinfo=UTC),
+        metadata={},
+    )
+    cand = MagicMock()
+    cand.candidate_type = MagicMock(value="breakout_long")
+
+    with patch("trading.models.filter_predictor.score_for_filter", return_value=(pred, True)) as mock_sf:
+        ok = orch._run_model_filter_stage(
+            signal=signal,
+            qty=Decimal("0.001"),
+            candidate=cand,
+            bars_5m=[],
+        )
+    assert ok is True
+    assert orch._strategy_order_outcomes.model_filter.prob_count == 1
+    mock_sf.assert_called_once()
+    assert mock_sf.call_args.kwargs["qty"] == pytest.approx(0.001)
 
 
 def test_record_model_decision_payload_shape() -> None:

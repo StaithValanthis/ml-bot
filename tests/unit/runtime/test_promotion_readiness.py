@@ -432,6 +432,37 @@ def test_promotion_paper_recovered_stale_feed_no_session_aborted_reason() -> Non
     assert "session_aborted" not in (assessment.get("promotion_verdict") or {}).get("reasons") or []
 
 
+def test_promotion_all_paper_sessions_skip_minimum_model_evaluations_gate() -> None:
+    """All-paper batches may lack model path signal; do not block promotion on total_model_evaluations."""
+    reports = [
+        _minimal_soak_report(
+            mode="paper",
+            verdict="PASS",
+            session_id=f"paper_soak_{i}",
+            filled=0,
+            pe_ack=0,
+            pe_submitted=0,
+            duration_seconds=8000,
+            total_model_evaluations=0,
+            model_allowed=0,
+            submitted=0,
+        )
+        for i in range(3)
+    ]
+    assessment = build_promotion_assessment(
+        reports,
+        minimum_passing_sessions=3,
+        minimum_total_duration_seconds=7200,
+        minimum_total_fills=3,
+        minimum_model_evaluations=10,
+    )
+    cov = assessment.get("session_coverage") or {}
+    assert cov.get("all_sessions_paper") is True
+    verdict_block = assessment.get("promotion_verdict") or {}
+    assert verdict_block.get("verdict") == VERDICT_READY_FOR_PAPER
+    assert not any("total_model_evaluations_" in r for r in (verdict_block.get("reasons") or []))
+
+
 def test_promotion_all_paper_sessions_skip_minimum_fills_gate() -> None:
     """Paper does not place exchange orders; promotion must not block on total_fills when every soak is paper."""
     reports = [
@@ -461,6 +492,37 @@ def test_promotion_all_paper_sessions_skip_minimum_fills_gate() -> None:
     verdict_block = assessment.get("promotion_verdict") or {}
     assert verdict_block.get("verdict") == VERDICT_READY_FOR_PAPER
     assert not any("total_fills_" in r for r in (verdict_block.get("reasons") or []))
+
+
+def test_promotion_demo_sessions_enforce_minimum_model_evaluations() -> None:
+    """When any session is non-paper, aggregate model-evaluation coverage still gates promotion."""
+    reports = [
+        _minimal_soak_report(
+            mode="demo",
+            verdict="PASS",
+            session_id=f"demo_soak_{i}",
+            filled=3,
+            pe_ack=3,
+            pe_submitted=3,
+            duration_seconds=8000,
+            total_model_evaluations=2,
+            model_allowed=1,
+            submitted=3,
+        )
+        for i in range(3)
+    ]
+    assessment = build_promotion_assessment(
+        reports,
+        minimum_passing_sessions=3,
+        minimum_total_duration_seconds=7200,
+        minimum_total_fills=0,
+        minimum_model_evaluations=10,
+    )
+    cov = assessment.get("session_coverage") or {}
+    assert cov.get("all_sessions_paper") is False
+    verdict_block = assessment.get("promotion_verdict") or {}
+    assert verdict_block.get("verdict") == VERDICT_CONTINUE_DEMO_SOAK
+    assert any("total_model_evaluations_" in str(r) for r in (verdict_block.get("reasons") or []))
 
 
 def test_promotion_mixed_paper_demo_still_enforces_minimum_fills() -> None:

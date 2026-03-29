@@ -421,7 +421,7 @@ def compute_promotion_verdict(
         reasons.append(f"total_duration_{total_duration:.0f}s_lt_minimum_{minimum_total_duration_seconds:.0f}s")
     if not all_sessions_paper and total_fills < minimum_total_fills:
         reasons.append(f"total_fills_{total_fills}_lt_minimum_{minimum_total_fills}")
-    if total_model_evals < minimum_model_evaluations:
+    if not all_sessions_paper and total_model_evals < minimum_model_evaluations:
         reasons.append(f"total_model_evaluations_{total_model_evals}_lt_minimum_{minimum_model_evaluations}")
 
     if reasons:

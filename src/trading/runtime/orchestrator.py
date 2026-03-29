@@ -42,7 +42,7 @@ from trading.strategy.candidates import (
     CandidateGeneratorConfig,
 )
 from trading.strategy.regime_filter import RegimeFilter, RegimeFilterReport
-from trading.strategy.signal_engine import SignalEngine
+from trading.strategy.signal_engine import SignalDecision, SignalEngine
 from trading.util.json_util import dumps_json_safe
 from trading.util.logging import get_logger
 from trading.util.time import utc_now
@@ -1088,6 +1088,24 @@ class RuntimeOrchestrator:
                         reference_price=float(sizing_inputs.reference_price),
                         min_qty=float(symbol_spec.min_qty),
                     )
+                    if (
+                        self._settings.runtime.mode == RuntimeMode.PAPER
+                        and self._model_filter_active
+                        and self._model_filter_model is not None
+                        and symbol_spec.min_qty > 0
+                    ):
+                        self._logger.info(
+                            "paper_model_probe_after_sizing_rejection",
+                            symbol=signal.symbol,
+                            probe_qty=str(symbol_spec.min_qty),
+                            sizing_reason=reason or "qty_zero",
+                        )
+                        _ = self._run_model_filter_stage(
+                            signal=signal,
+                            qty=symbol_spec.min_qty,
+                            candidate=candidate,
+                            bars_5m=bars_5m,
+                        )
                     continue
 
                 risk_ctx = RiskEvaluationContext(
@@ -1112,98 +1130,13 @@ class RuntimeOrchestrator:
                     continue
 
                 if self._model_filter_active:
-                    from trading.models.filter_predictor import score_for_filter
-
-                    mf_mode = self._model_filter_mode
-                    model_filter_threshold = (
-                        self._model_filter_threshold
-                        if self._model_filter_threshold is not None
-                        else 0.5
-                    )
-                    pred_result, allow = score_for_filter(
-                        self._model_filter_model,
-                        symbol=signal.symbol,
-                        action=signal.action.value,
-                        side=signal.side.value if signal.side else None,
-                        qty=float(qty),
-                        risk_approved=True,
-                        reference_price=signal.reference_price,
-                        confidence=signal.confidence,
-                        ts_utc=utc_now(),
-                        threshold=model_filter_threshold,
-                    )
-                    mf = self._strategy_order_outcomes.model_filter
-                    mf.threshold = model_filter_threshold
-                    mf.mode = mf_mode.value
-                    self._metrics.inc("strategy_model_filter_reached")
-                    if not pred_result.available:
-                        mf.prediction_unavailable += 1
-                        self._metrics.inc("strategy_model_blocked")
-                        self._logger.info(
-                            "model_filter_prediction_unavailable",
-                            symbol=signal.symbol,
-                            note=pred_result.feature_missing_note,
-                        )
-                        continue
-                    prob = pred_result.prob_fill
-                    mf.prob_count += 1
-                    mf.prob_latest = prob
-                    if mf.prob_min is None or prob < mf.prob_min:
-                        mf.prob_min = prob
-                    if mf.prob_max is None or prob > mf.prob_max:
-                        mf.prob_max = prob
-                    if pred_result.features_used is not None:
-                        mf.latest_features = dict(pred_result.features_used)
-                    would_block = not allow
-                    bar_close_time = bars_5m[-1].close_time if bars_5m else None
-                    self._record_model_decision(
-                        symbol=signal.symbol,
-                        candidate_type=candidate.candidate_type.value,
-                        side=signal.side.value if signal.side else None,
-                        bar_close_time=bar_close_time,
-                        model_probability=float(prob),
-                        threshold=model_filter_threshold,
-                        shadow_would_block=would_block,
-                        allow=allow if mf_mode != ModelFilterMode.SHADOW else None,
-                        reference_price=signal.reference_price,
-                        confidence=signal.confidence,
+                    if not self._run_model_filter_stage(
+                        signal=signal,
                         qty=qty,
-                    )
-                    if mf_mode == ModelFilterMode.SHADOW:
-                        if would_block:
-                            mf.shadow_would_have_blocked += 1
-                            self._logger.info(
-                                "model_filter_shadow_would_have_blocked",
-                                symbol=signal.symbol,
-                                prob_fill=prob,
-                                threshold=model_filter_threshold,
-                            )
-                        else:
-                            mf.allowed += 1
-                            self._logger.info(
-                                "model_filter_allowed",
-                                symbol=signal.symbol,
-                                prob_fill=prob,
-                                threshold=model_filter_threshold,
-                            )
-                    elif would_block:
-                        mf.blocked += 1
-                        self._metrics.inc("strategy_model_blocked")
-                        self._logger.info(
-                            "model_filter_blocked",
-                            symbol=signal.symbol,
-                            prob_fill=prob,
-                            threshold=model_filter_threshold,
-                        )
+                        candidate=candidate,
+                        bars_5m=bars_5m,
+                    ):
                         continue
-                    else:
-                        mf.allowed += 1
-                        self._logger.info(
-                            "model_filter_allowed",
-                            symbol=signal.symbol,
-                            prob_fill=prob,
-                            threshold=model_filter_threshold,
-                        )
 
                 if self._startup_state_blocked:
                     self._logger.info(
@@ -2275,6 +2208,112 @@ class RuntimeOrchestrator:
             and is_live_execution_mode(self._settings.runtime.mode)
             and not self._settings.runtime.dry_run
         )
+
+    def _run_model_filter_stage(
+        self,
+        *,
+        signal: SignalDecision,
+        qty: Decimal,
+        candidate: object,
+        bars_5m: list[OHLCVBar],
+    ) -> bool:
+        """Run ML filter for a sized (or probe) quantity. Returns False if caller should skip the candidate."""
+        if not self._model_filter_active or self._model_filter_model is None:
+            return True
+        from trading.models.filter_predictor import score_for_filter
+
+        mf_mode = self._model_filter_mode
+        thr = float(self._model_filter_threshold) if self._model_filter_threshold is not None else 0.5
+        pred_result, allow = score_for_filter(
+            self._model_filter_model,
+            symbol=signal.symbol,
+            action=signal.action.value,
+            side=signal.side.value if signal.side else None,
+            qty=float(qty),
+            risk_approved=True,
+            reference_price=signal.reference_price,
+            confidence=signal.confidence,
+            ts_utc=utc_now(),
+            threshold=thr,
+        )
+        mf = self._strategy_order_outcomes.model_filter
+        mf.threshold = thr
+        mf.mode = mf_mode.value
+        self._metrics.inc("strategy_model_filter_reached")
+        if not pred_result.available:
+            mf.prediction_unavailable += 1
+            self._metrics.inc("strategy_model_blocked")
+            self._logger.info(
+                "model_filter_prediction_unavailable",
+                symbol=signal.symbol,
+                note=pred_result.feature_missing_note,
+            )
+            return False
+        prob = pred_result.prob_fill
+        mf.prob_count += 1
+        mf.prob_latest = prob
+        if mf.prob_min is None or prob < mf.prob_min:
+            mf.prob_min = prob
+        if mf.prob_max is None or prob > mf.prob_max:
+            mf.prob_max = prob
+        if pred_result.features_used is not None:
+            mf.latest_features = dict(pred_result.features_used)
+        would_block = not allow
+        bar_close_time = bars_5m[-1].close_time if bars_5m else None
+        cand_type = getattr(
+            getattr(candidate, "candidate_type", None),
+            "value",
+            str(getattr(candidate, "candidate_type", "")),
+        )
+        self._record_model_decision(
+            symbol=signal.symbol,
+            candidate_type=cand_type,
+            side=signal.side.value if signal.side else None,
+            bar_close_time=bar_close_time,
+            model_probability=float(prob),
+            threshold=thr,
+            shadow_would_block=would_block,
+            allow=allow if mf_mode != ModelFilterMode.SHADOW else None,
+            reference_price=signal.reference_price,
+            confidence=signal.confidence,
+            qty=qty,
+        )
+        if mf_mode == ModelFilterMode.SHADOW:
+            if would_block:
+                mf.shadow_would_have_blocked += 1
+                self._logger.info(
+                    "model_filter_shadow_would_have_blocked",
+                    symbol=signal.symbol,
+                    prob_fill=prob,
+                    threshold=thr,
+                )
+            else:
+                mf.allowed += 1
+                self._logger.info(
+                    "model_filter_allowed",
+                    symbol=signal.symbol,
+                    prob_fill=prob,
+                    threshold=thr,
+                )
+            return True
+        if would_block:
+            mf.blocked += 1
+            self._metrics.inc("strategy_model_blocked")
+            self._logger.info(
+                "model_filter_blocked",
+                symbol=signal.symbol,
+                prob_fill=prob,
+                threshold=thr,
+            )
+            return False
+        mf.allowed += 1
+        self._logger.info(
+            "model_filter_allowed",
+            symbol=signal.symbol,
+            prob_fill=prob,
+            threshold=thr,
+        )
+        return True
 
     def _record_model_decision(
         self,
