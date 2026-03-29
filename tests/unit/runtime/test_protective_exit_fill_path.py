@@ -14,6 +14,10 @@ from trading.settings import load_settings
 from trading.util.types import OrderSide, OrderStatus, OrderType, RuntimeMode, TimeInForce
 
 
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
+
+
 def _orch_with_mocks() -> RuntimeOrchestrator:
     mock_rest = MagicMock()
     mock_rest.place_order = AsyncMock()
@@ -44,7 +48,7 @@ async def test_filled_entry_triggers_protective_submission_and_metrics() -> None
 
     now = datetime.now(UTC)
     intent = OrderIntent(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         side=OrderSide.BUY,
         qty=Decimal("0.01"),
         order_type=OrderType.LIMIT,
@@ -67,7 +71,7 @@ async def test_filled_entry_triggers_protective_submission_and_metrics() -> None
     upd = NormalizedOrderUpdate(
         order_id="oid1",
         order_link_id="entry_link_1",
-        symbol="BTCUSDT",
+        symbol=_sym(),
         status=OrderStatus.FILLED,
         qty=Decimal("0.01"),
         avg_price=Decimal("50000"),
@@ -98,7 +102,7 @@ async def test_duplicate_filled_transition_does_not_double_submit_protective() -
 
     now = datetime.now(UTC)
     intent = OrderIntent(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         side=OrderSide.BUY,
         qty=Decimal("0.01"),
         order_type=OrderType.LIMIT,
@@ -121,7 +125,7 @@ async def test_duplicate_filled_transition_does_not_double_submit_protective() -
     base = dict(
         order_id="oid1",
         order_link_id="entry_link_dup",
-        symbol="BTCUSDT",
+        symbol=_sym(),
         status=OrderStatus.FILLED,
         qty=Decimal("0.01"),
         avg_price=Decimal("50000"),
@@ -159,7 +163,7 @@ async def test_filled_entry_with_unknown_signal_action_records_explicit_skip() -
 
     now = datetime.now(UTC)
     intent = OrderIntent(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         side=OrderSide.BUY,
         qty=Decimal("0.01"),
         order_type=OrderType.LIMIT,
@@ -179,7 +183,7 @@ async def test_filled_entry_with_unknown_signal_action_records_explicit_skip() -
     upd = NormalizedOrderUpdate(
         order_id="oid_skip",
         order_link_id="entry_link_skip",
-        symbol="BTCUSDT",
+        symbol=_sym(),
         status=OrderStatus.FILLED,
         qty=Decimal("0.01"),
         avg_price=Decimal("50000"),
@@ -208,7 +212,7 @@ async def test_two_fills_one_submission_is_explicitly_attributed() -> None:
 
     now = datetime.now(UTC)
     valid = OrderIntent(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         side=OrderSide.BUY,
         qty=Decimal("0.01"),
         order_type=OrderType.LIMIT,
@@ -221,7 +225,7 @@ async def test_two_fills_one_submission_is_explicitly_attributed() -> None:
         metadata={"signal_action": "enter_long"},
     )
     invalid = OrderIntent(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         side=OrderSide.BUY,
         qty=Decimal("0.01"),
         order_type=OrderType.LIMIT,
@@ -248,7 +252,7 @@ async def test_two_fills_one_submission_is_explicitly_attributed() -> None:
             NormalizedOrderUpdate(
                 order_id="oid_valid",
                 order_link_id="entry_link_valid",
-                symbol="BTCUSDT",
+                symbol=_sym(),
                 status=OrderStatus.FILLED,
                 qty=Decimal("0.01"),
                 avg_price=Decimal("50000"),
@@ -258,7 +262,7 @@ async def test_two_fills_one_submission_is_explicitly_attributed() -> None:
             NormalizedOrderUpdate(
                 order_id="oid_invalid",
                 order_link_id="entry_link_invalid",
-                symbol="BTCUSDT",
+                symbol=_sym(),
                 status=OrderStatus.FILLED,
                 qty=Decimal("0.01"),
                 avg_price=Decimal("50010"),
@@ -283,7 +287,7 @@ async def test_reduce_only_fill_does_not_increment_entry_fill_received() -> None
 
     now = datetime.now(UTC)
     intent = OrderIntent(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         side=OrderSide.SELL,
         qty=Decimal("0.01"),
         order_type=OrderType.LIMIT,
@@ -304,7 +308,7 @@ async def test_reduce_only_fill_does_not_increment_entry_fill_received() -> None
             NormalizedOrderUpdate(
                 order_id="oid_ro",
                 order_link_id="pe_reduce_only_link",
-                symbol="BTCUSDT",
+                symbol=_sym(),
                 status=OrderStatus.FILLED,
                 qty=Decimal("0.01"),
                 avg_price=Decimal("51000"),
@@ -329,7 +333,7 @@ async def test_entry_fill_then_protective_exit_fill_diagnostics_aligned() -> Non
 
     now = datetime.now(UTC)
     entry = OrderIntent(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         side=OrderSide.BUY,
         qty=Decimal("0.01"),
         order_type=OrderType.LIMIT,
@@ -354,7 +358,7 @@ async def test_entry_fill_then_protective_exit_fill_diagnostics_aligned() -> Non
             NormalizedOrderUpdate(
                 order_id="oid_ent",
                 order_link_id="entry_then_pe_exit",
-                symbol="BTCUSDT",
+                symbol=_sym(),
                 status=OrderStatus.FILLED,
                 qty=Decimal("0.01"),
                 avg_price=Decimal("50000"),
@@ -365,7 +369,7 @@ async def test_entry_fill_then_protective_exit_fill_diagnostics_aligned() -> Non
     )
 
     open_orders = await orch._order_manager.get_open_orders(None)
-    pe_orders = [o for o in open_orders if o.reduce_only and o.symbol == "BTCUSDT"]
+    pe_orders = [o for o in open_orders if o.reduce_only and o.symbol == _sym()]
     assert len(pe_orders) == 1
     pe_link = pe_orders[0].order_link_id
 
@@ -374,7 +378,7 @@ async def test_entry_fill_then_protective_exit_fill_diagnostics_aligned() -> Non
             NormalizedOrderUpdate(
                 order_id="oid_pe_fill",
                 order_link_id=pe_link,
-                symbol="BTCUSDT",
+                symbol=_sym(),
                 status=OrderStatus.FILLED,
                 qty=Decimal("0.01"),
                 avg_price=Decimal("51000"),

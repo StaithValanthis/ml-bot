@@ -11,6 +11,10 @@ import pytest
 
 from trading.runtime.orchestrator import RuntimeOrchestrator
 from trading.settings import load_settings
+
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
+
 from trading.strategy.signal_engine import SignalAction, SignalDecision
 from trading.util.types import ModelFilterMode, OrderSide
 
@@ -47,7 +51,7 @@ def test_run_model_filter_stage_evaluates_probe_min_qty() -> None:
     pred.features_used = None
 
     signal = SignalDecision(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         action=SignalAction.ENTER_LONG,
         side=OrderSide.BUY,
         confidence=Decimal("0.7"),
@@ -78,7 +82,7 @@ def test_record_model_decision_payload_shape() -> None:
     orch = _make_orchestrator()
     orch._model_filter_mode = ModelFilterMode.SHADOW
     orch._record_model_decision(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         candidate_type="breakout_long",
         side="Buy",
         bar_close_time=datetime(2025, 3, 19, 10, 30, 0, tzinfo=UTC),
@@ -88,7 +92,7 @@ def test_record_model_decision_payload_shape() -> None:
     )
     assert len(orch._model_shadow_decisions) == 1
     d = orch._model_shadow_decisions[0]
-    assert d["symbol"] == "BTCUSDT"
+    assert d["symbol"] == _sym()
     assert d["candidate_type"] == "breakout_long"
     assert d["side"] == "Buy"
     assert "timestamp" in d
@@ -107,7 +111,7 @@ def test_record_model_decision_bounded_to_max() -> None:
     orch._model_filter_mode = ModelFilterMode.SHADOW
     for i in range(5):
         orch._record_model_decision(
-            symbol="BTCUSDT",
+            symbol=_sym(),
             candidate_type="breakout_long",
             side="Buy",
             bar_close_time=None,
@@ -125,9 +129,9 @@ async def test_session_summary_model_shadow_decisions_section() -> None:
     """Session summary includes model_shadow_decisions with aggregates."""
     orch = _make_orchestrator()
     orch._model_shadow_decisions = [
-        {"symbol": "BTCUSDT", "model_probability": 0.3, "shadow_would_block": True},
+        {"symbol": _sym(), "model_probability": 0.3, "shadow_would_block": True},
         {"symbol": "ETHUSDT", "model_probability": 0.8, "shadow_would_block": False},
-        {"symbol": "BTCUSDT", "model_probability": 0.55, "shadow_would_block": False},
+        {"symbol": _sym(), "model_probability": 0.55, "shadow_would_block": False},
     ]
     summary = await orch._build_session_summary()
     msd = summary.get("model_shadow_decisions")
@@ -161,7 +165,7 @@ def test_markdown_summary_model_shadow_evaluation_sections() -> None:
             "active_blocked_count": 2,
             "active_allowed_count": 3,
             "latest_active_decision": {
-                "symbol": "BTCUSDT",
+                "symbol": _sym(),
                 "candidate_type": "breakout_long",
                 "side": "Buy",
                 "model_probability": 0.52,
@@ -173,7 +177,7 @@ def test_markdown_summary_model_shadow_evaluation_sections() -> None:
             "max_probability": 0.75,
             "decisions": [
                 {
-                    "symbol": "BTCUSDT",
+                    "symbol": _sym(),
                     "candidate_type": "breakout_long",
                     "side": "Buy",
                     "timestamp": "2025-03-19T10:30:00.123456+00:00",
@@ -197,7 +201,7 @@ def test_markdown_summary_model_shadow_evaluation_sections() -> None:
     assert "threshold=0.45" in md
     assert "allow=True" in md
     assert "Prob: avg=0.48 min=0.2 max=0.75" in md
-    assert "BTCUSDT" in md
+    assert _sym() in md
     assert "breakout_long" in md
     assert "would_block=True" in md
 
@@ -214,7 +218,7 @@ async def test_csv_artifact_written_with_correct_columns(tmp_path: Path) -> None
     orch._model_shadow_decisions = [
         {
             "timestamp": "2025-03-19T10:30:00+00:00",
-            "symbol": "BTCUSDT",
+            "symbol": _sym(),
             "candidate_type": "breakout_long",
             "side": "Buy",
             "model_probability": 0.42,
@@ -233,7 +237,7 @@ async def test_csv_artifact_written_with_correct_columns(tmp_path: Path) -> None
     assert "session_id" in lines[0]
     assert "allow" in lines[0]
     assert "session_20250319" in lines[1]
-    assert "BTCUSDT" in lines[1]
+    assert _sym() in lines[1]
     assert "breakout_long" in lines[1]
     assert "Buy" in lines[1]
     assert "0.42" in lines[1]
@@ -248,7 +252,7 @@ def test_shadow_mode_does_not_gate_behavior() -> None:
     orch = _make_orchestrator()
     orch._model_filter_mode = ModelFilterMode.SHADOW
     orch._record_model_decision(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         candidate_type="breakout_long",
         side="Buy",
         bar_close_time=None,
@@ -279,7 +283,7 @@ def test_record_model_decision_active_mode_includes_allow() -> None:
     assert len(orch._model_shadow_decisions) == 1
     assert orch._model_shadow_decisions[0]["allow"] is True
     orch._record_model_decision(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         candidate_type="breakout_long",
         side="Buy",
         bar_close_time=None,
@@ -348,7 +352,7 @@ async def test_csv_export_includes_allow_column_for_active_decisions(tmp_path: P
     orch._model_shadow_decisions = [
         {
             "timestamp": "2025-03-19T10:30:00+00:00",
-            "symbol": "BTCUSDT",
+            "symbol": _sym(),
             "candidate_type": "breakout_long",
             "side": "Buy",
             "model_probability": 0.4,

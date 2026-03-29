@@ -8,13 +8,18 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from trading.execution.execution_engine import ExecutionEngine
+from trading.settings import load_settings
 from trading.strategy.signal_engine import SignalAction, SignalDecision
 from trading.util.types import OrderSide, OrderType, TimeInForce
 
 
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
+
+
 def _signal(side: OrderSide = OrderSide.BUY) -> SignalDecision:
     return SignalDecision(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         action=SignalAction.ENTER_LONG,
         side=side,
         reference_price=Decimal("50000"),
@@ -63,6 +68,10 @@ def test_build_entry_intent_force_marketable_is_market_ioc() -> None:
 def test_orchestrator_settings_produce_marketable_intent_when_demo_and_flag_enabled() -> None:
     """With DEMO + demo_force_marketable_entries, orchestrator logic yields force_marketable=True -> MARKET intent."""
     from trading.settings import load_settings
+
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
+
     from trading.util.types import RuntimeMode
 
     settings = load_settings()

@@ -11,6 +11,10 @@ from trading.execution.reconciler import ReconciliationIssue, ReconciliationRepo
 from trading.runtime.orchestrator import RuntimeOrchestrator
 from trading.settings import load_settings
 
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
+
+
 
 @pytest.mark.asyncio
 async def test_orphan_position_block_set_on_missing_reduce_only() -> None:
@@ -35,7 +39,7 @@ async def test_orphan_position_block_set_on_missing_reduce_only() -> None:
                 issues=[
                     ReconciliationIssue(
                         issue_type="missing_reduce_only_exit",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="Non-flat position has no local tracked reduce-only exit order.",
                         position_size=Decimal("0.05"),
                         position_side="Buy",
@@ -49,7 +53,7 @@ async def test_orphan_position_block_set_on_missing_reduce_only() -> None:
 
     assert orch._orphan_position_blocked is True
     assert len(orch._orphan_position_details) == 1
-    assert orch._orphan_position_details[0]["symbol"] == "BTCUSDT"
+    assert orch._orphan_position_details[0]["symbol"] == _sym()
     assert orch._orphan_position_details[0]["position_size"] == 0.05
     assert orch._orphan_position_details[0]["side"] == "Buy"
 
@@ -69,7 +73,7 @@ async def test_orphan_position_block_cleared_when_reconcile_ok() -> None:
         orch._settings.exchange.bybit_api_secret = MagicMock()
         orch._settings.exchange.bybit_api_secret.get_secret_value = lambda: "secret"
         orch._orphan_position_blocked = True
-        orch._orphan_position_details = [{"symbol": "BTCUSDT", "position_size": 0.05, "side": "Buy", "reason": "test"}]
+        orch._orphan_position_details = [{"symbol": _sym(), "position_size": 0.05, "side": "Buy", "reason": "test"}]
 
         mock_reconciler = MagicMock()
         mock_reconciler.reconcile_orders = AsyncMock(return_value=ReconciliationReport(ok=True, issues=[]))
@@ -104,7 +108,7 @@ async def test_orphan_block_not_set_for_order_issues_only() -> None:
                 issues=[
                     ReconciliationIssue(
                         issue_type="missing_on_exchange",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="Local open order not found remotely",
                         order_link_id="link-1",
                     ),
@@ -131,7 +135,7 @@ async def test_session_summary_includes_orphan_position_blocked() -> None:
         orch = RuntimeOrchestrator(settings)
         orch._orphan_position_blocked = True
         orch._orphan_position_details = [
-            {"symbol": "BTCUSDT", "position_size": 0.05, "side": "Buy", "reason": "non_flat_position_no_tracked_reduce_only_exit"},
+            {"symbol": _sym(), "position_size": 0.05, "side": "Buy", "reason": "non_flat_position_no_tracked_reduce_only_exit"},
         ]
 
         summary = await orch._build_session_summary()
@@ -139,7 +143,7 @@ async def test_session_summary_includes_orphan_position_blocked() -> None:
     assert summary.get("orphan_position_blocked") is True
     details = summary.get("orphan_position_details", [])
     assert len(details) == 1
-    assert details[0]["symbol"] == "BTCUSDT"
+    assert details[0]["symbol"] == _sym()
     assert details[0]["position_size"] == 0.05
 
 
@@ -160,7 +164,7 @@ async def test_runtime_summary_includes_orphan_position_blocked() -> None:
     ):
         orch = RuntimeOrchestrator(settings)
         orch._orphan_position_blocked = True
-        orch._orphan_position_details = [{"symbol": "BTCUSDT", "position_size": 0.05, "side": "Buy", "reason": "test"}]
+        orch._orphan_position_details = [{"symbol": _sym(), "position_size": 0.05, "side": "Buy", "reason": "test"}]
         orch._logger.info = capture_log
 
         await orch._runtime_summary_cycle()

@@ -27,6 +27,10 @@ from trading.settings import load_settings
 from trading.util.types import RuntimeMode
 
 
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
+
+
 def _minimal_session_summary(
     *,
     session_ended_cleanly: bool = True,
@@ -43,7 +47,7 @@ def _minimal_session_summary(
         "session_start": "2025-03-19T10:00:00+00:00",
         "session_end": "2025-03-19T11:00:00+00:00",
         "mode": "demo",
-        "symbols": ["BTCUSDT"],
+        "symbols": list(load_settings().trading.symbols),
         "session_ended_cleanly": session_ended_cleanly,
         "abort_reasons": abort_reasons or [],
         "strategy_flow": {
@@ -162,7 +166,7 @@ def test_soak_report_warn_model_allowed_but_guard_blocked_due_to_active_position
     )
     summary["entry_guard_block_reasons"] = {
         "by_type": {"existing_position": 55},
-        "by_symbol": {"BTCUSDT": {"existing_position": 55}},
+        "by_symbol": {_sym(): {"existing_position": 55}},
     }
     metrics = MetricsSnapshot(
         counters={
@@ -201,7 +205,7 @@ def test_soak_report_exact_session_shape_guard_blocked_active_position_is_warnin
     summary["strategy_flow"]["regime_rejected"] = 51
     summary["entry_guard_block_reasons"] = {
         "by_type": {"existing_position": 55},
-        "by_symbol": {"BTCUSDT": {"existing_position": 55}},
+        "by_symbol": {_sym(): {"existing_position": 55}},
     }
     summary["startup_state_diagnostics"] = {
         "block_reason": "dirty_at_startup",
@@ -249,7 +253,7 @@ def test_soak_report_fail_model_allowed_guard_only_when_runtime_decision_failure
     )
     summary["entry_guard_block_reasons"] = {
         "by_type": {"existing_position": 10},
-        "by_symbol": {"BTCUSDT": {"existing_position": 10}},
+        "by_symbol": {_sym(): {"existing_position": 10}},
     }
     metrics = MetricsSnapshot(
         counters={
@@ -289,7 +293,7 @@ def test_soak_report_fail_model_allowed_guard_only_when_reconcile_mismatch() -> 
     )
     summary["entry_guard_block_reasons"] = {
         "by_type": {"existing_position": 5},
-        "by_symbol": {"BTCUSDT": {"existing_position": 5}},
+        "by_symbol": {_sym(): {"existing_position": 5}},
     }
     metrics = MetricsSnapshot(
         counters={
@@ -323,7 +327,7 @@ def test_soak_report_fail_when_existing_position_is_not_only_nonzero_guard_reaso
     )
     summary["entry_guard_block_reasons"] = {
         "by_type": {"existing_position": 55, "max_concurrent_entries": 1},
-        "by_symbol": {"BTCUSDT": {"existing_position": 55, "max_concurrent_entries": 1}},
+        "by_symbol": {_sym(): {"existing_position": 55, "max_concurrent_entries": 1}},
     }
     metrics = MetricsSnapshot(
         counters={
@@ -357,7 +361,7 @@ def test_soak_report_fail_model_allowed_but_no_submissions_unexplained() -> None
     )
     summary["entry_guard_block_reasons"] = {
         "by_type": {"existing_working_entry": 55},
-        "by_symbol": {"BTCUSDT": {"existing_working_entry": 55}},
+        "by_symbol": {_sym(): {"existing_working_entry": 55}},
     }
     metrics = MetricsSnapshot(
         counters={
@@ -507,7 +511,7 @@ def test_soak_report_includes_reconcile_and_startup_diagnostics() -> None:
     summary["reconcile_diagnostics"] = {
         "total_occurrences": 5,
         "top_issue_type": "missing_on_exchange",
-        "top_symbol": "BTCUSDT",
+        "top_symbol": _sym(),
         "top_3_reason_buckets": [{"reason_bucket": "missing_on_exchange", "count": 5}],
     }
     summary["startup_state_diagnostics"] = {

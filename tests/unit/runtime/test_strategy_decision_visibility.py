@@ -190,8 +190,9 @@ async def test_session_summary_includes_last_risk_rejection_when_set() -> None:
         patch("trading.runtime.orchestrator.BybitWsPrivateClient", MagicMock()),
     ):
         orch = RuntimeOrchestrator(settings)
+        sym = settings.trading.symbols[0]
         orch._last_risk_rejection = {
-            "symbol": "BTCUSDT",
+            "symbol": sym,
             "reason": "max_total_notional_exceeded",
             "failed_conditions": ["max_total_notional_exceeded"],
         }
@@ -199,7 +200,7 @@ async def test_session_summary_includes_last_risk_rejection_when_set() -> None:
 
     assert "last_risk_rejection" in summary
     lrr = summary["last_risk_rejection"]
-    assert lrr["symbol"] == "BTCUSDT"
+    assert lrr["symbol"] == sym
     assert lrr["reason"] == "max_total_notional_exceeded"
     md = orch._build_markdown_summary(summary)
     assert "## Last Risk Rejection" in md
@@ -216,8 +217,9 @@ async def test_runtime_decision_failure_is_recorded_in_summary() -> None:
     ):
         orch = RuntimeOrchestrator(settings)
         orch._ledger.record = AsyncMock()
+        sym = settings.trading.symbols[0]
         orch._last_runtime_decision_context = {
-            "symbol": "BTCUSDT",
+            "symbol": sym,
             "candidate_type": "breakout_long",
             "action": "enter_long",
         }
@@ -237,4 +239,4 @@ async def test_runtime_decision_failure_is_recorded_in_summary() -> None:
     assert reasons.get("ValueError") == 1
     assert len(recent) == 1
     assert recent[0].get("exception_message") == "decision crashed"
-    assert (recent[0].get("decision_context") or {}).get("symbol") == "BTCUSDT"
+    assert (recent[0].get("decision_context") or {}).get("symbol") == sym

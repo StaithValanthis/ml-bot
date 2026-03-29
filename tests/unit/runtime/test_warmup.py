@@ -11,7 +11,13 @@ import pytest
 
 from trading.exchange.schemas import KlineItem
 from trading.runtime.warmup import preload_warmup_klines, WarmupResult
+from trading.settings import load_settings
 from trading.util.types import OHLCVBar
+
+
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
+
 
 
 def _make_kline_item(
@@ -56,12 +62,12 @@ async def test_preload_populates_5m_and_1h_history() -> None:
     mock_rest.get_kline = AsyncMock(side_effect=get_kline_side_effect)
 
     bar_history: dict[str, dict[str, deque[OHLCVBar]]] = {
-        "BTCUSDT": {"5": deque(maxlen=800), "60": deque(maxlen=800)},
+        _sym(): {"5": deque(maxlen=800), "60": deque(maxlen=800)},
     }
     results = await preload_warmup_klines(
         mock_rest,
         bar_history,
-        symbols=["BTCUSDT"],
+        symbols=[_sym()],
         category="linear",
         candle_timeframe="5",
         regime_timeframe="60",
@@ -69,9 +75,9 @@ async def test_preload_populates_5m_and_1h_history() -> None:
         min_1h_bars=24,
     )
     assert len(results) == 2
-    assert bar_history["BTCUSDT"]["5"].__len__() == 25
-    assert bar_history["BTCUSDT"]["60"].__len__() == 25
-    bars_5m = list(bar_history["BTCUSDT"]["5"])
+    assert bar_history[_sym()]["5"].__len__() == 25
+    assert bar_history[_sym()]["60"].__len__() == 25
+    bars_5m = list(bar_history[_sym()]["5"])
     assert all(b.confirmed for b in bars_5m)
     assert bars_5m[0].timeframe == "5"
     assert bars_5m[-1].timeframe == "5"
@@ -89,12 +95,12 @@ async def test_preload_satisfied_when_enough_bars() -> None:
         ]
     )
     bar_history: dict[str, dict[str, deque[OHLCVBar]]] = {
-        "BTCUSDT": {"5": deque(maxlen=800), "60": deque(maxlen=800)},
+        _sym(): {"5": deque(maxlen=800), "60": deque(maxlen=800)},
     }
     results = await preload_warmup_klines(
         mock_rest,
         bar_history,
-        symbols=["BTCUSDT"],
+        symbols=[_sym()],
         category="linear",
         candle_timeframe="5",
         regime_timeframe="60",
@@ -123,19 +129,19 @@ async def test_preload_readiness_after_preload() -> None:
     mock_rest.get_kline = AsyncMock(side_effect=get_kline_side_effect)
 
     bar_history: dict[str, dict[str, deque[OHLCVBar]]] = {
-        "BTCUSDT": {"5": deque(maxlen=800), "60": deque(maxlen=800)},
+        _sym(): {"5": deque(maxlen=800), "60": deque(maxlen=800)},
     }
     await preload_warmup_klines(
         mock_rest,
         bar_history,
-        symbols=["BTCUSDT"],
+        symbols=[_sym()],
         category="linear",
         candle_timeframe="5",
         regime_timeframe="60",
     )
-    bars_5m = list(bar_history["BTCUSDT"]["5"])
-    bars_1h = list(bar_history["BTCUSDT"]["60"])
-    readiness = get_candidate_readiness("BTCUSDT", bars_5m, bars_1h)
+    bars_5m = list(bar_history[_sym()]["5"])
+    bars_1h = list(bar_history[_sym()]["60"])
+    readiness = get_candidate_readiness(_sym(), bars_5m, bars_1h)
     assert readiness["has_enough_5m"] is True
     assert readiness["has_enough_1h"] is True
     assert readiness["reason"] == "ready"
@@ -152,7 +158,7 @@ async def test_preload_logs_start_and_complete() -> None:
         return_value=[_make_kline_item(base_ms + i * 5 * 60 * 1000) for i in range(25)]
     )
     bar_history: dict[str, dict[str, deque[OHLCVBar]]] = {
-        "BTCUSDT": {"5": deque(maxlen=800), "60": deque(maxlen=800)},
+        _sym(): {"5": deque(maxlen=800), "60": deque(maxlen=800)},
     }
     log_calls: list[tuple[str, dict]] = []
 
@@ -167,7 +173,7 @@ async def test_preload_logs_start_and_complete() -> None:
         await preload_warmup_klines(
             mock_rest,
             bar_history,
-            symbols=["BTCUSDT"],
+            symbols=[_sym()],
             category="linear",
             candle_timeframe="5",
             regime_timeframe="60",
@@ -185,12 +191,12 @@ async def test_preload_handles_failure_gracefully() -> None:
     mock_rest = MagicMock()
     mock_rest.get_kline = AsyncMock(side_effect=Exception("network error"))
     bar_history: dict[str, dict[str, deque[OHLCVBar]]] = {
-        "BTCUSDT": {"5": deque(maxlen=800), "60": deque(maxlen=800)},
+        _sym(): {"5": deque(maxlen=800), "60": deque(maxlen=800)},
     }
     results = await preload_warmup_klines(
         mock_rest,
         bar_history,
-        symbols=["BTCUSDT"],
+        symbols=[_sym()],
         category="linear",
         candle_timeframe="5",
         regime_timeframe="60",

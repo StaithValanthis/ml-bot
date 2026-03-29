@@ -12,6 +12,10 @@ from trading.execution.order_intent import IntentPurpose, OrderIntent
 from trading.execution.reconciler import ReconciliationIssue, ReconciliationReport
 from trading.runtime.orchestrator import RuntimeOrchestrator
 from trading.settings import load_settings
+
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
+
 from trading.util.types import OrderSide, RuntimeMode, OrderType, TimeInForce
 
 
@@ -32,7 +36,7 @@ async def test_missing_on_exchange_resolved_locally_order_no_longer_open() -> No
 
         await orch._order_manager.register_intent(
             OrderIntent(
-                symbol="BTCUSDT",
+                symbol=_sym(),
                 side=OrderSide.BUY,
                 qty=Decimal("0.001"),
                 order_type=OrderType.LIMIT,
@@ -61,7 +65,7 @@ async def test_missing_on_exchange_resolved_locally_order_no_longer_open() -> No
                 issues=[
                     ReconciliationIssue(
                         issue_type="missing_on_exchange",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="Local open order not found remotely: link_id=v1alph-btcu-260321235000-c2def87b",
                         order_link_id="v1alph-btcu-260321235000-c2def87b",
                         order_id="ord-xyz",
@@ -103,7 +107,7 @@ async def test_startup_state_block_clears_after_missing_on_exchange_resolution()
 
         await orch._order_manager.register_intent(
             OrderIntent(
-                symbol="BTCUSDT",
+                symbol=_sym(),
                 side=OrderSide.BUY,
                 qty=Decimal("0.001"),
                 order_type=OrderType.LIMIT,
@@ -129,7 +133,7 @@ async def test_startup_state_block_clears_after_missing_on_exchange_resolution()
                 issues=[
                     ReconciliationIssue(
                         issue_type="missing_on_exchange",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="Local open order not found remotely",
                         order_link_id="link-missing",
                         order_id="ord-1",
@@ -165,7 +169,7 @@ async def test_no_repeated_mismatch_after_resolution() -> None:
 
         await orch._order_manager.register_intent(
             OrderIntent(
-                symbol="BTCUSDT",
+                symbol=_sym(),
                 side=OrderSide.BUY,
                 qty=Decimal("0.001"),
                 order_type=OrderType.LIMIT,
@@ -191,7 +195,7 @@ async def test_no_repeated_mismatch_after_resolution() -> None:
                 issues=[
                     ReconciliationIssue(
                         issue_type="missing_on_exchange",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="Local open order not found remotely",
                         order_link_id="link-missing",
                         order_id="ord-1",

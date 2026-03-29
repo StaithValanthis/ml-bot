@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+from trading.settings import load_settings
 from trading.runtime.reconcile_diagnostics import (
     aggregate_reconcile_issues,
     bucket_details,
     build_reconcile_diagnostics_summary,
 )
+
+
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
 
 
 def test_bucket_details_missing_on_exchange() -> None:
@@ -47,19 +52,20 @@ def test_aggregate_reconcile_issues_empty() -> None:
 
 def test_aggregate_reconcile_issues_by_type_and_symbol() -> None:
     """Aggregation counts by issue_type and symbol."""
+    other = next(s for s in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "LINKUSDT") if s != _sym())
     accumulated = [
-        {"issue_type": "missing_on_exchange", "symbol": "BTCUSDT", "details": "Local not found", "occurred_at": "2025-01-01T10:00:00Z"},
-        {"issue_type": "missing_on_exchange", "symbol": "BTCUSDT", "details": "Local not found 2", "occurred_at": "2025-01-01T10:01:00Z"},
-        {"issue_type": "missing_locally", "symbol": "ETHUSDT", "details": "Not tracked", "occurred_at": "2025-01-01T10:02:00Z"},
+        {"issue_type": "missing_on_exchange", "symbol": _sym(), "details": "Local not found", "occurred_at": "2025-01-01T10:00:00Z"},
+        {"issue_type": "missing_on_exchange", "symbol": _sym(), "details": "Local not found 2", "occurred_at": "2025-01-01T10:01:00Z"},
+        {"issue_type": "missing_locally", "symbol": other, "details": "Not tracked", "occurred_at": "2025-01-01T10:02:00Z"},
     ]
     agg = aggregate_reconcile_issues(accumulated)
     assert agg["total_occurrences"] == 3
     assert agg["by_issue_type"]["missing_on_exchange"] == 2
     assert agg["by_issue_type"]["missing_locally"] == 1
-    assert agg["by_symbol"]["BTCUSDT"] == 2
-    assert agg["by_symbol"]["ETHUSDT"] == 1
+    assert agg["by_symbol"][_sym()] == 2
+    assert agg["by_symbol"][other] == 1
     assert agg["top_issue_type"] == "missing_on_exchange"
-    assert agg["top_symbol"] == "BTCUSDT"
+    assert agg["top_symbol"] == _sym()
 
 
 def test_build_reconcile_diagnostics_summary_top_3() -> None:

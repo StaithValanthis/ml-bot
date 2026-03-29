@@ -10,6 +10,10 @@ import pytest
 from trading.execution.reconciler import ReconciliationIssue, ReconciliationReport
 from trading.runtime.orchestrator import RuntimeOrchestrator
 from trading.settings import load_settings
+
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
+
 from trading.util.types import RuntimeMode
 
 
@@ -19,7 +23,7 @@ async def test_startup_detects_open_position_and_blocks() -> None:
     settings = load_settings()
     settings.runtime.mode = RuntimeMode.DEMO
     mock_pos = MagicMock()
-    mock_pos.symbol = "BTCUSDT"
+    mock_pos.symbol = _sym()
     mock_pos.side = "Buy"
     mock_pos.size = Decimal("0.05")
     mock_orders: list = []
@@ -38,7 +42,7 @@ async def test_startup_detects_open_position_and_blocks() -> None:
         await orch._inspect_startup_exchange_state()
     assert orch._startup_state_blocked is True
     assert len(orch._startup_state_details) >= 1
-    assert any(d["symbol"] == "BTCUSDT" and d["position_size"] == 0.05 for d in orch._startup_state_details)
+    assert any(d["symbol"] == _sym() and d["position_size"] == 0.05 for d in orch._startup_state_details)
 
 
 @pytest.mark.asyncio
@@ -47,7 +51,7 @@ async def test_startup_detects_stray_orders_and_blocks() -> None:
     settings = load_settings()
     settings.runtime.mode = RuntimeMode.DEMO
     mock_order = MagicMock()
-    mock_order.symbol = "BTCUSDT"
+    mock_order.symbol = _sym()
     mock_order.reduce_only = False
     mock_order.order_link_id = "stray-1"
     with (
@@ -65,7 +69,7 @@ async def test_startup_detects_stray_orders_and_blocks() -> None:
         await orch._inspect_startup_exchange_state()
     assert orch._startup_state_blocked is True
     assert len(orch._startup_state_details) >= 1
-    assert any(d["symbol"] == "BTCUSDT" and d.get("non_reduce_only_order_count", 0) >= 1 for d in orch._startup_state_details)
+    assert any(d["symbol"] == _sym() and d.get("non_reduce_only_order_count", 0) >= 1 for d in orch._startup_state_details)
 
 
 @pytest.mark.asyncio
@@ -97,7 +101,7 @@ async def test_startup_block_cleared_when_reconcile_ok() -> None:
         orch._settings.exchange.bybit_api_secret = MagicMock()
         orch._settings.exchange.bybit_api_secret.get_secret_value = lambda: "secret"
         orch._startup_state_blocked = True
-        orch._startup_state_details = [{"symbol": "BTCUSDT"}]
+        orch._startup_state_details = [{"symbol": _sym()}]
         mock_reconciler = MagicMock()
         mock_reconciler.reconcile_orders = AsyncMock(return_value=ReconciliationReport(ok=True, issues=[]))
         mock_reconciler.reconcile_positions = AsyncMock(return_value=ReconciliationReport(ok=True, issues=[]))
@@ -129,7 +133,7 @@ async def test_reconcile_preserves_startup_block_on_orphan() -> None:
                 issues=[
                     ReconciliationIssue(
                         issue_type="missing_reduce_only_exit",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="Non-flat position has no local tracked reduce-only exit order.",
                         position_size=Decimal("0.05"),
                         position_side="Buy",
@@ -157,7 +161,7 @@ async def test_runtime_summary_includes_startup_state_blocked() -> None:
         orch._startup_state_blocked = True
         orch._startup_state_details = [
             {
-                "symbol": "BTCUSDT",
+                "symbol": _sym(),
                 "position_size": 0.05,
                 "position_side": "Buy",
                 "open_order_count": 0,

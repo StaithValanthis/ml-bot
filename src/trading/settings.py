@@ -373,6 +373,50 @@ def _load_config_stack(config_dir: Path, base_file: str, env_name: str) -> dict[
     return _deep_merge(merged, model_registry_cfg)
 
 
+def _sync_trading_symbols_to_metadata(data: dict[str, Any]) -> None:
+    """
+    Keep trading.symbols consistent with symbols.yaml: drop entries with no metadata.
+
+    Preserves YAML order. Fails if nothing remains (stricter than silently trading unknowns).
+    """
+    meta = data.get("symbols")
+    if not isinstance(meta, dict):
+        return
+    allowed = {str(k).strip().upper() for k in meta.keys()}
+    trading = data.setdefault("trading", {})
+    raw = trading.get("symbols")
+    if not isinstance(raw, list):
+        return
+    normalized = [str(s).strip().upper() for s in raw]
+    filtered = [s for s in normalized if s in allowed]
+    if not filtered:
+        raise RuntimeError(
+            "No symbols remain after intersecting trading.symbols with symbols.yaml metadata. "
+            f"trading.symbols requested {raw!r}; symbols.yaml defines metadata for {sorted(allowed)!r}. "
+            "Align configs or add missing symbol entries."
+        )
+    trading["symbols"] = filtered
+
+
+def _align_demo_drill_symbol_to_trading(data: dict[str, Any]) -> None:
+    """Ensure demo drill uses a symbol that exists in the resolved trading universe."""
+    trading = data.get("trading")
+    if not isinstance(trading, dict):
+        return
+    syms = trading.get("symbols")
+    if not isinstance(syms, list) or not syms:
+        return
+    allowed_trade = {str(s).strip().upper() for s in syms}
+    runtime = data.setdefault("runtime", {})
+    drill = runtime.get("demo_drill")
+    if isinstance(drill, dict):
+        dsym = drill.get("symbol")
+        if dsym is None or str(dsym).strip().upper() not in allowed_trade:
+            drill["symbol"] = syms[0]
+    elif drill is None:
+        runtime["demo_drill"] = {"symbol": syms[0]}
+
+
 def load_settings() -> AppSettings:
     """
     Load and validate app settings from YAML + environment variables.
@@ -504,6 +548,9 @@ def load_settings() -> AppSettings:
 
     data.setdefault("exchange", {})["bybit_api_key"] = secrets.bybit_api_key
     data.setdefault("exchange", {})["bybit_api_secret"] = secrets.bybit_api_secret
+
+    _sync_trading_symbols_to_metadata(data)
+    _align_demo_drill_symbol_to_trading(data)
 
     try:
         return AppSettings.model_validate(data)

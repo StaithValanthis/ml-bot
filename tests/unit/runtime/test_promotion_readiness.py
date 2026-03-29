@@ -26,6 +26,15 @@ from trading.runtime.promotion_readiness import (
     load_soak_reports,
     run_promotion_evaluation,
 )
+from trading.settings import load_settings
+
+
+def _primary_trade_symbol() -> str:
+    return load_settings().trading.symbols[0]
+
+
+def _session_trade_symbols() -> list[str]:
+    return list(load_settings().trading.symbols)
 
 
 def _minimal_soak_report(
@@ -50,7 +59,7 @@ def _minimal_soak_report(
         "session_metadata": {
             "session_id": sid,
             "mode": mode,
-            "symbols": ["BTCUSDT"],
+            "symbols": _session_trade_symbols(),
             "started_at": "2025-03-19T10:00:00+00:00",
             "ended_at": "2025-03-19T11:00:00+00:00",
             "duration_seconds": duration_seconds,
@@ -133,7 +142,7 @@ def test_promotion_end_to_end_built_soak_guard_blocked_active_position_warn() ->
         "session_start": "2025-03-19T10:00:00+00:00",
         "session_end": "2025-03-19T11:00:00+00:00",
         "mode": "demo",
-        "symbols": ["BTCUSDT"],
+        "symbols": [_primary_trade_symbol()],
         "session_ended_cleanly": True,
         "abort_reasons": [],
         "strategy_flow": {
@@ -168,7 +177,7 @@ def test_promotion_end_to_end_built_soak_guard_blocked_active_position_warn() ->
         "blocking_stage": "submitted",
         "entry_guard_block_reasons": {
             "by_type": {"existing_position": 55},
-            "by_symbol": {"BTCUSDT": {"existing_position": 55}},
+            "by_symbol": {_primary_trade_symbol(): {"existing_position": 55}},
         },
     }
     metrics = MetricsSnapshot(
@@ -208,7 +217,7 @@ def test_promotion_exact_session_shape_guard_blocked_active_position_not_fail() 
         "session_start": "2026-03-26T12:43:08+00:00",
         "session_end": "2026-03-26T21:31:33+00:00",
         "mode": "demo",
-        "symbols": ["BTCUSDT"],
+        "symbols": [_primary_trade_symbol()],
         "session_ended_cleanly": True,
         "abort_reasons": [],
         "strategy_flow": {
@@ -242,7 +251,7 @@ def test_promotion_exact_session_shape_guard_blocked_active_position_not_fail() 
         "reconcile_mismatch_cycles": 0,
         "entry_guard_block_reasons": {
             "by_type": {"existing_position": 55},
-            "by_symbol": {"BTCUSDT": {"existing_position": 55}},
+            "by_symbol": {_primary_trade_symbol(): {"existing_position": 55}},
         },
         "startup_state_diagnostics": {
             "block_reason": "dirty_at_startup",
@@ -294,7 +303,7 @@ def test_promotion_marks_fail_when_guard_reason_not_existing_position_only() -> 
         "session_start": "2026-03-26T12:43:08+00:00",
         "session_end": "2026-03-26T21:31:33+00:00",
         "mode": "demo",
-        "symbols": ["BTCUSDT"],
+        "symbols": [_primary_trade_symbol()],
         "session_ended_cleanly": True,
         "abort_reasons": [],
         "strategy_flow": {
@@ -328,7 +337,7 @@ def test_promotion_marks_fail_when_guard_reason_not_existing_position_only() -> 
         "reconcile_mismatch_cycles": 0,
         "entry_guard_block_reasons": {
             "by_type": {"existing_position": 55, "max_concurrent_entries": 1},
-            "by_symbol": {"BTCUSDT": {"existing_position": 55, "max_concurrent_entries": 1}},
+            "by_symbol": {_primary_trade_symbol(): {"existing_position": 55, "max_concurrent_entries": 1}},
         },
     }
     metrics = MetricsSnapshot(
@@ -368,7 +377,7 @@ def test_promotion_paper_recovered_stale_feed_no_session_aborted_reason() -> Non
         "session_start": "2026-03-27T21:34:07+00:00",
         "session_end": "2026-03-27T23:00:00+00:00",
         "mode": "paper",
-        "symbols": ["BTCUSDT"],
+        "symbols": [_primary_trade_symbol()],
         "session_ended_cleanly": True,
         "abort_reasons": ["stale_feed"],
         "reconcile_mismatch_cycles": 0,
@@ -780,7 +789,7 @@ def test_promotion_report_includes_dominant_reconcile_fields() -> None:
     for r in reports:
         r["reconcile_diagnostics"] = {
             "by_issue_type": {"missing_on_exchange": 3},
-            "by_symbol": {"BTCUSDT": 3},
+            "by_symbol": {_primary_trade_symbol(): 3},
             "by_reason_bucket": {"missing_on_exchange": 3},
         }
         r["startup_state_diagnostics"] = {

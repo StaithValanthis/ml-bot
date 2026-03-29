@@ -11,6 +11,10 @@ from trading.execution.reconciler import ReconciliationIssue, ReconciliationRepo
 from trading.runtime.orchestrator import RuntimeOrchestrator
 from trading.settings import load_settings
 
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
+
+
 
 @pytest.mark.asyncio
 async def test_startup_block_clears_after_missing_locally_reduce_only_sync() -> None:
@@ -36,7 +40,7 @@ async def test_startup_block_clears_after_missing_locally_reduce_only_sync() -> 
                 issues=[
                     ReconciliationIssue(
                         issue_type="missing_locally",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="Exchange open order not tracked locally",
                         order_link_id="exch-ro-1",
                         order_id="ord-1",
@@ -83,7 +87,7 @@ async def test_missing_locally_non_reduce_only_stays_blocked_but_no_escalation()
                 issues=[
                     ReconciliationIssue(
                         issue_type="missing_locally",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="Exchange open order not tracked locally",
                         order_link_id="exch-entry-1",
                         order_id="ord-2",
@@ -127,7 +131,7 @@ async def test_no_repeated_mismatch_after_missing_locally_sync() -> None:
                 issues=[
                     ReconciliationIssue(
                         issue_type="missing_locally",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="Exchange open order not tracked locally",
                         order_link_id="exch-ro-2",
                         order_id="ord-3",
@@ -183,7 +187,7 @@ async def test_qty_mismatch_only_clears_startup() -> None:
                 issues=[
                     ReconciliationIssue(
                         issue_type="qty_mismatch",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="qty mismatch local=0.05 remote=0.04",
                         order_link_id="link-1",
                         order_id="ord-1",
@@ -227,7 +231,7 @@ async def test_soak_diagnostics_reflect_missing_locally_resolved() -> None:
                 issues=[
                     ReconciliationIssue(
                         issue_type="missing_locally",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="Exchange open order not tracked locally",
                         order_link_id="exch-ro-diag",
                         order_id="ord-diag",
@@ -273,7 +277,7 @@ async def test_mixed_reduce_only_and_non_reduce_only_keeps_block() -> None:
                 issues=[
                     ReconciliationIssue(
                         issue_type="missing_locally",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="Exchange reduce-only not tracked",
                         order_link_id="exch-ro-1",
                         order_id="ord-1",
@@ -282,7 +286,7 @@ async def test_mixed_reduce_only_and_non_reduce_only_keeps_block() -> None:
                     ),
                     ReconciliationIssue(
                         issue_type="missing_locally",
-                        symbol="BTCUSDT",
+                        symbol=_sym(),
                         details="Exchange entry not tracked",
                         order_link_id="exch-entry-1",
                         order_id="ord-2",

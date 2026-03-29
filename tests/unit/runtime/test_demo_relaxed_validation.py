@@ -9,6 +9,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from trading.settings import load_settings
+
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
+
 from trading.strategy.candidates import BreakoutTrendCandidateGenerator, CandidateGeneratorConfig
 from trading.util.types import OHLCVBar
 
@@ -24,7 +28,7 @@ def _make_bar(
     h = high if high is not None else close + Decimal("10")
     l_ = low if low is not None else close - Decimal("10")
     return OHLCVBar(
-        symbol="BTCUSDT",
+        symbol=_sym(),
         timeframe="5",
         open_time=t,
         close_time=t,
@@ -67,11 +71,11 @@ def test_create_relaxed_validation_candidates_breakout_near_miss() -> None:
         low=base + Decimal("5"),
         volume=Decimal("115"),
     )
-    precondition = gen.get_precondition_report("BTCUSDT", bars)
+    precondition = gen.get_precondition_report(_sym(), bars)
     assert precondition is not None
     assert "breakout_up" in precondition.failed_conditions or "breakout_dn" in precondition.failed_conditions
 
-    relaxed = gen.create_relaxed_validation_candidates("BTCUSDT", precondition, bars)
+    relaxed = gen.create_relaxed_validation_candidates(_sym(), precondition, bars)
     assert len(relaxed) >= 1
     assert relaxed[0].metadata.get("relaxed_validation") is True
     assert "original_failed_conditions" in relaxed[0].metadata
@@ -83,9 +87,9 @@ def test_create_relaxed_validation_candidates_empty_when_no_near_miss() -> None:
     gen = BreakoutTrendCandidateGenerator()
     base = Decimal("40000")
     bars = [_make_bar(close=base, volume=Decimal("100")) for _ in range(25)]
-    precondition = gen.get_precondition_report("BTCUSDT", bars)
+    precondition = gen.get_precondition_report(_sym(), bars)
     assert precondition is not None
-    relaxed = gen.create_relaxed_validation_candidates("BTCUSDT", precondition, bars)
+    relaxed = gen.create_relaxed_validation_candidates(_sym(), precondition, bars)
     assert isinstance(relaxed, list)
 
 

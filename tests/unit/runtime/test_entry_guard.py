@@ -13,6 +13,10 @@ from trading.settings import load_settings
 from trading.util.types import OrderSide, OrderType, PositionSide, TimeInForce
 
 
+def _sym() -> str:
+    return load_settings().trading.symbols[0]
+
+
 def _make_orchestrator() -> RuntimeOrchestrator:
     mock_rest = MagicMock()
     mock_ws_public = MagicMock()
@@ -31,15 +35,16 @@ def _make_orchestrator() -> RuntimeOrchestrator:
         return RuntimeOrchestrator(load_settings())
 
 
-def _mock_order(symbol: str = "BTCUSDT", reduce_only: bool = False, drill: bool = False, order_link_id: str = "link-1"):
+def _mock_order(symbol: str | None = None, reduce_only: bool = False, drill: bool = False, order_link_id: str = "link-1"):
     from trading.execution.order_manager import ManagedOrder
     from datetime import datetime, timezone
     from trading.util.types import OrderStatus
 
+    sym = _sym() if symbol is None else symbol
     return ManagedOrder(
         order_id="ord-1",
         order_link_id=order_link_id,
-        symbol=symbol,
+        symbol=sym,
         status=OrderStatus.NEW,
         qty=Decimal("0.001"),
         filled_qty=Decimal("0"),
@@ -58,8 +63,8 @@ def test_blocks_entry_when_symbol_has_non_flat_position() -> None:
     orch._settings.runtime.max_concurrent_entries_per_symbol = 1
     from trading.risk.portfolio_state import PositionRiskView
 
-    orch._portfolio.positions["BTCUSDT"] = PositionRiskView(
-        symbol="BTCUSDT",
+    orch._portfolio.positions[_sym()] = PositionRiskView(
+        symbol=_sym(),
         side=PositionSide.LONG,
         qty=Decimal("0.01"),
         entry_price=Decimal("60000"),
@@ -68,12 +73,12 @@ def test_blocks_entry_when_symbol_has_non_flat_position() -> None:
         liquidation_price=None,
     )
 
-    result = orch._should_block_new_entry("BTCUSDT", [])
+    result = orch._should_block_new_entry(_sym(), [])
     assert result is not None
     blocked, reason, payload = result
     assert blocked is True
     assert reason == "existing_position"
-    assert payload["symbol"] == "BTCUSDT"
+    assert payload["symbol"] == _sym()
     assert payload["current_position_size"] == 0.01
     assert payload["allow_position_adds"] is False
 
@@ -84,8 +89,8 @@ def test_blocks_entry_when_working_entry_order_exists() -> None:
     orch._settings.runtime.allow_position_adds = False
     orch._settings.runtime.max_concurrent_entries_per_symbol = 1
 
-    open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=False, drill=False)]
-    result = orch._should_block_new_entry("BTCUSDT", open_orders)
+    open_orders = [_mock_order(symbol=_sym(), reduce_only=False, drill=False)]
+    result = orch._should_block_new_entry(_sym(), open_orders)
     assert result is not None
     blocked, reason, payload = result
     assert blocked is True
@@ -99,10 +104,10 @@ def test_allows_entry_when_flat_and_no_working_entry() -> None:
     orch._settings.runtime.allow_position_adds = False
     orch._settings.runtime.max_concurrent_entries_per_symbol = 1
 
-    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", [])
+    blocked, block_reason, payload = orch._should_block_new_entry(_sym(), [])
     assert blocked is False
     assert block_reason is None
-    assert payload["symbol"] == "BTCUSDT"
+    assert payload["symbol"] == _sym()
 
 
 def test_allows_only_one_concurrent_entry_by_default() -> None:
@@ -110,8 +115,8 @@ def test_allows_only_one_concurrent_entry_by_default() -> None:
     orch = _make_orchestrator()
     orch._settings.runtime.allow_position_adds = False
 
-    open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=False)]
-    result = orch._should_block_new_entry("BTCUSDT", open_orders)
+    open_orders = [_mock_order(symbol=_sym(), reduce_only=False)]
+    result = orch._should_block_new_entry(_sym(), open_orders)
     assert result is not None
     blocked, reason, _ = result
     assert blocked is True
@@ -124,8 +129,8 @@ def test_flat_with_stale_reduce_only_allows_entry() -> None:
     orch._settings.runtime.allow_position_adds = False
     orch._portfolio.positions = {}
 
-    open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=True)]
-    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", open_orders)
+    open_orders = [_mock_order(symbol=_sym(), reduce_only=True)]
+    blocked, block_reason, payload = orch._should_block_new_entry(_sym(), open_orders)
     assert blocked is False
     assert block_reason is None
     assert payload["current_position_size"] == 0.0
@@ -139,13 +144,13 @@ def test_respects_allow_position_adds_true_plus_max_concurrent() -> None:
     orch._settings.runtime.max_concurrent_entries_per_symbol = 2
 
     open_orders = [
-        _mock_order(symbol="BTCUSDT", reduce_only=False),
-        _mock_order(symbol="BTCUSDT", reduce_only=False, drill=False),
+        _mock_order(symbol=_sym(), reduce_only=False),
+        _mock_order(symbol=_sym(), reduce_only=False, drill=False),
     ]
     open_orders[1].order_link_id = "link-2"
     open_orders[1].order_id = "ord-2"
 
-    result = orch._should_block_new_entry("BTCUSDT", open_orders)
+    result = orch._should_block_new_entry(_sym(), open_orders)
     assert result is not None
     blocked, reason, payload = result
     assert blocked is True
@@ -160,8 +165,8 @@ def test_allow_position_adds_true_allows_when_under_limit() -> None:
     orch._settings.runtime.allow_position_adds = True
     orch._settings.runtime.max_concurrent_entries_per_symbol = 2
 
-    open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=False)]
-    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", open_orders)
+    open_orders = [_mock_order(symbol=_sym(), reduce_only=False)]
+    blocked, block_reason, payload = orch._should_block_new_entry(_sym(), open_orders)
     assert blocked is False
     assert block_reason is None
     assert payload["open_entry_order_count"] == 1
@@ -172,8 +177,8 @@ def test_drill_orders_excluded_from_guard() -> None:
     orch = _make_orchestrator()
     orch._settings.runtime.allow_position_adds = False
 
-    open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=False, drill=True)]
-    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", open_orders)
+    open_orders = [_mock_order(symbol=_sym(), reduce_only=False, drill=True)]
+    blocked, block_reason, payload = orch._should_block_new_entry(_sym(), open_orders)
     assert blocked is False
     assert block_reason is None
     assert payload["open_entry_order_count"] == 0
@@ -185,8 +190,8 @@ def test_non_flat_position_with_reduce_only_still_blocks() -> None:
     orch._settings.runtime.allow_position_adds = False
     from trading.risk.portfolio_state import PositionRiskView
 
-    orch._portfolio.positions["BTCUSDT"] = PositionRiskView(
-        symbol="BTCUSDT",
+    orch._portfolio.positions[_sym()] = PositionRiskView(
+        symbol=_sym(),
         side=PositionSide.LONG,
         qty=Decimal("0.01"),
         entry_price=Decimal("60000"),
@@ -195,8 +200,8 @@ def test_non_flat_position_with_reduce_only_still_blocks() -> None:
         liquidation_price=None,
     )
 
-    open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=True)]
-    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", open_orders)
+    open_orders = [_mock_order(symbol=_sym(), reduce_only=True)]
+    blocked, block_reason, payload = orch._should_block_new_entry(_sym(), open_orders)
     assert blocked is True
     assert block_reason == "existing_position"
     assert payload["current_position_size"] == 0.01
@@ -209,8 +214,8 @@ def test_entry_blocked_existing_position_log_merge_no_duplicate_keywords() -> No
     orch._settings.runtime.allow_position_adds = False
     from trading.risk.portfolio_state import PositionRiskView
 
-    orch._portfolio.positions["BTCUSDT"] = PositionRiskView(
-        symbol="BTCUSDT",
+    orch._portfolio.positions[_sym()] = PositionRiskView(
+        symbol=_sym(),
         side=PositionSide.LONG,
         qty=Decimal("0.01"),
         entry_price=Decimal("60000"),
@@ -218,7 +223,7 @@ def test_entry_blocked_existing_position_log_merge_no_duplicate_keywords() -> No
         leverage=Decimal("1"),
         liquidation_price=None,
     )
-    blocked, block_reason, guard_payload = orch._should_block_new_entry("BTCUSDT", [])
+    blocked, block_reason, guard_payload = orch._should_block_new_entry(_sym(), [])
     assert blocked is True
     assert block_reason == "existing_position"
     assert guard_payload.get("block_reason_bucket") == "existing_position"
@@ -241,9 +246,9 @@ def test_entry_blocked_working_entry_and_max_concurrent_log_merge_no_duplicate_k
     orch._settings.runtime.allow_position_adds = False
     orch._settings.runtime.max_concurrent_entries_per_symbol = 1
     open_working = [
-        _mock_order(symbol="BTCUSDT", reduce_only=False),
+        _mock_order(symbol=_sym(), reduce_only=False),
     ]
-    blocked_w, reason_w, payload_w = orch._should_block_new_entry("BTCUSDT", open_working)
+    blocked_w, reason_w, payload_w = orch._should_block_new_entry(_sym(), open_working)
     assert blocked_w and reason_w == "existing_working_entry"
     bucket_w = payload_w.get("block_reason_bucket", reason_w or "unknown")
     log_w = {**payload_w, "block_reason_bucket": bucket_w}
@@ -253,10 +258,10 @@ def test_entry_blocked_working_entry_and_max_concurrent_log_merge_no_duplicate_k
     orch2._settings.runtime.allow_position_adds = True
     orch2._settings.runtime.max_concurrent_entries_per_symbol = 1
     two_entries = [
-        _mock_order(symbol="BTCUSDT", reduce_only=False, order_link_id="link-a"),
-        _mock_order(symbol="BTCUSDT", reduce_only=False, order_link_id="link-b"),
+        _mock_order(symbol=_sym(), reduce_only=False, order_link_id="link-a"),
+        _mock_order(symbol=_sym(), reduce_only=False, order_link_id="link-b"),
     ]
-    blocked_m, reason_m, payload_m = orch2._should_block_new_entry("BTCUSDT", two_entries)
+    blocked_m, reason_m, payload_m = orch2._should_block_new_entry(_sym(), two_entries)
     assert blocked_m and reason_m == "max_concurrent_entries"
     bucket_m = payload_m.get("block_reason_bucket", reason_m or "unknown")
     log_m = {**payload_m, "block_reason_bucket": bucket_m}
@@ -269,8 +274,8 @@ def test_effectively_flat_dust_position_does_not_block_existing_position() -> No
     orch._settings.runtime.allow_position_adds = False
     from trading.risk.portfolio_state import PositionRiskView
 
-    orch._portfolio.positions["BTCUSDT"] = PositionRiskView(
-        symbol="BTCUSDT",
+    orch._portfolio.positions[_sym()] = PositionRiskView(
+        symbol=_sym(),
         side=PositionSide.LONG,
         qty=Decimal("0.0004"),
         entry_price=Decimal("60000"),
@@ -279,11 +284,12 @@ def test_effectively_flat_dust_position_does_not_block_existing_position() -> No
         liquidation_price=None,
     )
 
-    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", [])
+    blocked, block_reason, payload = orch._should_block_new_entry(_sym(), [])
     assert blocked is False
     assert block_reason is None
     assert payload["position_effectively_flat"] is True
-    assert payload["effective_flat_threshold_qty"] == 0.0005
+    step = orch._settings.symbols[_sym()].qty_step
+    assert payload["effective_flat_threshold_qty"] == float(step / Decimal("2"))
 
 
 def test_defaults_without_env_vars_block_repeated_adds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -301,9 +307,9 @@ def test_guard_diagnostic_payload_has_required_fields() -> None:
     orch._settings.runtime.allow_position_adds = False
     orch._settings.runtime.max_concurrent_entries_per_symbol = 1
 
-    blocked, block_reason, payload = orch._should_block_new_entry("BTCUSDT", [])
+    blocked, block_reason, payload = orch._should_block_new_entry(_sym(), [])
     assert "symbol" in payload
-    assert payload["symbol"] == "BTCUSDT"
+    assert payload["symbol"] == _sym()
     assert "allow_position_adds" in payload
     assert "max_concurrent_entries_per_symbol" in payload
     assert "current_position_size" in payload
@@ -313,8 +319,8 @@ def test_guard_diagnostic_payload_has_required_fields() -> None:
     assert blocked is False
     assert block_reason is None
 
-    open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=False)]
-    blocked2, block_reason2, payload2 = orch._should_block_new_entry("BTCUSDT", open_orders)
+    open_orders = [_mock_order(symbol=_sym(), reduce_only=False)]
+    blocked2, block_reason2, payload2 = orch._should_block_new_entry(_sym(), open_orders)
     assert blocked2 is True
     assert block_reason2 == "existing_working_entry"
     assert payload2["open_entry_order_count"] == 1
@@ -359,12 +365,12 @@ def test_guard_payload_has_local_tracked_order_count() -> None:
     orch = _make_orchestrator()
     orch._settings.runtime.allow_position_adds = False
 
-    _, _, payload = orch._should_block_new_entry("BTCUSDT", [])
+    _, _, payload = orch._should_block_new_entry(_sym(), [])
     assert "local_tracked_order_count" in payload
     assert payload["local_tracked_order_count"] == 0
 
-    open_orders = [_mock_order(symbol="BTCUSDT", reduce_only=True)]
-    _, _, payload2 = orch._should_block_new_entry("BTCUSDT", open_orders)
+    open_orders = [_mock_order(symbol=_sym(), reduce_only=True)]
+    _, _, payload2 = orch._should_block_new_entry(_sym(), open_orders)
     assert payload2["local_tracked_order_count"] == 1
 
 
@@ -372,10 +378,12 @@ def test_guard_payload_has_local_tracked_order_count() -> None:
 async def test_session_summary_includes_entry_guard_block_reasons() -> None:
     """Session summary includes entry_guard_block_reasons aggregation for soak diagnostics."""
     orch = _make_orchestrator()
+    syms = orch._settings.trading.symbols
+    s0, s1 = syms[0], syms[1] if len(syms) > 1 else syms[0]
     orch._entry_guard_block_reasons = [
-        {"symbol": "BTCUSDT", "block_reason": "existing_position", "block_reason_bucket": "existing_position"},
-        {"symbol": "BTCUSDT", "block_reason": "existing_position", "block_reason_bucket": "existing_position"},
-        {"symbol": "ETHUSDT", "block_reason": "existing_working_entry", "block_reason_bucket": "existing_working_entry"},
+        {"symbol": s0, "block_reason": "existing_position", "block_reason_bucket": "existing_position"},
+        {"symbol": s0, "block_reason": "existing_position", "block_reason_bucket": "existing_position"},
+        {"symbol": s1, "block_reason": "existing_working_entry", "block_reason_bucket": "existing_working_entry"},
     ]
 
     summary = await orch._build_session_summary()
@@ -383,6 +391,7 @@ async def test_session_summary_includes_entry_guard_block_reasons() -> None:
     assert block_reasons is not None
     assert block_reasons.get("by_type", {}).get("existing_position") == 2
     assert block_reasons.get("by_type", {}).get("existing_working_entry") == 1
-    assert block_reasons.get("by_symbol", {}).get("BTCUSDT", {}).get("existing_position") == 2
-    assert block_reasons.get("by_symbol", {}).get("ETHUSDT", {}).get("existing_working_entry") == 1
+    by_sym = block_reasons.get("by_symbol") or {}
+    assert by_sym.get(s0, {}).get("existing_position") == 2
+    assert by_sym.get(s1, {}).get("existing_working_entry") == 1
     assert len(block_reasons.get("recent_context", [])) == 3
