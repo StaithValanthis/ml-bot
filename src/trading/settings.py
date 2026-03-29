@@ -12,6 +12,34 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from trading.util.types import ExchangeType, MarketSymbol, ModelFilterMode, RuntimeMode
 
 
+def _resolve_config_dir(config_dir: Path) -> Path:
+    """
+    Resolve TRADING_CONFIG_DIR / default so loading works from any process cwd.
+
+    Relative paths are tried against cwd, then each ancestor of this module up to the repo
+    root (directory that contains base.yaml + symbols.yaml).
+    """
+    if config_dir.is_file():
+        config_dir = config_dir.parent
+
+    def _has_config_stack(d: Path) -> bool:
+        return (d / "base.yaml").is_file() and (d / "symbols.yaml").is_file()
+
+    if _has_config_stack(config_dir):
+        return config_dir.resolve()
+
+    if config_dir.is_absolute():
+        return config_dir.resolve()
+
+    rel = config_dir
+    for base in (Path.cwd(), *Path(__file__).resolve().parents):
+        candidate = (base / rel).resolve()
+        if _has_config_stack(candidate):
+            return candidate
+
+    return (Path.cwd() / rel).resolve()
+
+
 class EnvSettings(BaseSettings):
     """
     Environment-based configuration values.
@@ -353,9 +381,10 @@ def load_settings() -> AppSettings:
     """
     env = EnvSettings()
     secrets = SecretsSettings()
+    config_dir = _resolve_config_dir(env.config_dir)
 
     data = _load_config_stack(
-        config_dir=env.config_dir,
+        config_dir=config_dir,
         base_file=env.config_base,
         env_name=env.env,
     )
