@@ -20,6 +20,9 @@ REASON_PROTECTIVE_EXIT_FAILURES_PRESENT = "protective_exit_failures_present"
 REASON_REPEATED_RECONCILE_MISMATCH_ABORT = "repeated_reconcile_mismatch_abort"
 REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS = "model_allowed_but_no_submissions"  # legacy
 REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED = "model_allowed_but_no_submissions_unexplained"
+REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_DUE_TO_SIZING_REJECTION = (
+    "model_allowed_but_no_submissions_due_to_sizing_rejection"
+)
 REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION = "model_allowed_but_guard_blocked_due_to_active_position"
 REASON_SUBMITTED_GT_ACK = "submitted_gt_ack"
 REASON_ENTRY_FILL_INCONSISTENT = "entry_fill_inconsistent"
@@ -197,6 +200,7 @@ def build_soak_report(
             "ended_at": end_s,
             "duration_seconds": round(duration_seconds, 1) if duration_seconds is not None else None,
             "session_ended_cleanly": _g_bool(summary, "session_ended_cleanly", True),
+            "order_placement_enabled": summary.get("order_placement_enabled"),
             "abort_reasons": abort_reasons,
             "circuit_breaker_tripped_at_session_end": cb_at_end,
             "stale_channel_count_at_session_end": stale_ch_at_end,
@@ -372,6 +376,9 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
     model_allowed = _g(model_s, "model_allowed_count")
     total_model_evals = _g(model_s, "total_model_evaluations")
     candidates = _g(pipeline, "candidates")
+    sizing_rejected = _g(pipeline, "sizing_rejected")
+    cand_detail = (report.get("candidate_summary") or {}).get("candidate_pipeline_detail") or {}
+    sizing_passed_pipeline = _g(cand_detail, "sizing_passed", -1)
 
     session_clean = _g_bool(meta, "session_ended_cleanly", True)
     repeated_reconcile = safety.get("repeated_reconcile_mismatch_triggered") is True
@@ -440,8 +447,18 @@ def compute_verdict(report: dict[str, Any]) -> tuple[str, list[str], list[str]]:
         clean_existing_position_only_block_case = (
             guard_blocked_active_position_only and operational_clean_for_guard_warn
         )
+        placement_raw = meta.get("order_placement_enabled")
+        paper_model_eval_after_sizing_only = (
+            _g_str(meta, "mode", "").lower() == "paper"
+            and placement_raw is False
+            and sizing_rejected > 0
+            and sizing_passed_pipeline == 0
+            and operational_clean_for_guard_warn
+        )
         if clean_existing_position_only_block_case:
             warnings.append(REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION)
+        elif paper_model_eval_after_sizing_only:
+            warnings.append(REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_DUE_TO_SIZING_REJECTION)
         else:
             failures.append(REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED)
 

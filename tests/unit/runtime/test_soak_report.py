@@ -21,6 +21,7 @@ from trading.runtime.soak_report import (
     build_soak_report,
     compute_verdict,
     REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION,
+    REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_DUE_TO_SIZING_REJECTION,
     REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED,
 )
 from trading.settings import load_settings
@@ -348,6 +349,71 @@ def test_soak_report_fail_when_existing_position_is_not_only_nonzero_guard_reaso
     assert verdict_block.get("verdict") == VERDICT_FAIL
     assert REASON_MODEL_ALLOWED_BUT_GUARD_BLOCKED_DUE_TO_ACTIVE_POSITION not in (verdict_block.get("warnings") or [])
     assert REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED in (verdict_block.get("failures") or [])
+
+
+def test_soak_report_pass_with_warnings_paper_model_probe_after_sizing_rejection() -> None:
+    """Paper + placement off: model evals via sizing-rejection probe only — zero submit is explained (not FAIL)."""
+    summary = {
+        "session_start": "2026-03-29T22:39:13+00:00",
+        "session_end": "2026-03-29T23:40:00+00:00",
+        "mode": "paper",
+        "symbols": list(load_settings().trading.symbols),
+        "session_ended_cleanly": True,
+        "abort_reasons": [],
+        "order_placement_enabled": False,
+        "strategy_flow": {
+            "bars_confirmed": 272,
+            "candidates": 47,
+            "regime_rejected": 25,
+            "signal_rejected": 0,
+            "sizing_rejected": 22,
+            "risk_rejected": 0,
+            "model_filter_reached": 22,
+            "model_blocked": 0,
+            "submitted": 0,
+        },
+        "strategy_order_outcomes": {
+            "intents": 0,
+            "submissions": 0,
+            "acks": 0,
+            "filled": 0,
+            "cancelled": 0,
+            "rejected": 0,
+        },
+        "model_filter": {
+            "enabled": True,
+            "active": True,
+            "mode": "hard_block",
+            "threshold": 1.75e-07,
+            "allowed": 22,
+            "blocked": 0,
+            "prob_count": 22,
+        },
+        "reconcile_mismatch_cycles": 0,
+        "blocking_stage": "unknown",
+        "entry_guard_block_reasons": {"by_type": {}, "by_symbol": {}},
+    }
+    metrics = MetricsSnapshot(
+        counters={
+            "entry_fill_received_count": 0,
+            "protective_exit_order_submitted_count": 0,
+            "protective_exit_order_ack_received_count": 0,
+            "protective_exit_placement_failed_count": 0,
+            "runtime_decision_failures_count": 0,
+            "position_add_blocked_count": 0,
+            "working_entry_blocked_count": 0,
+            "startup_state_blocked_count": 0,
+        },
+        gauges={},
+        histograms={},
+    )
+    report = build_soak_report(summary, metrics)
+    verdict_block = report.get("health_verdict") or {}
+    assert verdict_block.get("verdict") == VERDICT_PASS_WITH_WARNINGS
+    assert REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_UNEXPLAINED not in (verdict_block.get("failures") or [])
+    assert REASON_MODEL_ALLOWED_BUT_NO_SUBMISSIONS_DUE_TO_SIZING_REJECTION in (verdict_block.get("warnings") or [])
+    detail = (report.get("candidate_summary") or {}).get("candidate_pipeline_detail") or {}
+    assert detail.get("sizing_passed") == 0
 
 
 def test_soak_report_fail_model_allowed_but_no_submissions_unexplained() -> None:
