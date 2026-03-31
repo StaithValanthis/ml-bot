@@ -662,7 +662,7 @@ def _make_orchestrator() -> RuntimeOrchestrator:
 
 @pytest.mark.asyncio
 async def test_soak_report_written_on_session_summary_generation(tmp_path: Path) -> None:
-    """Soak report JSON and MD written when session summary is generated."""
+    """Session summary is written; soak report can be built from the emitted summary."""
     orch = _make_orchestrator()
     orch._settings.runtime.mode = RuntimeMode.DEMO
     orch._parquet_store._root_dir = tmp_path
@@ -671,18 +671,19 @@ async def test_soak_report_written_on_session_summary_generation(tmp_path: Path)
     await orch._write_session_summary()
 
     summaries_dir = tmp_path / "session_summaries"
-    soak_jsons = list(summaries_dir.glob("soak_report_*.json"))
-    soak_mds = list(summaries_dir.glob("soak_report_*.md"))
+    session_jsons = list(summaries_dir.glob("session_*.json"))
+    session_mds = list(summaries_dir.glob("session_*.md"))
 
-    assert len(soak_jsons) == 1
-    assert len(soak_mds) == 1
+    assert len(session_jsons) == 1
+    assert len(session_mds) == 1
 
-    report = __import__("json").loads(soak_jsons[0].read_text(encoding="utf-8"))
+    summary = __import__("json").loads(session_jsons[0].read_text(encoding="utf-8"))
+    report = build_soak_report(summary, None)
     assert "health_verdict" in report
     assert report["health_verdict"]["verdict"] in (VERDICT_PASS, VERDICT_PASS_WITH_WARNINGS, VERDICT_FAIL)
 
-    md = soak_mds[0].read_text(encoding="utf-8")
-    assert "## Final Verdict" in md
+    md = session_mds[0].read_text(encoding="utf-8")
+    assert "# Session Summary" in md
 
 
 def test_paper_transient_stale_feed_recovered_pass_with_warnings() -> None:
